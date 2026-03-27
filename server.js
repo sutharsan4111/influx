@@ -3,13 +3,10 @@ require("dotenv").config();
 
 const express = require("express");
 const fetch = require("node-fetch");
-const http = require("http");
-const https = require("https");
 const path = require("path");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const fs = require("fs");
-const tls = require("tls");
 const multer = require("multer");
 const FormData = require("form-data");
 const bcrypt = require("bcrypt");
@@ -310,11 +307,7 @@ const ZOHO_BASE_URL = process.env.ZOHO_BASE_URL || 'https://desk.zoho.in/api/v1'
 const ZOHO_DEPARTMENT_ID = process.env.ZOHO_DEPARTMENT_ID;
 const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
 const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
-const SSL_ALERT_MILESTONES = [33, 18, 10, 7, 4, 3];
-const SSL_DAILY_CHECK_HOUR = 11;
-const SSL_DAILY_CHECK_MINUTE = 0;
-const SSL_MAX_REDIRECTS = 5;
-const SSL_REQUEST_TIMEOUT_MS = 10000;
+const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 
 // ------------------------
 // Serve Angular build
@@ -352,41 +345,6 @@ async function refreshZohoToken() {
   }
 }
 
-let sslDailyCheckTimeout = null;
-
-function getNextDailyRunTime(hour, minute) {
-  const now = new Date();
-  const nextRun = new Date(now);
-  nextRun.setHours(hour, minute, 0, 0);
-
-  if (nextRun <= now) {
-    nextRun.setDate(nextRun.getDate() + 1);
-  }
-
-  return nextRun;
-}
-
-async function runScheduledSslAlerts() {
-  console.log(`[SSL] Running daily SSL expiry check at ${new Date().toISOString()}`);
-  await processSslAlerts();
-}
-
-function scheduleDailySslAlertRun() {
-  if (sslDailyCheckTimeout) {
-    clearTimeout(sslDailyCheckTimeout);
-  }
-
-  const nextRun = getNextDailyRunTime(SSL_DAILY_CHECK_HOUR, SSL_DAILY_CHECK_MINUTE);
-  const delayMs = nextRun.getTime() - Date.now();
-
-  console.log(`[SSL] Daily SSL expiry check scheduled for ${nextRun.toString()}`);
-
-  sslDailyCheckTimeout = setTimeout(async () => {
-    await runScheduledSslAlerts();
-    scheduleDailySslAlertRun();
-  }, delayMs);
-}
-
 // Refresh token on startup and every 55 minutes
 setInterval(refreshZohoToken, 55 * 60 * 1000);
 refreshZohoToken();
@@ -394,9 +352,10 @@ refreshZohoToken();
 // IHUB expiry alert processing on startup + every 12 hours
 setTimeout(() => {
   processIhubAlerts();
+  processSslAlerts();
 }, 15 * 1000);
 setInterval(processIhubAlerts, 12 * 60 * 60 * 1000);
-scheduleDailySslAlertRun();
+setInterval(processSslAlerts, 12 * 60 * 60 * 1000);
 
 // ------------------------
 // ZOHO API HELPER
@@ -476,139 +435,6 @@ function isValidDateInput(value) {
 function normalizeDateOnly(value) {
   const d = toStartOfDay(value);
   return d.toISOString().slice(0, 10);
-}
-
-function httpRequestForRedirectCheck(targetUrl, method) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(targetUrl);
-    const transport = parsedUrl.protocol === 'https:' ? https : http;
-
-    const request = transport.request({
-      protocol: parsedUrl.protocol,
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port || undefined,
-      path: `${parsedUrl.pathname}${parsedUrl.search}`,
-      method,
-      timeout: SSL_REQUEST_TIMEOUT_MS,
-      rejectUnauthorized: false,
-      headers: {
-        'User-Agent': 'itsm-ssl-check/1.0'
-      }
-    }, (response) => {
-      response.resume();
-      resolve({
-        statusCode: response.statusCode || 0,
-        headers: response.headers || {}
-      });
-    });
-
-    request.on('timeout', () => {
-      request.destroy(new Error(`Timed out while checking ${targetUrl}`));
-    });
-
-    request.on('error', reject);
-    request.end();
-  });
-}
-
-async function resolveSslCheckUrl(targetUrl) {
-  let currentUrl = targetUrl;
-
-  for (let redirectCount = 0; redirectCount < SSL_MAX_REDIRECTS; redirectCount += 1) {
-    let response = await httpRequestForRedirectCheck(currentUrl, 'HEAD');
-
-    if (response.statusCode === 405 || response.statusCode === 501) {
-      response = await httpRequestForRedirectCheck(currentUrl, 'GET');
-    }
-
-    const location = response.headers.location;
-    const isRedirect = response.statusCode >= 300 && response.statusCode < 400 && location;
-
-    if (!isRedirect) {
-      return currentUrl;
-    }
-
-    currentUrl = new URL(location, currentUrl).toString();
-  }
-
-  return currentUrl;
-}
-
-function readSslCertificateExpiry(targetUrl) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(targetUrl);
-    const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : 443;
-
-    const socket = tls.connect({
-      host: parsedUrl.hostname,
-      port,
-      servername: parsedUrl.hostname,
-      rejectUnauthorized: false,
-      timeout: SSL_REQUEST_TIMEOUT_MS
-    }, () => {
-      try {
-        const certificate = socket.getPeerCertificate();
-
-        if (!certificate || !certificate.valid_to) {
-          throw new Error(`No SSL certificate found for ${targetUrl}`);
-        }
-
-        resolve(normalizeDateOnly(certificate.valid_to));
-      } catch (error) {
-        reject(error);
-      } finally {
-        socket.end();
-      }
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy(new Error(`Timed out while reading certificate for ${targetUrl}`));
-    });
-
-    socket.on('error', reject);
-  });
-}
-
-async function fetchLiveSslMetadata(targetUrl) {
-  if (!targetUrl) {
-    throw new Error('SSL URL is required');
-  }
-
-  const resolvedUrl = await resolveSslCheckUrl(targetUrl);
-  const parsedResolvedUrl = new URL(resolvedUrl);
-
-  if (parsedResolvedUrl.protocol !== 'https:') {
-    throw new Error(`Resolved URL must use HTTPS: ${resolvedUrl}`);
-  }
-
-  const expiryDate = await readSslCertificateExpiry(resolvedUrl);
-
-  return {
-    resolvedUrl,
-    expiryDate
-  };
-}
-
-async function syncSslAssetExpiry(asset) {
-  const liveSsl = await fetchLiveSslMetadata(asset.ssl_url);
-  const currentExpiry = normalizeDateOnly(asset.ssl_expiry);
-
-  if (currentExpiry !== liveSsl.expiryDate) {
-    await pool.query(
-      `UPDATE ssl_assets
-       SET ssl_expiry = $1,
-           updated_by = $2,
-           updated_at = NOW()
-       WHERE id = $3`,
-      [liveSsl.expiryDate, 'ssl-monitor', asset.id]
-    );
-  }
-
-  return {
-    ...asset,
-    ssl_expiry: liveSsl.expiryDate,
-    resolved_ssl_url: liveSsl.resolvedUrl
-  };
 }
 
 async function closeZohoTicketWithFallback(ticketId) {
@@ -939,23 +765,14 @@ async function processSslAlerts() {
     console.log(`[SSL] Processing ${result.rows.length} assets for alert generation...`);
 
     for (const asset of result.rows) {
-      let liveAsset;
-
-      try {
-        liveAsset = await syncSslAssetExpiry(asset);
-      } catch (err) {
-        console.error(`[SSL] Live certificate check failed for asset ${asset.id}:`, err?.message || err);
-        continue;
-      }
-
-      const daysLeft = daysUntilDate(liveAsset.ssl_expiry);
+      const daysLeft = daysUntilDate(asset.ssl_expiry);
       if (!SSL_ALERT_MILESTONES.includes(daysLeft)) {
         continue;
       }
 
       try {
         console.log(`[SSL] Creating alert ticket for asset ${asset.id} at ${daysLeft} day milestone`);
-        await createSslAlertTicket(liveAsset, daysLeft);
+        await createSslAlertTicket(asset, daysLeft);
         console.log(`[SSL] Alert ticket processed for asset ${asset.id}`);
       } catch (err) {
         console.error(`SSL alert generation failed for asset ${asset.id}:`, err?.message || err);
