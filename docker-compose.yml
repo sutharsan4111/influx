@@ -1,0 +1,26 @@
+services:
+  web:
+    container_name: itsm-muraai-dev
+    image: node:18
+    working_dir: /usr/src/app
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    command: sh -c "npm install --legacy-peer-deps && (npm run watch & npm start)"
+
+
+
+# services:
+#   web:
+#     container_name: itsm-muraai
+#     build:
+#       context: .
+#     image: itsm-muraai
+#     ports:
+#       - "3000:3000"
+#     env_file:
+#       - .env

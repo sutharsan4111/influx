@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="currentColor">
+  <!-- Iconic Batman Logo - Bat silhouette -->
+  <path d="M50 18
+    C45 18 40 22 38 28
+    L35 35
+    C32 32 28 30 22 30
+    C18 30 12 33 8 38
+    C12 42 18 48 25 52
+    L30 55
+    C28 60 26 68 26 75
+    C30 72 38 68 50 68
+    C62 68 70 72 74 75
+    C74 68 72 60 70 55
+    L75 52
+    C82 48 88 42 92 38
+    C88 33 82 30 78 30
+    C72 30 68 32 65 35
+    L62 28
+    C60 22 55 18 50 18Z"/>
+  <!-- Bat ears -->
+  <path d="M35 28 L32 15 L40 25 Z"/>
+  <path d="M65 28 L68 15 L60 25 Z"/>
+</svg>

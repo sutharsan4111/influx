@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Superman Shield Shape -->
+  <path d="M50 5 L92 30 L92 60 L50 95 L8 60 L8 30 Z" fill="#dc2626" stroke="#fbbf24" stroke-width="4"/>
+  <!-- Inner Shield -->
+  <path d="M50 12 L85 33 L85 58 L50 88 L15 58 L15 33 Z" fill="#dc2626"/>
+  <!-- Yellow Background for S -->
+  <path d="M50 20 L78 38 L78 55 L50 80 L22 55 L22 38 Z" fill="#fbbf24"/>
+  <!-- The S -->
+  <text x="50" y="62" font-family="Impact, Arial Black, sans-serif" font-size="42" font-weight="900" fill="#dc2626" text-anchor="middle">S</text>
+</svg>
