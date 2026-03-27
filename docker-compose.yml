@@ -1,6 +1,6 @@
 services:
   web:
-    container_name: itsm-muraai-dev
+    container_name: itsm-muraai-tst
     image: node:18
     working_dir: /usr/src/app
     ports:
