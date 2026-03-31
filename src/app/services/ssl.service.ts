@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
-import { Observable } from 'rxjs';
+import { Observable, of } from 'rxjs';
+import { tap } from 'rxjs/operators';
 
 export interface SslAsset {
   id?: number;
@@ -33,6 +34,9 @@ export interface AssignableUserLite {
 })
 export class SslService {
   private apiUrl = '/api/ssl';
+  private assetsCache: SslAsset[] | null = null;
+  private alertTicketsCache: any[] | null = null;
+  private responsiblePeopleCache = new Map<string, SslResponsiblePerson[]>();
 
   constructor(private http: HttpClient) {}
 
@@ -43,7 +47,7 @@ export class SslService {
     });
 
     if (extraHeaders) {
-      Object.keys(extraHeaders).forEach(key => {
+      Object.keys(extraHeaders).forEach((key) => {
         headers = headers.set(key, extraHeaders[key]);
       });
     }
@@ -51,10 +55,24 @@ export class SslService {
     return headers;
   }
 
-  getAssets(): Observable<SslAsset[]> {
-    return this.http.get<SslAsset[]>(this.apiUrl, {
-      headers: this.getAuthHeaders()
-    });
+  getAssets(forceRefresh = false): Observable<SslAsset[]> {
+    if (!forceRefresh && this.assetsCache) {
+      return of(this.assetsCache);
+    }
+
+    return this.http
+      .get<SslAsset[]>(this.apiUrl, {
+        headers: this.getAuthHeaders()
+      })
+      .pipe(
+        tap((assets) => {
+          this.assetsCache = assets || [];
+        })
+      );
+  }
+
+  invalidateAssetsCache(): void {
+    this.assetsCache = null;
   }
 
   createAsset(payload: SslAsset): Observable<SslAsset> {
@@ -83,16 +101,33 @@ export class SslService {
     );
   }
 
-  getAlertTickets(sslAssetId?: number): Observable<any[]> {
-    const url = sslAssetId
-      ? `${this.apiUrl}/alerts?ssl_asset_id=${sslAssetId}`
-      : `${this.apiUrl}/alerts`;
-    return this.http.get<any[]>(url, {
-      headers: this.getAuthHeaders()
-    });
+  getAlertTickets(sslAssetId?: number, forceRefresh = false): Observable<any[]> {
+    if (!sslAssetId && !forceRefresh && this.alertTicketsCache) {
+      return of(this.alertTicketsCache);
+    }
+
+    const url = sslAssetId ? `${this.apiUrl}/alerts?ssl_asset_id=${sslAssetId}` : `${this.apiUrl}/alerts`;
+    return this.http
+      .get<any[]>(url, {
+        headers: this.getAuthHeaders()
+      })
+      .pipe(
+        tap((alerts) => {
+          if (!sslAssetId) {
+            this.alertTicketsCache = alerts || [];
+          }
+        })
+      );
   }
 
-  closeAlertTicket(zohoTicketId: string, newExpiryDate?: string): Observable<{ message: string; ssl_expiry?: string }> {
+  invalidateAlertTicketsCache(): void {
+    this.alertTicketsCache = null;
+  }
+
+  closeAlertTicket(
+    zohoTicketId: string,
+    newExpiryDate?: string
+  ): Observable<{ message: string; ssl_expiry?: string }> {
     return this.http.post<{ message: string; ssl_expiry: string }>(
       `${this.apiUrl}/tickets/${zohoTicketId}/close`,
       newExpiryDate ? { new_expiry_date: newExpiryDate } : {},
@@ -100,13 +135,34 @@ export class SslService {
     );
   }
 
-  getResponsiblePeople(groupEmail: string, graphToken: string): Observable<{ members: SslResponsiblePerson[] }> {
-    return this.http.get<{ members: SslResponsiblePerson[] }>(
-      `/api/admin/group-members?groupEmail=${encodeURIComponent(groupEmail)}`,
-      {
-        headers: this.getAuthHeaders({ 'x-graph-token': graphToken || '' })
-      }
-    );
+  getResponsiblePeople(
+    groupEmail: string,
+    graphToken: string,
+    forceRefresh = false
+  ): Observable<{ members: SslResponsiblePerson[] }> {
+    const cacheKey = (groupEmail || '').toLowerCase();
+    const cachedMembers = this.responsiblePeopleCache.get(cacheKey);
+
+    if (!forceRefresh && cachedMembers) {
+      return of({ members: cachedMembers });
+    }
+
+    return this.http
+      .get<{ members: SslResponsiblePerson[] }>(
+        `/api/admin/group-members?groupEmail=${encodeURIComponent(groupEmail)}`,
+        {
+          headers: this.getAuthHeaders({ 'x-graph-token': graphToken || '' })
+        }
+      )
+      .pipe(
+        tap((response) => {
+          this.responsiblePeopleCache.set(cacheKey, response?.members || []);
+        })
+      );
+  }
+
+  invalidateResponsiblePeopleCache(): void {
+    this.responsiblePeopleCache.clear();
   }
 
   getAssignableUsersFallback(): Observable<AssignableUserLite[]> {

@@ -48,14 +48,32 @@ export const routes: Routes = [
           import('./admin/report.component').then(m => m.ReportComponent)
       },
       {
-        path: 'ihub',
+        path: 'infrastructure',
         loadComponent: () =>
-          import('./admin/ihub.component').then(m => m.IhubComponent)
+          import('./admin/infrastructure.component').then(m => m.InfrastructureComponent),
+        children: [
+          { path: '', redirectTo: 'ssl', pathMatch: 'full' },
+          {
+            path: 'ssl',
+            loadComponent: () =>
+              import('./admin/ssl.component').then(m => m.SslComponent)
+          },
+          {
+            path: 'ihub',
+            loadComponent: () =>
+              import('./admin/ihub.component').then(m => m.IhubComponent)
+          }
+        ]
+      },
+      {
+        path: 'ihub',
+        redirectTo: 'infrastructure/ihub',
+        pathMatch: 'full'
       },
       {
         path: 'ssl',
-        loadComponent: () =>
-          import('./admin/ssl.component').then(m => m.SslComponent)
+        redirectTo: 'infrastructure/ssl',
+        pathMatch: 'full'
       }
     ]
   },

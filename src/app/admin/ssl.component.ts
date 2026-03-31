@@ -552,9 +552,12 @@ export class SslComponent implements OnInit {
 
     try {
       await firstValueFrom(this.sslService.closeAlertTicket(this.closeModalAlert.id, this.newExpiryDate));
+      this.sslService.invalidateAssetsCache();
+      this.sslService.invalidateAlertTicketsCache();
       this.messageService.success('SSL alert closed and expiry date updated');
       this.closeCloseModal();
-      await Promise.all([this.loadAssets(), this.loadAlertTickets()]);
+      this.assets = await firstValueFrom(this.sslService.getAssets(true));
+      this.alertTickets = await firstValueFrom(this.sslService.getAlertTickets(undefined, true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Failed to close SSL alert');
     }
@@ -571,8 +574,9 @@ export class SslComponent implements OnInit {
     this.isRunningCheck = true;
     try {
       await firstValueFrom(this.sslService.runExpiryCheck());
+      this.sslService.invalidateAssetsCache();
       this.messageService.success('SSL expiry check completed. New alert tickets have been generated if applicable.');
-      await this.loadAssets();
+      this.assets = await firstValueFrom(this.sslService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'SSL expiry check failed');
     } finally {
@@ -595,8 +599,9 @@ export class SslComponent implements OnInit {
         this.messageService.success('SSL details added');
       }
 
+      this.sslService.invalidateAssetsCache();
       this.showModal = false;
-      await this.loadAssets();
+      this.assets = await firstValueFrom(this.sslService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Failed to save SSL details');
     }
@@ -610,8 +615,9 @@ export class SslComponent implements OnInit {
 
     try {
       await firstValueFrom(this.sslService.deleteAsset(item.id));
+      this.sslService.invalidateAssetsCache();
       this.messageService.success('SSL details deleted');
-      await this.loadAssets();
+      this.assets = await firstValueFrom(this.sslService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Failed to delete SSL details');
     }

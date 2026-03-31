@@ -44,17 +44,11 @@ import { MsalService } from '../services/msal.service';
         </li>
         <li *ngIf="isAdmin()"
             class="menu-item"
-            routerLink="/ihub"
-            [class.active]="isActive('/ihub')">
-          <i class="fas fa-server"></i>
-          <span>IHUB</span>
-        </li>
-        <li *ngIf="isAdmin()"
-            class="menu-item"
-            routerLink="/ssl"
-            [class.active]="isActive('/ssl')">
-          <i class="fas fa-lock"></i>
-          <span>SSL</span>
+            routerLink="/infrastructure"
+            [class.active]="isInfrastructureSection()">
+          <i class="fas fa-network-wired"></i>
+          <span>Infrastructure</span>
+          <i class="fas fa-chevron-right"></i>
         </li>
       </ul>
 
@@ -192,6 +186,12 @@ import { MsalService } from '../services/msal.service';
       font-size: 0.7rem;
       color: #64748b;
       transition: color 0.2s ease;
+    }
+
+    .menu-item > i:last-child {
+      margin-left: auto;
+      width: auto;
+      font-size: 0.6rem;
     }
 
     .menu-item.sub-item {
@@ -709,6 +709,10 @@ export class SidebarComponent implements OnInit {
 
   isAdminSection() {
     return this.router.url.startsWith('/admin');
+  }
+
+  isInfrastructureSection() {
+    return this.router.url.startsWith('/infrastructure') || this.router.url.startsWith('/ssl') || this.router.url.startsWith('/ihub');
   }
 
   isAdmin() { return this.role === 'admin'; }

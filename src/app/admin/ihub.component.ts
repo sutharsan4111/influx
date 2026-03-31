@@ -472,8 +472,9 @@ export class IhubComponent implements OnInit {
     this.isRunningCheck = true;
     try {
       await firstValueFrom(this.ihubService.runExpiryCheck());
+      this.ihubService.invalidateAssetsCache();
       this.messageService.success('Expiry check completed. New alert tickets have been generated if applicable.');
-      await this.loadAssets();
+      this.assets = await firstValueFrom(this.ihubService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Expiry check failed');
     } finally {
@@ -489,8 +490,9 @@ export class IhubComponent implements OnInit {
 
     try {
       await firstValueFrom(this.ihubService.deleteAsset(item.id));
+      this.ihubService.invalidateAssetsCache();
       this.messageService.success('IHUB details deleted');
-      await this.loadAssets();
+      this.assets = await firstValueFrom(this.ihubService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Failed to delete IHUB details');
     }
@@ -511,8 +513,9 @@ export class IhubComponent implements OnInit {
         this.messageService.success('IHUB details added');
       }
 
+      this.ihubService.invalidateAssetsCache();
       this.showModal = false;
-      await this.loadAssets();
+      this.assets = await firstValueFrom(this.ihubService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Failed to save IHUB details');
     }

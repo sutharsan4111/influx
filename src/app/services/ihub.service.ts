@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
-import { Observable } from 'rxjs';
+import { Observable, of } from 'rxjs';
+import { tap } from 'rxjs/operators';
 
 export interface IhubAsset {
   id?: number;
@@ -31,6 +32,8 @@ export interface AssignableUserLite {
 })
 export class IhubService {
   private apiUrl = '/api/ihub';
+  private assetsCache: IhubAsset[] | null = null;
+  private responsiblePeopleCache = new Map<string, IhubResponsiblePerson[]>();
 
   constructor(private http: HttpClient) {}
 
@@ -49,10 +52,22 @@ export class IhubService {
     return headers;
   }
 
-  getAssets(): Observable<IhubAsset[]> {
+  getAssets(forceRefresh = false): Observable<IhubAsset[]> {
+    if (!forceRefresh && this.assetsCache) {
+      return of(this.assetsCache);
+    }
+
     return this.http.get<IhubAsset[]>(this.apiUrl, {
       headers: this.getAuthHeaders()
-    });
+    }).pipe(
+      tap((assets) => {
+        this.assetsCache = assets || [];
+      })
+    );
+  }
+
+  invalidateAssetsCache(): void {
+    this.assetsCache = null;
   }
 
   createAsset(payload: IhubAsset): Observable<IhubAsset> {
@@ -73,13 +88,28 @@ export class IhubService {
     });
   }
 
-  getResponsiblePeople(groupEmail: string, graphToken: string): Observable<{ members: IhubResponsiblePerson[] }> {
+  getResponsiblePeople(groupEmail: string, graphToken: string, forceRefresh = false): Observable<{ members: IhubResponsiblePerson[] }> {
+    const cacheKey = (groupEmail || '').toLowerCase();
+    const cachedMembers = this.responsiblePeopleCache.get(cacheKey);
+
+    if (!forceRefresh && cachedMembers) {
+      return of({ members: cachedMembers });
+    }
+
     return this.http.get<{ members: IhubResponsiblePerson[] }>(
       `/api/admin/group-members?groupEmail=${encodeURIComponent(groupEmail)}`,
       {
         headers: this.getAuthHeaders({ 'x-graph-token': graphToken || '' })
       }
+    ).pipe(
+      tap((response) => {
+        this.responsiblePeopleCache.set(cacheKey, response?.members || []);
+      })
     );
+  }
+
+  invalidateResponsiblePeopleCache(): void {
+    this.responsiblePeopleCache.clear();
   }
 
   getAssignableUsersFallback(): Observable<AssignableUserLite[]> {

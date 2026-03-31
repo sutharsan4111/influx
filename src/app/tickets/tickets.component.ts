@@ -2139,7 +2139,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
         this.messageService.success('Ticket closed');
         this.cancelDialogs();
       },
-      error: err => this.messageService.error(this.describeError(err, 'Close failed'))
+      error: (err: any) => this.messageService.error(this.describeError(err, 'Close failed'))
     });
   }
 
