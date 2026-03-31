@@ -3,6 +3,7 @@ require("dotenv").config();
 
 const express = require("express");
 const fetch = require("node-fetch");
+const crypto = require("crypto");
 const path = require("path");
 const bodyParser = require("body-parser");
 const cors = require("cors");
@@ -127,6 +128,27 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
         closed_at TIMESTAMP WITH TIME ZONE,
         UNIQUE (ssl_asset_id, milestone_days, ssl_expiry_on)
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS alertmanager_ssl_tickets (
+        id SERIAL PRIMARY KEY,
+        alert_fingerprint VARCHAR(255) NOT NULL UNIQUE,
+        alertname VARCHAR(255),
+        milestone_days INTEGER NOT NULL,
+        client VARCHAR(255),
+        environment VARCHAR(100),
+        application VARCHAR(255),
+        instance TEXT,
+        responsible VARCHAR(255),
+        responsible_email VARCHAR(255),
+        zoho_ticket_id VARCHAR(50) UNIQUE,
+        zoho_ticket_number VARCHAR(50),
+        status VARCHAR(50) NOT NULL DEFAULT 'Open',
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        closed_at TIMESTAMP WITH TIME ZONE
       )
     `);
 
@@ -308,6 +330,9 @@ const ZOHO_DEPARTMENT_ID = process.env.ZOHO_DEPARTMENT_ID;
 const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
 const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
+const AUTOMATION_SSL_ALERT_MILESTONES = [33, 18, 10, 7, 4, 3];
+const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
+const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
 
 // ------------------------
 // Serve Angular build
@@ -436,6 +461,272 @@ function normalizeDateOnly(value) {
   const d = toStartOfDay(value);
   return d.toISOString().slice(0, 10);
 }
+
+function isLikelyEmail(value) {
+  if (!value) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((value || '').trim());
+}
+
+function safeTokenEqual(a, b) {
+  const aa = Buffer.from(a || '', 'utf8');
+  const bb = Buffer.from(b || '', 'utf8');
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function isAlertmanagerAuthorized(req) {
+  if (!ALERTMANAGER_WEBHOOK_SECRET) return true;
+  const provided = (req.headers['x-alertmanager-secret'] || '').toString().trim();
+  return safeTokenEqual(provided, ALERTMANAGER_WEBHOOK_SECRET);
+}
+
+function parseMilestoneDays(alert) {
+  const labels = alert?.labels || {};
+  const annotations = alert?.annotations || {};
+  const fromLabel = parseInt(labels.milestone_days || labels.days_left || '', 10);
+  if (Number.isInteger(fromLabel)) return fromLabel;
+
+  const sources = [
+    labels.alertname || '',
+    annotations.summary || '',
+    annotations.description || ''
+  ];
+
+  for (const text of sources) {
+    const match = /\b(\d{1,3})\s*day/i.exec(text);
+    if (match) {
+      const value = parseInt(match[1], 10);
+      if (Number.isInteger(value)) return value;
+    }
+  }
+
+  return null;
+}
+
+function buildAlertFingerprint(alert, milestoneDays) {
+  const labels = alert?.labels || {};
+  const raw = [
+    labels.alertname || 'SSL_ALERT',
+    labels.client || 'unknown-client',
+    labels.instance || labels.target || labels.url || 'unknown-instance',
+    labels.application || 'unknown-app',
+    String(milestoneDays)
+  ].join('|');
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+async function createAlertmanagerSslTicket(alert, milestoneDays) {
+  const labels = alert?.labels || {};
+  const annotations = alert?.annotations || {};
+
+  const client = (labels.client || '').trim() || 'Unknown Client';
+  const environment = (labels.environment || '').trim() || 'Unknown';
+  const application = (labels.application || '').trim() || 'Unknown';
+  const instance = (labels.instance || labels.target || labels.url || '').trim() || 'Unknown';
+  const alertname = (labels.alertname || 'SSLCert').trim();
+  const responsible = (labels.responsible || labels.owner || labels.assignee || '').trim();
+
+  const responsibleCandidates = [
+    labels.responsible_email,
+    labels.owner_email,
+    labels.assignee_email,
+    labels.email,
+    responsible
+  ];
+  const responsibleEmail = responsibleCandidates
+    .map(v => (v || '').toString().trim().toLowerCase())
+    .find(isLikelyEmail) || ALERTMANAGER_FALLBACK_EMAIL;
+
+  if (!responsibleEmail) {
+    return {
+      status: 'skipped',
+      reason: 'missing responsible email label and fallback email'
+    };
+  }
+
+  const fingerprint = buildAlertFingerprint(alert, milestoneDays);
+
+  // Check if an Open/Pending ticket already exists for this fingerprint.
+  // If the previous ticket was Closed, allow a new one to be created.
+  const existing = await pool.query(
+    `SELECT id, status FROM alertmanager_ssl_tickets 
+     WHERE alert_fingerprint = $1
+     ORDER BY id DESC LIMIT 1`,
+    [fingerprint]
+  );
+  if (existing.rows.length > 0 && ['Open', 'Pending'].includes(existing.rows[0].status)) {
+    return { status: 'duplicate', reason: 'already processed' };
+  }
+
+  // Remove old closed row so the unique constraint allows a fresh insert.
+  if (existing.rows.length > 0) {
+    await pool.query(
+      `DELETE FROM alertmanager_ssl_tickets WHERE alert_fingerprint = $1 AND status = 'Closed'`,
+      [fingerprint]
+    );
+  }
+
+  const reservation = await pool.query(
+    `INSERT INTO alertmanager_ssl_tickets
+      (alert_fingerprint, alertname, milestone_days, client, environment, application, instance, responsible, responsible_email, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Pending')
+     RETURNING id`,
+    [
+      fingerprint,
+      alertname,
+      milestoneDays,
+      client,
+      environment,
+      application,
+      instance,
+      responsible || null,
+      responsibleEmail
+    ]
+  );
+
+  if (reservation.rows.length === 0) {
+    return { status: 'duplicate', reason: 'already processed' };
+  }
+
+  const rowId = reservation.rows[0].id;
+  const subject = `[SSL][Automation] ${client} - certificate expiry in ${milestoneDays} day(s)`;
+  const description = [
+    '<p><strong>SSL Expiry Alert (Automation Stack)</strong></p>',
+    `<p>Milestone: <strong>${milestoneDays} day(s)</strong></p>`,
+    `<p>Client: ${client}</p>`,
+    `<p>Environment: ${environment}</p>`,
+    `<p>Application: ${application}</p>`,
+    `<p>Instance/URL: ${instance}</p>`,
+    `<p>Responsible: ${responsible || '-'}</p>`,
+    `<p>Responsible Email: ${responsibleEmail}</p>`,
+    `<p>Summary: ${(annotations.summary || '').trim() || '-'}</p>`,
+    `<p>Description: ${(annotations.description || '').trim() || '-'}</p>`,
+    `<p>Source Alert: ${alertname}</p>`,
+    `<p>Starts At: ${alert?.startsAt || '-'}</p>`,
+    `<p>Generator URL: ${alert?.generatorURL || '-'}</p>`
+  ].join('');
+
+  const payload = {
+    subject,
+    priority: milestoneDays <= 7 ? 'High' : 'Medium',
+    status: 'Open',
+    category: 'SSL',
+    subCategory: 'SSL Expiry',
+    description,
+    contact: {
+      lastName: responsible || client,
+      email: responsibleEmail
+    }
+  };
+
+  if (ZOHO_DEPARTMENT_ID) {
+    payload.departmentId = ZOHO_DEPARTMENT_ID;
+  }
+
+  const assigneeId = await lookupAgentIdByEmail(responsibleEmail);
+  if (assigneeId) {
+    payload.assigneeId = assigneeId;
+  }
+
+  let response = await zohoFetch('/tickets', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+  let data = await response.json().catch(() => null);
+
+  if (!response.ok && payload.assigneeId) {
+    const assigneeError = Array.isArray(data?.errors)
+      ? data.errors.find((e) => e?.fieldName === '/assigneeId')
+      : null;
+
+    if (assigneeError) {
+      delete payload.assigneeId;
+      response = await zohoFetch('/tickets', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      data = await response.json().catch(() => null);
+    }
+  }
+
+  if (!response.ok || !data?.id) {
+    await pool.query(
+      `DELETE FROM alertmanager_ssl_tickets
+       WHERE id = $1 AND status = 'Pending'`,
+      [rowId]
+    );
+    throw new Error(data?.message || `Alertmanager SSL ticket creation failed (${response.status})`);
+  }
+
+  await pool.query(
+    `UPDATE alertmanager_ssl_tickets
+     SET zoho_ticket_id = $1,
+         zoho_ticket_number = $2,
+         status = 'Open',
+         updated_at = NOW()
+     WHERE id = $3`,
+    [data.id, data.ticketNumber || null, rowId]
+  );
+
+  await upsertSslAssignment(data.id, data.ticketNumber || null, responsibleEmail);
+  return { status: 'created', ticketId: data.id, ticketNumber: data.ticketNumber || null };
+}
+
+app.post('/api/webhook/alertmanager', async (req, res) => {
+  try {
+    if (!isAlertmanagerAuthorized(req)) {
+      return res.status(401).json({ message: 'Invalid webhook secret' });
+    }
+
+    const payload = req.body || {};
+    const incomingAlerts = Array.isArray(payload.alerts) ? payload.alerts : [];
+    const firingAlerts = incomingAlerts.filter(a => (a?.status || '').toLowerCase() === 'firing');
+
+    if (firingAlerts.length === 0) {
+      return res.json({ message: 'No firing alerts to process', processed: 0 });
+    }
+
+    const results = [];
+    for (const alert of firingAlerts) {
+      const milestoneDays = parseMilestoneDays(alert);
+      if (!Number.isInteger(milestoneDays) || !AUTOMATION_SSL_ALERT_MILESTONES.includes(milestoneDays)) {
+        results.push({
+          status: 'ignored',
+          reason: 'milestone not in configured automation list',
+          alertname: alert?.labels?.alertname || null,
+          milestone_days: milestoneDays
+        });
+        continue;
+      }
+
+      try {
+        const created = await createAlertmanagerSslTicket(alert, milestoneDays);
+        results.push({
+          alertname: alert?.labels?.alertname || null,
+          milestone_days: milestoneDays,
+          ...created
+        });
+      } catch (err) {
+        console.error('Alertmanager webhook ticket creation failed:', err?.message || err);
+        results.push({
+          alertname: alert?.labels?.alertname || null,
+          milestone_days: milestoneDays,
+          status: 'error',
+          reason: err?.message || String(err)
+        });
+      }
+    }
+
+    return res.json({
+      message: 'Alertmanager webhook processed',
+      processed: results.length,
+      results
+    });
+  } catch (err) {
+    console.error('Alertmanager webhook failed:', err);
+    return res.status(500).json({ message: 'Webhook processing failed' });
+  }
+});
 
 async function closeZohoTicketWithFallback(ticketId) {
   const closeTry = await zohoFetch(`/tickets/${ticketId}`, {
@@ -1924,10 +2215,6 @@ app.post('/api/ssl/tickets/:zohoTicketId/close', authenticateToken, async (req, 
     const userEmail = (req.user?.email || '').toLowerCase();
     const isAdmin = req.user?.role === 'admin';
 
-    if (!isValidDateInput(newExpiryDate)) {
-      return res.status(400).json({ message: 'Valid new_expiry_date is required' });
-    }
-
     const assignmentResult = await pool.query(
       `SELECT * FROM ticket_assignments WHERE zoho_ticket_id = $1 LIMIT 1`,
       [ticketId]
@@ -1944,6 +2231,44 @@ app.post('/api/ssl/tickets/:zohoTicketId/close', authenticateToken, async (req, 
 
     if (!isAdmin && !assignedUsers.includes(userEmail)) {
       return res.status(403).json({ message: 'Only responsible person or admin can close SSL ticket' });
+    }
+
+    const automationAlertResult = await pool.query(
+      `SELECT * FROM alertmanager_ssl_tickets WHERE zoho_ticket_id = $1 LIMIT 1`,
+      [ticketId]
+    );
+    const automationAlert = automationAlertResult.rows[0];
+
+    // Automation SSL tickets are URL-driven; they do not need manual expiry updates while closing.
+    if (automationAlert) {
+      const closedInZoho = await closeZohoTicketWithFallback(ticketId);
+      if (!closedInZoho) {
+        return res.status(502).json({ message: 'Failed to close ticket in Zoho' });
+      }
+
+      await pool.query(
+        `UPDATE alertmanager_ssl_tickets
+         SET status = 'Closed',
+             closed_at = NOW(),
+             updated_at = NOW()
+         WHERE zoho_ticket_id = $1`,
+        [ticketId]
+      );
+
+      await pool.query(
+        `UPDATE ticket_assignments
+         SET status = 'Closed', closed_at = NOW(), closed_by = $1, updated_at = NOW()
+         WHERE zoho_ticket_id = $2`,
+        [userEmail || null, ticketId]
+      );
+
+      return res.json({
+        message: 'Automation SSL ticket closed successfully'
+      });
+    }
+
+    if (!isValidDateInput(newExpiryDate)) {
+      return res.status(400).json({ message: 'Valid new_expiry_date is required' });
     }
 
     const alertResult = await pool.query(

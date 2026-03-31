@@ -2044,10 +2044,13 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   closeTicket(ticketId: string): void {
     if (!ticketId) return;
     this.activeTicketId = ticketId;
+    const selectedTicket = this.filteredTickets.find(t => (t.id || t.ticketId || '') === ticketId);
     const assignment = this.assignmentsMap.get(ticketId);
     const category = (assignment?.category || '').toUpperCase();
     this.closingTicketType = category;
-    this.closeRequiresNewExpiry = category === 'IHUB' || category === 'SSL';
+    const subject = (selectedTicket?.subject || '').toUpperCase();
+    const isAutomationSslTicket = category === 'SSL' && subject.includes('[SSL][AUTOMATION]');
+    this.closeRequiresNewExpiry = category === 'IHUB' || (category === 'SSL' && !isAutomationSslTicket);
     this.closeNewExpiryDate = '';
     this.showCloseDialog = true;
   }

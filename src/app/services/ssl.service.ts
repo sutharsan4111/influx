@@ -92,10 +92,10 @@ export class SslService {
     });
   }
 
-  closeAlertTicket(zohoTicketId: string, newExpiryDate: string): Observable<{ message: string; ssl_expiry: string }> {
+  closeAlertTicket(zohoTicketId: string, newExpiryDate?: string): Observable<{ message: string; ssl_expiry?: string }> {
     return this.http.post<{ message: string; ssl_expiry: string }>(
       `${this.apiUrl}/tickets/${zohoTicketId}/close`,
-      { new_expiry_date: newExpiryDate },
+      newExpiryDate ? { new_expiry_date: newExpiryDate } : {},
       { headers: this.getAuthHeaders() }
     );
   }
