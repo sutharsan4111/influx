@@ -48,7 +48,6 @@ import { MsalService } from '../services/msal.service';
             [class.active]="isInfrastructureSection()">
           <i class="fas fa-network-wired"></i>
           <span>Infrastructure</span>
-          <i class="fas fa-chevron-right"></i>
         </li>
       </ul>
 
