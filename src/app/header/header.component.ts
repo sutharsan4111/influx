@@ -17,7 +17,6 @@ import { PublicClientApplication } from '@azure/msal-browser';
         alt="Muraai Logo"
         class="logo-img"
       />
-      <span class="logo-text">Ticketing Portal</span>
     </div>
 
       <div class="right">

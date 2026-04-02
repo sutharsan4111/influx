@@ -48,15 +48,6 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
       <div class="body">
         <main class="main">
 
-          <!-- Email Notice --> 
-          <div class="email-notice" *ngIf="ticket?.channel === 'Email'">
-            <i class="fa fa-envelope"></i>
-            <span>This ticket was created via email. Content may be abbreviated.</span>
-            <a *ngIf="zohoTicketUrl" [href]="zohoTicketUrl" target="_blank" class="view-zoho-link">
-              View full ticket in Zoho <i class="fa fa-external-link"></i>
-            </a>
-          </div>
-
           <section class="desc" *ngIf="ticket?.description">
             <h4>Description</h4>
             <div class="desc-body" [innerHTML]="sanitize(ticket?.description)"></div>
@@ -72,7 +63,7 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
                 </div>
                 <div>
                   <div class="who">{{ t.authorName }}</div>
-                  <div class="when">{{ t.createdTime | date:'medium' }}</div>
+                  <div class="when">{{ t.createdTime | date:'MMM d, y, h:mm a' }}</div>
                 </div>
               </div>
 
@@ -155,8 +146,8 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
           </div>
 
           <div class="panel">
-            <div class="row"><strong>Created</strong><span>{{ ticket?.createdTime | date:'medium' }}</span></div>
-            <div class="row"><strong>Due</strong><span>{{ ticket?.dueDate | date:'medium' }}</span></div>
+            <div class="row"><strong>Created</strong><span>{{ ticket?.createdTime | date:'MMM d, y, h:mm a' }}</span></div>
+            <div class="row"><strong>Due</strong><span>{{ ticket?.dueDate | date:'MMM d, y, h:mm a' }}</span></div>
             <div class="row"><strong>Channel</strong><span>{{ ticket?.channel || '—' }}</span></div>
           </div>
 
@@ -179,85 +170,80 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
     </ng-template>
   `,
   styles: [`
-    :host { display:block;font-family:Arial,Helvetica,sans-serif;color:#222;font-size:10px }
+    :host { display:block;font-family:Arial,Helvetica,sans-serif;color:#222;font-size:13px }
     .wrap { padding:8px }
     .hdr { display:flex;justify-content:space-between;align-items:center;margin-bottom:6px }
     .left { display:flex;align-items:center;gap:5px }
-    .back { background:none;border:none;color:#0b66d1;cursor:pointer;font-size:10px }
-    .pill { padding:2px 6px;border-radius:8px;font-size:9px;font-weight:600;color:#fff }
+    .back { background:none;border:none;color:#0b66d1;cursor:pointer;font-size:12px }
+    .pill { padding:3px 8px;border-radius:8px;font-size:11px;font-weight:600;color:#fff }
     .pill.status-open { background:#0b66d1 }
     .pill.status-inprogress { background:#f59e0b }
     .pill.status-resolved { background:#059669 }
     .pill.status-closed { background:#6b7280 }
     .actions { display:flex;gap:4px }
-    .btn { padding:3px 7px;border-radius:4px;border:none;cursor:pointer;background:#eef1f5;font-size:9px }
+    .btn { padding:4px 10px;border-radius:4px;border:none;cursor:pointer;background:#eef1f5;font-size:12px }
     .btn.primary { background:#0b66d1;color:#fff }
-    .body { display:flex;gap:8px }
-    .main { flex:1 }
-    .side { width:180px;min-width:180px }
-    .subject { margin: 3px 0 6px }
-    .subject h2 { margin: 0 0 2px; font-size: 12px }
-    .meta { color: #6b7280; font-size: 9px }
-    .desc { background:#fff;border:1px solid #e5e7eb;border-radius:4px;padding:6px;margin-bottom:6px }
-    .desc h4 { margin:0 0 4px;font-size:10px }
-    .desc-body { white-space: pre-wrap; color:#334155;font-size:10px;line-height:1.35 }
-    .email-notice { 
-      background: #fef3c7; 
-      border: 1px solid #fbbf24; 
-      border-radius: 4px; 
-      padding: 5px 6px; 
-      margin-bottom: 6px; 
-      display: flex; 
-      align-items: center; 
-      gap: 5px; 
-      font-size: 9px; 
-      color: #92400e;
-    }
-    .email-notice i { color: #d97706; }
-    .view-zoho-link { 
-      margin-left: auto; 
-      color: #0369a1; 
-      text-decoration: none; 
-      font-weight: 500;
-      white-space: nowrap;
-      font-size:9px;
-    }
-    .view-zoho-link:hover { text-decoration: underline; }
-    .panel { background:#fff;border:1px solid #e5e7eb;border-radius:4px;padding:6px }
-    .panel + .panel { margin-top: 5px }
-    .row { display:flex;justify-content:space-between;gap:5px;margin-bottom:4px;font-size:9px }
-    .row strong { color:#475569;font-weight:600 }
-    .row span { text-align:right;color:#111827;word-break:break-all }
-    .msg { background:#fbfdff;padding:6px;border-radius:4px;border:1px solid #e5e7eb;margin-bottom:6px }
-    .mh { display:flex;gap:5px;margin-bottom:3px }
-    .av { width:20px;height:20px;border-radius:50%;background:#e5edff;color:#0b66d1;
-          display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:9px }
-    .who { font-size:10px;font-weight:600 }
-    .when { font-size:8px;color:#6b7280 }
+    .body { display:flex;gap:10px }
+    .main { flex:1;min-width:0 }
+    .side { width:220px;min-width:220px }
+    .subject { margin: 4px 0 8px }
+    .subject h2 { margin: 0 0 2px; font-size: 15px; font-weight: 600 }
+    .meta { color: #6b7280; font-size: 11px }
+    .desc { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px;margin-bottom:8px }
+    .desc h4 { margin:0 0 6px;font-size:12px;color:#374151 }
+    .desc-body { color:#1f2937;font-size:13px;line-height:1.5;word-break:break-word;overflow-wrap:anywhere }
+    .desc-body img { max-width: 100%; height: auto; }
+    .desc-body a { color: #0b66d1; text-decoration: underline; }
+    .desc-body p { margin: 0 0 8px; }
+    .desc-body p:last-child { margin-bottom: 0; }
+
+    .panel { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px }
+    .panel + .panel { margin-top: 8px }
+    .row { display:flex;flex-direction:column;gap:1px;margin-bottom:8px }
+    .row:last-child { margin-bottom:0 }
+    .row strong { color:#6b7280;font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:0.03em }
+    .row span { color:#111827;font-size:12px;word-break:break-word;overflow-wrap:anywhere }
+    .msg { background:#fbfdff;padding:8px;border-radius:6px;border:1px solid #e5e7eb;margin-bottom:8px }
+    .mh { display:flex;gap:6px;margin-bottom:6px;align-items:center }
+    .av { width:24px;height:24px;border-radius:50%;background:#e5edff;color:#0b66d1;
+          display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:10px;flex-shrink:0 }
+    .who { font-size:11px;font-weight:600 }
+    .when { font-size:9px;color:#6b7280 }
     .mb {
-      white-space: pre-wrap;
       word-break: break-word;
       overflow-wrap: anywhere;
-      line-height: 1.25;
-      font-size:10px;
+      line-height: 1.5;
+      font-size: 13px;
+      color: #1f2937;
+      padding: 4px 0;
     }
-    .attachments { margin-top: 4px; display: grid; gap: 3px; }
-    .attachment { display: flex; gap: 5px; align-items: center; font-size: 9px; }
-    .att-name { color: #1f2937; font-weight: 600; }
-    .att-link { background: none; border: none; color: #0b66d1; cursor: pointer; font-size: 9px; padding: 0; text-decoration: underline; }
-    .reply { margin-top: 6px }
-    .reply h4 { font-size:10px;margin:0 0 4px }
-    textarea { width:100%;border-radius:4px;border:1px solid #ccc;padding:4px;font-size:10px }
+    .mb p { margin: 0 0 8px; }
+    .mb p:last-child { margin-bottom: 0; }
+    .mb a { color: #0b66d1; text-decoration: underline; }
+    .mb img { max-width: 100%; height: auto; }
+    .mb table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 6px 0; }
+    .mb td, .mb th { border: 1px solid #e5e7eb; padding: 6px 8px; }
+    .mb blockquote { border-left: 3px solid #d1d5db; margin: 8px 0; padding: 4px 10px; color: #6b7280; }
+    .mb hr { border: none; border-top: 1px solid #e5e7eb; margin: 10px 0; }
+    .mb ul, .mb ol { margin: 4px 0; padding-left: 20px; }
+    .mb h1, .mb h2, .mb h3, .mb h4, .mb h5, .mb h6 { margin: 8px 0 4px; }
+    .attachments { margin-top: 6px; display: grid; gap: 4px; }
+    .attachment { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+    .att-name { color: #1f2937; font-weight: 600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .att-link { background: none; border: none; color: #0b66d1; cursor: pointer; font-size: 12px; padding: 0; text-decoration: underline; white-space:nowrap; }
+    .reply { margin-top: 8px }
+    .reply h4 { font-size:13px;margin:0 0 6px;font-weight:600 }
+    textarea { width:100%;border-radius:6px;border:1px solid #d1d5db;padding:8px;font-size:13px;resize:vertical }
     .no-msg { background:#f3f5f7;border-radius:4px;padding:6px;text-align:center;color:#666;font-size:9px }
     .reply-files { margin: 4px 0; }
-    .file-btn { display: inline-flex; gap: 4px; align-items: center; font-size: 9px; color:#0b66d1; cursor: pointer; }
+    .file-btn { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color:#0b66d1; cursor: pointer; }
     .file-btn input { display: none; }
     .file-list { margin-top: 3px; display: grid; gap: 3px; }
-    .file-item { display: flex; justify-content: space-between; align-items: center; font-size: 9px; color: #475569; }
-    .link { background: none; border: none; color: #d32f2f; cursor: pointer; font-size: 9px; }
-    .controls { display:flex;gap:10px;margin:5px 0;font-size:9px }
-    .btns { margin-top:5px }
-    @media(max-width:900px){ .body{flex-direction:column}.side{width:100%} }
+    .file-item { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #475569; }
+    .link { background: none; border: none; color: #d32f2f; cursor: pointer; font-size: 12px; }
+    .controls { display:flex;gap:12px;margin:6px 0;font-size:12px }
+    .btns { margin-top:6px }
+    @media(max-width:900px){ .body{flex-direction:column}.side{width:100%;min-width:unset} }
 
     :host-context(.dark-theme) { color: #e2e8f0; }
 
@@ -311,13 +297,7 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
       color: #94a3b8;
     }
 
-    :host-context(.dark-theme) .email-notice {
-      background: #422006;
-      border-color: #854d0e;
-      color: #fcd34d;
-    }
-    :host-context(.dark-theme) .email-notice i { color: #fbbf24; }
-    :host-context(.dark-theme) .view-zoho-link { color: #38bdf8; }
+
   `]
 })
 export class TicketDetailComponent implements OnInit, OnDestroy {
@@ -431,7 +411,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
         // Process messages/threads
         this.threads = (results.messages?.data || []).map((t: any) => ({
           authorName: t.author?.name || 'User',
-          content: t.content || t.summary || t.description || '',
+          content: t.content || t.description || t.summary || '',
           createdTime: t.createdTime,
           attachments: this.normalizeAttachments(t)
         }));

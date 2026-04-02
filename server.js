@@ -1391,41 +1391,50 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       return res.json(data);
     }
 
-    // 🚀 OPTIMIZATION: Limit enrichment to only conversations without content
-    // and use Promise.allSettled to prevent one failure from breaking others
-    const conversationsWithoutContent = data.data
-      .map((conv, idx) => ({ conv, idx }))
-      .filter(item => !item.conv?.content && !item.conv?.description && !item.conv?.summary)
-      .slice(0, 10); // 🔥 Limit max 10 detail calls per request
-
-    if (conversationsWithoutContent.length === 0) {
-      // All conversations have content, return as-is
-      return res.json(data);
-    }
-
-    const detailRequests = conversationsWithoutContent.map(async ({ conv, idx }) => {
+    // Always fetch full conversation details for every conversation
+    // Zoho uses /threads/{id} for email threads and /comments/{id} for comments
+    const detailRequests = data.data.map(async (conv, idx) => {
       try {
-        const detailRes = await zohoFetch(
-          `/tickets/${req.params.id}/conversations/${conv.id}`
-        );
+        // Determine the correct sub-endpoint based on conversation type
+        const convType = (conv.type || '').toLowerCase();
+        let detailEndpoint;
+        if (convType === 'comment') {
+          detailEndpoint = `/tickets/${req.params.id}/comments/${conv.id}`;
+        } else {
+          // Default to threads for email-type conversations
+          detailEndpoint = `/tickets/${req.params.id}/threads/${conv.id}`;
+        }
+
+        const detailRes = await zohoFetch(detailEndpoint);
         if (detailRes.ok) {
           const detail = await detailRes.json();
-          return {
-            idx,
-            enriched: detail?.data ? { ...conv, ...detail.data } : { ...conv, ...detail }
-          };
+          const detailData = detail?.data || detail;
+          return { idx, enriched: { ...conv, ...detailData } };
+        } else {
+          // Try the other endpoint as fallback
+          const fallbackEndpoint = convType === 'comment'
+            ? `/tickets/${req.params.id}/threads/${conv.id}`
+            : `/tickets/${req.params.id}/comments/${conv.id}`;
+          const fallbackRes = await zohoFetch(fallbackEndpoint);
+          if (fallbackRes.ok) {
+            const fallback = await fallbackRes.json();
+            const fallbackData = fallback?.data || fallback;
+            return { idx, enriched: { ...conv, ...fallbackData } };
+          }
         }
       } catch {
-        // ignore enrichment errors
+        // ignore enrichment errors, fall back to original
       }
       return { idx, enriched: conv };
     });
 
-    const enriched = await Promise.all(detailRequests);
+    const enriched = await Promise.allSettled(detailRequests);
     const resultData = [...data.data];
-    
-    enriched.forEach(({ idx, enriched: enrichedConv }) => {
-      resultData[conversationsWithoutContent[idx]?.idx] = enrichedConv;
+
+    enriched.forEach((result) => {
+      if (result.status === 'fulfilled') {
+        resultData[result.value.idx] = result.value.enriched;
+      }
     });
 
     res.json({ ...data, data: resultData });
