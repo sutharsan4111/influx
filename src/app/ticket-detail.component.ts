@@ -3,7 +3,8 @@ import { CommonModule } from '@angular/common';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
-import { forkJoin, Subject, takeUntil } from 'rxjs';
+import { forkJoin, Subject, takeUntil, of } from 'rxjs';
+import { catchError, map } from 'rxjs/operators';
 
 import { TicketService } from './services/ticket.service';
 import { MsalService } from './services/msal.service';
@@ -312,6 +313,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   replyFiles: File[] = [];
   currentUserEmail = '';
   userRole: 'admin' | 'user' = 'user';
+  private inlineObjectUrls: string[] = [];
 
   get isAdmin(): boolean {
     return this.userRole === 'admin';
@@ -370,11 +372,14 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.revokeInlineObjectUrls();
     this.destroy$.next();
     this.destroy$.complete();
   }
 
   loadTicketAndRelated(showLoading = true): void {
+    this.revokeInlineObjectUrls();
+
     // 🚀 Reset state before loading new ticket
     if (showLoading) {
       this.loading = true;
@@ -389,17 +394,19 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     this.replyFiles = [];
     this.cdr.markForCheck();
 
-    // Parallelize all 3 API calls at once using forkJoin
+    // Parallelize all 4 API calls at once (including Supabase assignment)
     forkJoin({
       ticket: this.ticketService.getTicketById(this.ticketId),
       messages: this.ticketService.getTicketMessages(this.ticketId),
-      attachments: this.ticketService.getTicketAttachments(this.ticketId)
+      attachments: this.ticketService.getTicketAttachments(this.ticketId),
+      assignment: this.assignmentService.getAssignment(this.ticketId).pipe(catchError(() => of(null)))
     }).subscribe({
       next: (results: any) => {
         // All responses arrive at the same time
         this.ticket = this.normalizeTicket(results.ticket);
+        this.supabaseAssignment = results.assignment;
         
-        // Check permissions before displaying ticket
+        // Check permissions AFTER loading both Zoho and Supabase data
         if (!this.canViewTicket(this.ticket)) {
           this.loading = false;
           this.messageService.error('You do not have permission to view this ticket');
@@ -415,22 +422,13 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
           createdTime: t.createdTime,
           attachments: this.normalizeAttachments(t)
         }));
+
+        this.resolveInlineImagesInThreads();
         
         // Process attachments
         this.ticketAttachments = Array.isArray(results.attachments?.data) 
           ? results.attachments.data 
           : [];
-        
-        // Load Supabase assignment (for org users not in Zoho)
-        this.assignmentService.getAssignment(this.ticketId).subscribe({
-          next: (assignment) => {
-            this.supabaseAssignment = assignment;
-            this.cdr.markForCheck();
-          },
-          error: () => {
-            // No assignment found - that's OK
-          }
-        });
         
         this.saveToCache(this.ticketId);
         this.loading = false;
@@ -532,6 +530,218 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
 
   sanitize(html: string): SafeHtml {
     return this.sanitizer.bypassSecurityTrustHtml(html);
+  }
+
+  private resolveInlineImagesInThreads(): void {
+    this.threads.forEach((thread: any, threadIndex: number) => {
+      const html = (thread?.content || '').toString();
+      const attachments = Array.isArray(thread?.attachments) ? thread.attachments : [];
+      if (!html || !/<img\b/i.test(html)) return;
+
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const images = Array.from(doc.querySelectorAll('img'));
+      if (!images.length) return;
+
+      const targets: Array<{ imageIndex: number; attachmentId?: string; path?: string }> = [];
+      const usedAttachmentIds = new Set<string>();
+
+      images.forEach((img, imageIndex) => {
+        const src = (img.getAttribute('src') || '').trim();
+        if (!src || /^data:|^blob:/i.test(src)) return;
+
+        let attachment: any | null = null;
+
+        if (/^cid:/i.test(src)) {
+          attachment = this.findAttachmentForCid(src, attachments);
+        }
+
+        if (!attachment) {
+          const attachmentIdFromSrc = this.extractAttachmentIdFromSrc(src);
+          if (attachmentIdFromSrc) {
+            attachment = this.findAttachmentById(attachmentIdFromSrc, attachments);
+          }
+        }
+
+        const attachmentId = (attachment?.id || attachment?.attachmentId || '').toString();
+        if (attachmentId) {
+          targets.push({ imageIndex, attachmentId });
+          usedAttachmentIds.add(attachmentId);
+          return;
+        }
+
+        const pathFromSrc = this.extractZohoPathFromSrc(src);
+        if (pathFromSrc) {
+          targets.push({ imageIndex, path: pathFromSrc });
+        }
+      });
+
+      // Fallback: map unresolved images to available image attachments by order.
+      const imageAttachments = attachments.filter((a: any) => this.isImageAttachment(a));
+      if (imageAttachments.length) {
+        const unresolved = images
+          .map((_, imageIndex) => imageIndex)
+          .filter((imageIndex) => !targets.some(t => t.imageIndex === imageIndex));
+
+        unresolved.forEach((imageIndex) => {
+          const next = imageAttachments.find((a: any) => {
+            const id = (a?.id || a?.attachmentId || '').toString();
+            return !!id && !usedAttachmentIds.has(id);
+          });
+
+          const attachmentId = (next?.id || next?.attachmentId || '').toString();
+          if (!attachmentId) return;
+
+          targets.push({ imageIndex, attachmentId });
+          usedAttachmentIds.add(attachmentId);
+        });
+      }
+
+      const uniqueAttachmentIds = Array.from(new Set(targets.map(t => t.attachmentId).filter(Boolean) as string[]));
+      const uniquePaths = Array.from(new Set(targets.map(t => t.path).filter(Boolean) as string[]));
+      if (!uniqueAttachmentIds.length && !uniquePaths.length) return;
+
+      const requests: any[] = uniqueAttachmentIds.map((attachmentId) =>
+        this.ticketService.getAttachmentBlob(this.ticketId, attachmentId).pipe(
+          map((blob: Blob) => {
+            const objectUrl = URL.createObjectURL(blob);
+            this.inlineObjectUrls.push(objectUrl);
+            return { attachmentId, objectUrl };
+          }),
+          catchError(() => of(null))
+        )
+      );
+
+      uniquePaths.forEach((path) => {
+        requests.push(
+          this.ticketService.getZohoContentByPath(path).pipe(
+            map((blob: Blob) => {
+              const objectUrl = URL.createObjectURL(blob);
+              this.inlineObjectUrls.push(objectUrl);
+              return { path, objectUrl };
+            }),
+            catchError(() => of(null))
+          )
+        );
+      });
+
+      forkJoin(requests).subscribe((results: any[]) => {
+        const urlByAttachmentId = new Map<string, string>();
+        const urlByPath = new Map<string, string>();
+        results.filter(Boolean).forEach((item: any) => {
+          if (item.attachmentId) {
+            urlByAttachmentId.set(item.attachmentId, item.objectUrl);
+          }
+          if (item.path) {
+            urlByPath.set(item.path, item.objectUrl);
+          }
+        });
+
+        targets.forEach((target) => {
+          let objectUrl = '';
+          if (target.attachmentId) {
+            objectUrl = urlByAttachmentId.get(target.attachmentId) || '';
+          }
+          if (!objectUrl && target.path) {
+            objectUrl = urlByPath.get(target.path) || '';
+          }
+          if (!objectUrl) return;
+          images[target.imageIndex]?.setAttribute('src', objectUrl);
+        });
+
+        this.threads[threadIndex] = {
+          ...this.threads[threadIndex],
+          content: doc.body.innerHTML
+        };
+        this.cdr.markForCheck();
+      });
+    });
+  }
+
+  private findAttachmentForCid(cid: string, attachments: any[]): any | null {
+    const normalize = (value: any) => (value || '')
+      .toString()
+      .trim()
+      .replace(/^cid:/i, '')
+      .replace(/[<>]/g, '')
+      .toLowerCase();
+
+    const normalizedCid = normalize(cid);
+    if (!normalizedCid) return null;
+
+    const byContentId = attachments.find((a: any) => {
+      const candidates = [a?.contentId, a?.contentID, a?.content_id, a?.cid, a?.content];
+      return candidates.some((c: any) => normalize(c) === normalizedCid);
+    });
+    if (byContentId) return byContentId;
+
+    // Outlook often uses filename-like cid; fallback by file name match
+    const byName = attachments.find((a: any) => {
+      const name = normalize(a?.fileName || a?.name || '');
+      return !!name && (normalizedCid.includes(name) || name.includes(normalizedCid));
+    });
+    return byName || null;
+  }
+
+  private extractAttachmentIdFromSrc(src: string): string | null {
+    if (!src) return null;
+
+    const fromPath = src.match(/\/attachments\/([^\/?#]+)/i);
+    if (fromPath?.[1]) return fromPath[1];
+
+    const fromQuery = src.match(/[?&](?:attachmentId|id)=([^&#]+)/i);
+    if (fromQuery?.[1]) return decodeURIComponent(fromQuery[1]);
+
+    return null;
+  }
+
+  private extractZohoPathFromSrc(src: string): string | null {
+    if (!src) return null;
+
+    const cleaned = src.trim();
+
+    if (cleaned.startsWith('/api/v1/')) {
+      return cleaned;
+    }
+
+    if (/^https?:\/\//i.test(cleaned)) {
+      try {
+        const parsed = new URL(cleaned);
+        const pathname = parsed.pathname || '';
+        if (pathname.toLowerCase().includes('/api/v1/')) {
+          return `${pathname}${parsed.search || ''}`;
+        }
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  private findAttachmentById(attachmentId: string, attachments: any[]): any | null {
+    const id = (attachmentId || '').toString().trim();
+    if (!id) return null;
+    return attachments.find((a: any) => {
+      const candidateId = (a?.id || a?.attachmentId || '').toString().trim();
+      return candidateId === id;
+    }) || null;
+  }
+
+  private isImageAttachment(att: any): boolean {
+    const contentType = (att?.contentType || att?.mimeType || att?.type || '').toString().toLowerCase();
+    if (contentType.startsWith('image/')) return true;
+
+    const fileName = (att?.fileName || att?.name || '').toString().toLowerCase();
+    return /\.(png|jpg|jpeg|gif|bmp|webp|svg)$/.test(fileName);
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private revokeInlineObjectUrls(): void {
+    this.inlineObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+    this.inlineObjectUrls = [];
   }
 
   onReplyFilesSelected(event: Event): void {
@@ -662,10 +872,24 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
       return true;
     }
 
-    // User can only view their own tickets (requester or assignee)
+    // User can view if they are:
+    // 1. The requester (contact email matches)
     const requesterEmail = (ticket.email || ticket.contact?.email || '').trim().toLowerCase();
-    const assigneeEmail = (ticket.assignedTo || ticket.assignee?.email || '').trim().toLowerCase();
+    if (requesterEmail === this.currentUserEmail) {
+      return true;
+    }
 
-    return requesterEmail === this.currentUserEmail || assigneeEmail === this.currentUserEmail;
+    // 2. The assignee in Zoho
+    const assigneeEmail = (ticket.assignedTo || ticket.assignee?.email || '').trim().toLowerCase();
+    if (assigneeEmail === this.currentUserEmail) {
+      return true;
+    }
+
+    // 3. Assigned via Supabase (multi-agent assignment)
+    if (this.supabaseAssignment?.assigned_users?.some(u => u.toLowerCase() === this.currentUserEmail)) {
+      return true;
+    }
+
+    return false;
   }
 }

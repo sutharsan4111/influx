@@ -59,6 +59,18 @@ export interface AssignableUser {
   role: string;
 }
 
+export interface RecycleBinTicket {
+  zoho_ticket_id: string;
+  zoho_ticket_number?: string;
+  subject?: string;
+  email?: string;
+  priority?: string;
+  deleted_by?: string;
+  deleted_at?: string;
+  expires_at?: string;
+  expires_in_days?: number;
+}
+
 // 🚀 Tab cache interface for persisting ticket list state across navigation
 export interface TabCacheEntry {
   tickets: Ticket[];
@@ -121,7 +133,8 @@ export class TicketService {
     page = 1,
     limit = 27,
     status?: 'open' | 'closed',
-    search?: string
+    search?: string,
+    filterByEmail?: string
   ): Observable<any> {
 
     const params: string[] = [
@@ -131,6 +144,7 @@ export class TicketService {
 
     if (status) params.push(`status=${status}`);
     if (search) params.push(`search=${encodeURIComponent(search)}`);
+    if (filterByEmail) params.push(`filterByEmail=${encodeURIComponent(filterByEmail)}`);
 
     const cacheKey = params.join('&');
 
@@ -203,6 +217,13 @@ export class TicketService {
   getAttachmentBlob(ticketId: string, attachmentId: string) {
     return this.http.get(
       `${this.apiUrl}/${ticketId}/attachments/${attachmentId}`,
+      { headers: this.getAuthHeaders(), responseType: 'blob' }
+    );
+  }
+
+  getZohoContentByPath(path: string) {
+    return this.http.get(
+      `/api/zoho-content?path=${encodeURIComponent(path)}`,
       { headers: this.getAuthHeaders(), responseType: 'blob' }
     );
   }
@@ -343,6 +364,38 @@ export class TicketService {
   getAssignableUsers(): Observable<AssignableUser[]> {
     return this.http.get<AssignableUser[]>(
       '/api/assignable-users',
+      { headers: this.getAuthHeaders() }
+    );
+  }
+
+  /* ================= RECYCLE BIN ================= */
+
+  moveToRecycleBin(ticketId: string, ticket?: Partial<Ticket>): Observable<any> {
+    return this.http.post(
+      `${this.apiUrl}/${ticketId}/recycle`,
+      { ticket: ticket || null },
+      { headers: this.getAuthHeaders() }
+    );
+  }
+
+  getRecycleBinTickets(): Observable<{ data: RecycleBinTicket[] }> {
+    return this.http.get<{ data: RecycleBinTicket[] }>(
+      `${this.apiUrl}/recycle-bin`,
+      { headers: this.getAuthHeaders() }
+    );
+  }
+
+  restoreFromRecycleBin(ticketId: string): Observable<any> {
+    return this.http.post(
+      `${this.apiUrl}/recycle-bin/${ticketId}/restore`,
+      {},
+      { headers: this.getAuthHeaders() }
+    );
+  }
+
+  permanentDeleteFromRecycleBin(ticketId: string): Observable<any> {
+    return this.http.delete(
+      `${this.apiUrl}/recycle-bin/${ticketId}`,
       { headers: this.getAuthHeaders() }
     );
   }

@@ -5,8 +5,36 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ticket Management System</title>
   <base href="/">
-  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="icon" id="favicon" type="image/png" href="assets/MIT_logo.png">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"/>
+  <script>
+    // Generate circular favicon: crop white corners to transparent
+    (function() {
+      var img = new Image();
+      img.onload = function() {
+        var size = 64;
+        var c = document.createElement('canvas');
+        c.width = size; c.height = size;
+        var ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, size, size);
+        // Clip to circle
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.clip();
+        // Crop the center square of the image (the circle area)
+        var s = Math.min(img.width, img.height);
+        var sx = (img.width - s) / 2;
+        var sy = (img.height - s) / 2;
+        // Slightly zoom in (90%) to cut off any remaining white edges
+        var inset = s * 0.05;
+        ctx.drawImage(img, sx + inset, sy + inset, s - inset * 2, s - inset * 2, 0, 0, size, size);
+        var link = document.getElementById('favicon');
+        if (link) { link.href = c.toDataURL('image/png'); }
+      };
+      img.src = 'assets/MIT_logo.png';
+    })();
+  </script>
 </head>
 <body>
   <app-root></app-root>

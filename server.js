@@ -152,6 +152,24 @@ async function runMigrations() {
       )
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS recycled_tickets (
+        id SERIAL PRIMARY KEY,
+        zoho_ticket_id VARCHAR(50) NOT NULL UNIQUE,
+        zoho_ticket_number VARCHAR(50),
+        subject TEXT,
+        email VARCHAR(255),
+        priority VARCHAR(100),
+        deleted_by VARCHAR(255) NOT NULL,
+        deleted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
+        restored_at TIMESTAMP WITH TIME ZONE,
+        snapshot JSONB,
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+
     // Optional SSL fields should be nullable/optional in API usage.
     await pool.query(`
       ALTER TABLE ssl_assets
@@ -1083,6 +1101,21 @@ let countsCache = null;
 let countsCacheTime = 0;
 const COUNTS_CACHE_MS = 5 * 60 * 1000; // 5 minutes cache (larger datasets need more time)
 
+async function getActiveRecycledTicketIds() {
+  try {
+    const result = await pool.query(
+      `SELECT zoho_ticket_id
+       FROM recycled_tickets
+       WHERE restored_at IS NULL
+         AND expires_at > NOW()`
+    );
+    return new Set(result.rows.map(r => (r.zoho_ticket_id || '').toString()));
+  } catch (err) {
+    console.error('Failed to fetch recycled ticket ids:', err?.message || err);
+    return new Set();
+  }
+}
+
 app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
   // Disable browser caching for this endpoint
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
@@ -1092,10 +1125,12 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
   
   try {
     const userEmail = req.user?.email?.toLowerCase() || '';
+    const userRole = (req.user?.role || 'user').toLowerCase();
+    const isAdmin = userRole === 'admin';
     
     // Return cached counts if still valid (5 min cache for large datasets)
     // Use user-specific cache key for assigned count
-    const cacheKey = `counts_${userEmail}`;
+    const cacheKey = `counts_${userRole}_${userEmail}`;
     if (countsCache && countsCache._key === cacheKey && (Date.now() - countsCacheTime) < COUNTS_CACHE_MS) {
       console.log('Returning cached counts:', countsCache);
       return res.json(countsCache);
@@ -1103,29 +1138,8 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
 
     console.log(`Fetching fresh counts for user: ${userEmail}`);
     
-    // Helper to count tickets for a specific status with pagination
-    async function countTicketsByStatus(status) {
-      let count = 0;
-      let from = 0;
-      const limit = 100;
-      let hasMore = true;
-      
-      while (hasMore && from < 10000) { // Safety limit of 10k per status
-        const res = await zohoFetch(`/tickets?limit=${limit}&from=${from}&status=${status}`);
-        if (!res.ok) {
-          console.error(`Failed to fetch ${status} tickets at from=${from}:`, res.status);
-          break;
-        }
-        const data = await res.json();
-        const tickets = data.data || [];
-        count += tickets.length;
-        hasMore = tickets.length === limit;
-        from += limit;
-      }
-      return count;
-    }
+    const recycledTicketIds = await getActiveRecycledTicketIds();
 
-    // Get Supabase assignments for current user
     async function getSupabaseAssignedTickets(email) {
       if (!email) return new Set();
       try {
@@ -1140,91 +1154,100 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
       }
     }
 
-    // Get Supabase assigned ticket IDs first
-    const supabaseAssignedIds = await getSupabaseAssignedTickets(userEmail);
-    console.log(`User has ${supabaseAssignedIds.size} Supabase assignments`);
+    async function getAllSupabaseAssignedOpenTickets() {
+      try {
+        const result = await pool.query(
+          `SELECT zoho_ticket_id
+           FROM ticket_assignments
+           WHERE status IS NULL OR LOWER(status) NOT IN ('closed', 'resolved')`
+        );
+        return new Set(result.rows.map(r => r.zoho_ticket_id));
+      } catch (e) {
+        console.error('Error fetching all Supabase open assignments:', e);
+        return new Set();
+      }
+    }
 
-    // Helper to count SLA tickets assigned to user (from Zoho + Supabase)
-    async function countMySLATickets(email, supabaseIds) {
-      if (!email) return 0;
-      let slaCount = 0;
-      let from = 0;
+    const mySupabaseAssignedIds = await getSupabaseAssignedTickets(userEmail);
+    const allSupabaseAssignedOpenIds = isAdmin
+      ? await getAllSupabaseAssignedOpenTickets()
+      : new Set();
+
+    // Helper to count tickets with filters and pagination
+    async function countTicketsByStatus(status, options = {}) {
+      const {
+        onlyMine = false,
+        onlySla = false,
+        onlyAssigned = false
+      } = options;
+
+      let count = 0;
       const limit = 100;
-      let hasMore = true;
+      const PARALLEL = 5;
+      let batchStart = 0;
+      let keepGoing = true;
       
-      while (hasMore && from < 10000) {
-        const res = await zohoFetch(`/tickets?limit=${limit}&from=${from}&status=Open&include=assignee`);
-        if (!res.ok) break;
-        const data = await res.json();
-        const tickets = data.data || [];
-        
-        for (const t of tickets) {
-          const priority = (t.priority || '').toLowerCase();
-          const isSLA = priority.includes('sla') || priority.includes('urgent') || priority.includes('critical');
-          
-          if (isSLA) {
-            const ticketId = t.id?.toString();
+      while (keepGoing && batchStart < 10000) {
+        const batchPromises = [];
+        for (let i = 0; i < PARALLEL; i++) {
+          const offset = batchStart + i * limit;
+          if (offset >= 10000) break;
+          batchPromises.push(
+            zohoFetch(`/tickets?limit=${limit}&from=${offset}&status=${status}&include=assignee`)
+              .then(r => r.ok ? r.json() : { data: [] })
+              .then(d => ({ data: d.data || [], offset }))
+              .catch(() => ({ data: [], offset }))
+          );
+        }
+
+        if (batchPromises.length === 0) break;
+        const batchResults = await Promise.all(batchPromises);
+
+        let anyFull = false;
+        for (const result of batchResults) {
+          const tickets = result.data;
+          if (tickets.length === limit) anyFull = true;
+
+          for (const t of tickets) {
+            const ticketId = (t.id || '').toString();
+            if (!ticketId || recycledTicketIds.has(ticketId)) continue;
+
+            const priority = (t.priority || '').toLowerCase();
             const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-            
-            // Check if assigned to user via Zoho OR Supabase
-            if (zohoAssignee === email || supabaseIds.has(ticketId)) {
-              slaCount++;
-            }
+            const mineByZoho = !!userEmail && zohoAssignee === userEmail;
+            const mineBySupabase = !!userEmail && mySupabaseAssignedIds.has(ticketId);
+            const isMine = mineByZoho || mineBySupabase;
+            const isAssigned = !!zohoAssignee || allSupabaseAssignedOpenIds.has(ticketId);
+            const isSla = priority.includes('sla') || priority.includes('urgent') || priority.includes('critical');
+
+            if (onlyMine && !isMine) continue;
+            if (onlySla && !isSla) continue;
+            if (onlyAssigned && !isAssigned) continue;
+
+            count++;
           }
         }
-        
-        hasMore = tickets.length === limit;
-        from += limit;
+
+        if (!anyFull) keepGoing = false;
+        batchStart += PARALLEL * limit;
       }
-      return slaCount;
+
+      return count;
     }
 
-    // Helper to count tickets assigned to current user (Zoho + Supabase)
-    async function countAssignedToUser(email, supabaseIds) {
-      if (!email) return 0;
-      let assignedCount = 0;
-      const countedIds = new Set();
-      let from = 0;
-      const limit = 100;
-      let hasMore = true;
-      
-      while (hasMore && from < 10000) {
-        const res = await zohoFetch(`/tickets?limit=${limit}&from=${from}&status=Open&include=assignee`);
-        if (!res.ok) break;
-        const data = await res.json();
-        const tickets = data.data || [];
-        
-        for (const t of tickets) {
-          const ticketId = t.id?.toString();
-          if (countedIds.has(ticketId)) continue;
-          
-          const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-          
-          // Check if assigned to user via Zoho OR Supabase
-          if (zohoAssignee === email || supabaseIds.has(ticketId)) {
-            assignedCount++;
-            countedIds.add(ticketId);
-          }
-        }
-        
-        hasMore = tickets.length === limit;
-        from += limit;
-      }
-      return assignedCount;
-    }
-
-    // Fetch all counts in parallel
+    // Admin sees all tickets for open/closed; assigned & SLA are always personal.
     const [openCount, closedCount, slaCount, assignedCount] = await Promise.all([
-      countTicketsByStatus('Open'),
-      countTicketsByStatus('Closed'),
-      countMySLATickets(userEmail, supabaseAssignedIds),
-      countAssignedToUser(userEmail, supabaseAssignedIds)
+      countTicketsByStatus('Open', isAdmin ? {} : { onlyMine: true }),
+      countTicketsByStatus('Closed', isAdmin ? {} : { onlyMine: true }),
+      countTicketsByStatus('Open', { onlyMine: true, onlySla: true }),
+      countTicketsByStatus('Open', { onlyMine: true })
     ]);
 
     console.log(`Counts for ${userEmail}: open=${openCount}, closed=${closedCount}, mySLA=${slaCount}, assigned=${assignedCount}`);
 
     countsCache = {
       _key: cacheKey,
+      scope: isAdmin ? 'all' : 'mine',
       open: openCount,
       closed: closedCount,
       sla: slaCount,
@@ -1283,15 +1306,129 @@ app.get('/api/agents', authenticateToken, async (req, res) => {
   }
 });
 
+// Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
+const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
+const USER_TICKETS_CACHE_MS = 5 * 60 * 1000; // 5 minutes
+
 app.get('/api/tickets', authenticateToken, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 27;
     const page = parseInt(req.query.page) || 1;
     const status = req.query.status;
     const search = req.query.search;
+    const filterByEmail = req.query.filterByEmail; // Server-side user filter
     const from = (page - 1) * limit;
     const include = 'contacts,assignee';
 
+    // If filterByEmail is set, use cached user tickets
+    if (filterByEmail) {
+      const userEmail = filterByEmail.toLowerCase();
+      const cacheKey = `${userEmail}_${status || 'all'}`;
+      const cached = userTicketsCache.get(cacheKey);
+
+      let allUserTickets;
+      if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) {
+        allUserTickets = cached.tickets;
+      } else {
+        // Scan Zoho in PARALLEL batches for speed
+        const startTime = Date.now();
+        const apiPageSize = 100;
+        const PARALLEL_BATCH = 5; // 5 parallel requests at a time
+
+        const [recycledIds, supabaseResult] = await Promise.all([
+          getActiveRecycledTicketIds(),
+          pool.query(
+            "SELECT zoho_ticket_id FROM ticket_assignments WHERE LOWER(primary_assignee) = $1",
+            [userEmail]
+          ).catch(e => { console.error('Supabase assignment fetch error:', e); return { rows: [] }; })
+        ]);
+        const supabaseAssignedIds = new Set(supabaseResult.rows.map(r => r.zoho_ticket_id));
+
+        // Helper to filter tickets from a Zoho response
+        function filterMyTickets(tickets) {
+          const result = [];
+          for (const t of tickets) {
+            const ticketId = (t.id || '').toString();
+            if (!ticketId || recycledIds.has(ticketId)) continue;
+            const contactEmail = (t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail || '').toLowerCase();
+            const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+            if (contactEmail === userEmail || assigneeEmail === userEmail || supabaseAssignedIds.has(ticketId)) {
+              result.push({
+                ...t,
+                email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
+                assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+              });
+            }
+          }
+          return result;
+        }
+
+        // First, do a quick probe to find how many pages exist
+        let statusParam = '';
+        if (status === 'open') statusParam = '&status=Open';
+        else if (status === 'closed') statusParam = '&status=Closed';
+
+        allUserTickets = [];
+        let zohoFrom = 0;
+        let keepScanning = true;
+
+        while (keepScanning) {
+          // Launch PARALLEL_BATCH requests at once
+          const batchPromises = [];
+          for (let i = 0; i < PARALLEL_BATCH; i++) {
+            const offset = zohoFrom + i * apiPageSize;
+            if (offset > 5000) break; // Safety cap
+            const ep = `/tickets?limit=${apiPageSize}&from=${offset}&include=${include}${statusParam}`;
+            batchPromises.push(
+              zohoFetch(ep)
+                .then(r => r.ok ? r.json() : { data: [] })
+                .then(d => ({ data: d.data || [], offset }))
+                .catch(() => ({ data: [], offset }))
+            );
+          }
+
+          if (batchPromises.length === 0) break;
+
+          const batchResults = await Promise.all(batchPromises);
+
+          // Sort by offset to maintain order
+          batchResults.sort((a, b) => a.offset - b.offset);
+
+          let anyPageFull = false;
+          for (const result of batchResults) {
+            const myTickets = filterMyTickets(result.data);
+            allUserTickets.push(...myTickets);
+            if (result.data.length === apiPageSize) anyPageFull = true;
+          }
+
+          // If no page in batch was full, we've reached the end
+          if (!anyPageFull) {
+            keepScanning = false;
+          } else {
+            zohoFrom += PARALLEL_BATCH * apiPageSize;
+            if (zohoFrom > 5000) keepScanning = false;
+          }
+        }
+
+        // Cache all user tickets
+        userTicketsCache.set(cacheKey, { tickets: allUserTickets, time: Date.now() });
+        console.log(`Cached ${allUserTickets.length} tickets for ${userEmail} (${status || 'all'}) in ${Date.now() - startTime}ms`);
+      }
+
+      // Paginate from cached results
+      const startIdx = (page - 1) * limit;
+      const pageData = allUserTickets.slice(startIdx, startIdx + limit);
+
+      return res.json({
+        page,
+        limit,
+        count: pageData.length,
+        hasMore: startIdx + limit < allUserTickets.length,
+        data: pageData
+      });
+    }
+
+    // Standard path (no user filter)
     let endpoint = `/tickets?limit=${limit}&from=${from}&include=${include}`;
 
     if (status === 'open') {
@@ -1329,16 +1466,162 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
       assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
     }));
 
+    const recycledIds = await getActiveRecycledTicketIds();
+    const filtered = normalized.filter(t => !recycledIds.has((t.id || '').toString()));
+
     res.json({
       page,
       limit,
-      count: normalized.length || 0,
+      count: filtered.length || 0,
       hasMore: (data.data || []).length === limit,
-      data: normalized
+      data: filtered
     });
   } catch (err) {
     console.error('Tickets endpoint error:', err.message);
     res.status(500).json({ error: 'Failed to fetch tickets', details: err.message });
+  }
+});
+
+app.get('/api/tickets/recycle-bin', authenticateToken, async (req, res) => {
+  try {
+    await pool.query(
+      `DELETE FROM recycled_tickets
+       WHERE restored_at IS NULL
+         AND expires_at <= NOW()`
+    );
+
+    const result = await pool.query(
+      `SELECT
+         zoho_ticket_id,
+         zoho_ticket_number,
+         subject,
+         email,
+         priority,
+         deleted_by,
+         deleted_at,
+         expires_at,
+         GREATEST(0, CEIL(EXTRACT(EPOCH FROM (expires_at - NOW())) / 86400))::INT AS expires_in_days
+       FROM recycled_tickets
+       WHERE restored_at IS NULL
+         AND expires_at > NOW()
+       ORDER BY deleted_at DESC`
+    );
+
+    return res.json({ data: result.rows });
+  } catch (err) {
+    console.error('Recycle bin fetch failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to fetch recycle bin' });
+  }
+});
+
+app.post('/api/tickets/:id/recycle', authenticateToken, async (req, res) => {
+  // Invalidate caches
+  userTicketsCache.clear();
+  countsCache = null;
+  countsCacheTime = 0;
+  try {
+    const ticketId = (req.params.id || '').toString();
+    if (!ticketId) {
+      return res.status(400).json({ error: 'Ticket id is required' });
+    }
+
+    let snapshot = req.body?.ticket || null;
+
+    if (!snapshot) {
+      const detailRes = await zohoFetch(`/tickets/${ticketId}?include=contacts,assignee`);
+      if (detailRes.ok) {
+        snapshot = await detailRes.json();
+      }
+    }
+
+    const source = snapshot?.data || snapshot || {};
+    const ticketNumber = source.ticketNumber || source.displayId || source.id || ticketId;
+    const subject = source.subject || 'No Subject';
+    const email = source.email || source.contact?.email || source.contact?.emailAddress || null;
+    const priority = source.priority || null;
+    const deletedBy = (req.user?.email || '').toLowerCase() || 'unknown';
+
+    await pool.query(
+      `INSERT INTO recycled_tickets
+        (zoho_ticket_id, zoho_ticket_number, subject, email, priority, deleted_by, deleted_at, expires_at, restored_at, snapshot, updated_at)
+       VALUES
+        ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', NULL, $7::jsonb, NOW())
+       ON CONFLICT (zoho_ticket_id)
+       DO UPDATE SET
+         zoho_ticket_number = EXCLUDED.zoho_ticket_number,
+         subject = EXCLUDED.subject,
+         email = EXCLUDED.email,
+         priority = EXCLUDED.priority,
+         deleted_by = EXCLUDED.deleted_by,
+         deleted_at = NOW(),
+         expires_at = NOW() + INTERVAL '30 days',
+         restored_at = NULL,
+         snapshot = EXCLUDED.snapshot,
+         updated_at = NOW()`,
+      [ticketId, `${ticketNumber}`, subject, email, priority, deletedBy, JSON.stringify(source || {})]
+    );
+
+    countsCache = null;
+    countsCacheTime = 0;
+
+    return res.json({ message: 'Ticket moved to recycle bin' });
+  } catch (err) {
+    console.error('Recycle ticket failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to move ticket to recycle bin' });
+  }
+});
+
+app.post('/api/tickets/recycle-bin/:ticketId/restore', authenticateToken, async (req, res) => {
+  // Invalidate caches
+  userTicketsCache.clear();
+  countsCache = null;
+  countsCacheTime = 0;
+  try {
+    const ticketId = (req.params.ticketId || '').toString();
+    const result = await pool.query(
+      `UPDATE recycled_tickets
+       SET restored_at = NOW(), updated_at = NOW()
+       WHERE zoho_ticket_id = $1
+         AND restored_at IS NULL
+       RETURNING zoho_ticket_id`,
+      [ticketId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Ticket not found in recycle bin' });
+    }
+
+    countsCache = null;
+    countsCacheTime = 0;
+
+    return res.json({ message: 'Ticket restored successfully' });
+  } catch (err) {
+    console.error('Restore recycle ticket failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to restore ticket' });
+  }
+});
+
+app.delete('/api/tickets/recycle-bin/:ticketId', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = (req.params.ticketId || '').toString();
+    const result = await pool.query(
+      `DELETE FROM recycled_tickets
+       WHERE zoho_ticket_id = $1
+       RETURNING zoho_ticket_id`,
+      [ticketId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Ticket not found in recycle bin' });
+    }
+
+    countsCache = null;
+    countsCacheTime = 0;
+
+    return res.json({ message: 'Ticket permanently deleted from recycle bin' });
+  } catch (err) {
+    console.error('Permanent delete recycle ticket failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to permanently delete ticket' });
   }
 });
 
@@ -1373,6 +1656,11 @@ app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
     if (!response.ok) {
       return res.status(response.status).json(data || { error: 'Failed to update ticket' });
     }
+
+    // Invalidate user tickets cache and counts cache on ticket update
+    userTicketsCache.clear();
+    countsCache = null;
+    countsCacheTime = 0;
 
     return res.json(data || { status: 'ok' });
   } catch (err) {
@@ -1486,6 +1774,54 @@ app.get('/api/tickets/:id/attachments/:attachmentId', authenticateToken, async (
     response.body.pipe(res);
   } catch {
     res.status(500).json({ error: 'Failed to download attachment' });
+  }
+});
+
+app.get('/api/zoho-content', authenticateToken, async (req, res) => {
+  try {
+    const rawPath = (req.query.path || '').toString().trim();
+    if (!rawPath) {
+      return res.status(400).json({ error: 'path query is required' });
+    }
+
+    // Only allow Zoho Desk API v1 paths.
+    let apiPath = rawPath;
+    if (/^https?:\/\//i.test(rawPath)) {
+      const parsed = new URL(rawPath);
+      apiPath = `${parsed.pathname}${parsed.search || ''}`;
+    }
+
+    const v1Index = apiPath.toLowerCase().indexOf('/api/v1/');
+    if (v1Index >= 0) {
+      apiPath = apiPath.slice(v1Index + '/api/v1'.length);
+    }
+
+    if (!apiPath.startsWith('/')) {
+      apiPath = `/${apiPath}`;
+    }
+
+    const response = await zohoFetch(apiPath);
+    if (!response.ok) {
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = { error: 'Failed to fetch Zoho content' };
+      }
+      return res.status(response.status).json(data);
+    }
+
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    const disposition = response.headers.get('content-disposition');
+
+    res.setHeader('Content-Type', contentType);
+    if (disposition) {
+      res.setHeader('Content-Disposition', disposition);
+    }
+
+    response.body.pipe(res);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch Zoho content', details: err?.message || String(err) });
   }
 });
 

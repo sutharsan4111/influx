@@ -177,6 +177,11 @@ import { SslService } from '../services/ssl.service';
                         (click)="openTicket(ticket.id || ticket.ticketId || '')">
                   Open
                 </button>
+
+                <button class="btn btn-delete"
+                        (click)="moveToRecycleBin(ticket)">
+                  Delete
+                </button>
               </div>
             </td>
           </tr>
@@ -1145,6 +1150,17 @@ import { SslService } from '../services/ssl.service';
       box-shadow: 0 2px 6px rgba(16, 185, 129, 0.2);
     }
 
+    .btn-delete {
+      background: linear-gradient(135deg, #fff1f2 0%, #ffe4e6 100%);
+      color: #e11d48;
+      border: 1px solid #fecdd3;
+    }
+
+    .btn-delete:hover {
+      background: linear-gradient(135deg, #ffe4e6 0%, #fecdd3 100%);
+      box-shadow: 0 2px 6px rgba(225, 29, 72, 0.25);
+    }
+
     :host-context(.dark-theme) .btn-assign {
       background: linear-gradient(135deg, #064e3b 0%, #065f46 100%);
       color: #6ee7b7;
@@ -1173,6 +1189,12 @@ import { SslService } from '../services/ssl.service';
       background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%);
       color: #fca5a5;
       border-color: #991b1b;
+    }
+
+    :host-context(.dark-theme) .btn-delete {
+      background: linear-gradient(135deg, #881337 0%, #9f1239 100%);
+      color: #fda4af;
+      border-color: #9f1239;
     }
 
     :host-context(.dark-theme) .btn-bulk-assign {
@@ -1695,7 +1717,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     let page = 1;
     let hasMore = true;
     const allResults: Ticket[] = [];
-    let maxPages = 10; // Search up to 10 pages for comprehensive results
+    let maxPages = 200; // Global search across large datasets (safety cap)
 
     const searchLower = term.toLowerCase();
 
@@ -1742,9 +1764,18 @@ export class TicketsComponent implements OnInit, OnDestroy {
   
   refreshCurrentTab(): void {
     this.isRefreshing = true;
+    // Clear ALL caches
     this.ticketService.clearAllCache();
+    this.ticketService.invalidateTabCache();
     this.searchCache.clear();
-    this.loadTickets(false).finally(() => {
+    // Reset my tickets arrays so fresh data is fetched
+    this.myTicketsOpenAll = [];
+    this.myTicketsClosedAll = [];
+    this.myTicketsOpenLastApiPage = 0;
+    this.myTicketsClosedLastApiPage = 0;
+    this.myTicketsOpenPage = 1;
+    this.myTicketsClosedPage = 1;
+    this.loadTickets(true).finally(() => {
       this.isRefreshing = false;
       this.cdr.markForCheck();
     });
@@ -1764,8 +1795,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   // If there's a search term, perform search with caching
   if (this.searchTerm) {
     try {
-      // Create cache key combining search term, status, and tab
-      const cacheKey = `${this.searchTerm}|${this.selectedTab === 'my' ? 'my' : 'all'}`;
+      // Create cache key combining search term, role, and user
+      const roleKey = this.isAdmin ? 'admin' : 'user';
+      const cacheKey = `${roleKey}|${this.currentUserEmail}|${this.searchTerm}`;
       
       let searchResults: Ticket[] = [];
 
@@ -1774,18 +1806,18 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
         searchResults = this.searchCache.get(cacheKey) || [];
       } else {
         // Not in cache, perform search
-        if (this.selectedTab === 'my') {
-          // For "my" tickets, search in user's tickets across all statuses
+        if (this.isAdmin) {
+          // Admin global search: all tickets across all statuses
+          searchResults = await this.globalSearchAllPages(
+            this.searchTerm,
+            undefined
+          );
+        } else {
+          // User global search: only their tickets across all statuses
           searchResults = await this.globalSearchAllPages(
             this.searchTerm,
             undefined,
             (ticket: Ticket) => this.isMyTicket(ticket)
-          );
-        } else {
-          // Search across all tickets regardless of open/closed tab
-          searchResults = await this.globalSearchAllPages(
-            this.searchTerm,
-            undefined
           );
         }
         
@@ -1889,11 +1921,10 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   }
 
   private async loadMyTickets(): Promise<void> {
-    // 🔥 Load "my" tickets with progressive/lazy loading
+    // 🔥 Load "my" tickets using server-side filtering by email
     this.cdr.markForCheck();
 
     const pageSize = 25; // Display size per page
-    const apiPageSize = 100; // Load 100 items per API call
     
     try {
       // Select cache and state based on status
@@ -1912,37 +1943,26 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
         return;
       }
 
-      // Need to load more - keep loading API pages until we get enough "my" tickets
+      // Use server-side filtering by user email
       let allMyTickets = [...cache];
       let currentApiPage = lastApiPage + 1;
       let hasMoreOnServer = true;
-      let consecutiveEmptyPages = 0;
 
-      // Keep loading until we have enough tickets for current page OR reach end
-      while (allMyTickets.length < neededIndex && hasMoreOnServer && currentApiPage <= 100 && consecutiveEmptyPages < 3) {
+      // Server does the filtering now, so each page returns only our tickets
+      while (allMyTickets.length < neededIndex && hasMoreOnServer && currentApiPage <= 20) {
         try {
           const res = await firstValueFrom(
-            this.ticketService.getTickets(currentApiPage, apiPageSize, this.myStatus)
+            this.ticketService.getTickets(currentApiPage, pageSize, this.myStatus, undefined, this.currentUserEmail)
           );
 
           const data: Ticket[] = res?.data || [];
-          // 🔥 Filter by BOTH "my ticket" AND correct status (open/closed)
-          const newMyTickets = data.filter(t => 
-            this.isMyTicket(t) && this.isCorrectStatus(t, this.myStatus)
-          );
-          
-          if (newMyTickets.length === 0) {
-            // No new "my" tickets on this page, increment empty counter
-            consecutiveEmptyPages++;
-          } else {
-            consecutiveEmptyPages = 0; // Reset counter when we find tickets
-          }
+          // Server already filtered by email, just verify status
+          const newMyTickets = data.filter(t => this.isCorrectStatus(t, this.myStatus));
           
           allMyTickets = [...allMyTickets, ...newMyTickets];
           hasMoreOnServer = !!res?.hasMore;
           currentApiPage++;
         } catch (pageErr) {
-          // If we hit an error loading a page, stop trying to load more
           console.error(`Error loading API page ${currentApiPage}:`, pageErr);
           hasMoreOnServer = false;
           break;
@@ -1953,11 +1973,11 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       if (this.myStatus === 'open') {
         this.myTicketsOpenAll = allMyTickets;
         this.myTicketsOpenLastApiPage = currentApiPage - 1;
-        this.myTicketsOpenHasMore = allMyTickets.length > neededIndex && hasMoreOnServer;
+        this.myTicketsOpenHasMore = allMyTickets.length > neededIndex || hasMoreOnServer;
       } else {
         this.myTicketsClosedAll = allMyTickets;
         this.myTicketsClosedLastApiPage = currentApiPage - 1;
-        this.myTicketsClosedHasMore = allMyTickets.length > neededIndex && hasMoreOnServer;
+        this.myTicketsClosedHasMore = allMyTickets.length > neededIndex || hasMoreOnServer;
       }
 
       // Display current page
@@ -2059,22 +2079,47 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     if (!ticketId) return;
     this.ticketService.openTicket(ticketId).subscribe({
       next: () => {
-        // 🚀 UPDATE LOCAL STATE instead of reloading all tickets
-        const ticketIndex = this.filteredTickets.findIndex(t => t.id === ticketId || t.ticketId === ticketId);
-        if (ticketIndex !== -1) {
-          this.filteredTickets[ticketIndex].status = 'Open';
-          this.cdr.markForCheck();
+        // Remove reopened ticket from current view immediately
+        const openedTicket = this.filteredTickets.find(t => t.id === ticketId || t.ticketId === ticketId);
+        this.filteredTickets = this.filteredTickets.filter(t => (t.id || t.ticketId) !== ticketId);
+        // Remove from closed caches
+        this.myTicketsClosedAll = this.myTicketsClosedAll.filter(t => (t.id || t.ticketId) !== ticketId);
+        // Add to open caches if we have the ticket data
+        if (openedTicket) {
+          openedTicket.status = 'Open';
+          this.myTicketsOpenAll.unshift(openedTicket);
         }
-        // Update My Tickets cache if applicable
-        const closedIdx = this.myTicketsClosedAll.findIndex(t => t.id === ticketId || t.ticketId === ticketId);
-        if (closedIdx !== -1) {
-          this.myTicketsClosedAll.splice(closedIdx, 1);
-        }
-        // INVALIDATE CACHE for affected status
-        this.ticketService.invalidateTabCache(['my_closed', 'closed']);
+        // INVALIDATE ALL CACHE
+        this.ticketService.clearAllCache();
+        this.ticketService.invalidateTabCache();
         this.messageService.success('Ticket reopened');
+        this.cdr.markForCheck();
       },
       error: () => this.messageService.error('Reopen failed')
+    });
+  }
+
+  moveToRecycleBin(ticket: Ticket): void {
+    const ticketId = (ticket.id || ticket.ticketId || '').toString();
+    if (!ticketId) return;
+
+    const ok = window.confirm('Move this ticket to recycle bin?');
+    if (!ok) return;
+
+    this.ticketService.moveToRecycleBin(ticketId, ticket).subscribe({
+      next: () => {
+        this.filteredTickets = this.filteredTickets.filter(t => (t.id || t.ticketId) !== ticketId);
+        this.tickets = this.tickets.filter(t => (t.id || t.ticketId) !== ticketId);
+        this.myTicketsOpenAll = this.myTicketsOpenAll.filter(t => (t.id || t.ticketId) !== ticketId);
+        this.myTicketsClosedAll = this.myTicketsClosedAll.filter(t => (t.id || t.ticketId) !== ticketId);
+        this.ticketService.clearAllCache();
+        this.ticketService.invalidateTabCache();
+        this.messageService.success('Ticket moved to recycle bin');
+        this.cdr.markForCheck();
+      },
+      error: (err: any) => {
+        this.messageService.error(this.describeError(err, 'Failed to move ticket to recycle bin'));
+      }
     });
   }
 
@@ -2120,23 +2165,22 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
     closeRequest$.subscribe({
       next: () => {
-        // 🚀 UPDATE LOCAL STATE instead of reloading all tickets
-        const ticketIndex = this.filteredTickets.findIndex(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
-        if (ticketIndex !== -1) {
-          this.filteredTickets[ticketIndex].status = 'Closed';
-          if (this.currentUserEmail) {
-            this.filteredTickets[ticketIndex].closedBy = this.currentUserEmail;
-          }
-          this.cdr.markForCheck();
+        // Remove closed ticket from current view immediately
+        const closedTicket = this.filteredTickets.find(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
+        this.filteredTickets = this.filteredTickets.filter(t => (t.id || t.ticketId) !== this.activeTicketId);
+        // Remove from open caches
+        this.myTicketsOpenAll = this.myTicketsOpenAll.filter(t => (t.id || t.ticketId) !== this.activeTicketId);
+        // Add to closed caches if we have the ticket data
+        if (closedTicket) {
+          closedTicket.status = 'Closed';
+          if (this.currentUserEmail) closedTicket.closedBy = this.currentUserEmail;
+          this.myTicketsClosedAll.unshift(closedTicket);
         }
-        // Update My Tickets cache if applicable
-        const openIdx = this.myTicketsOpenAll.findIndex(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
-        if (openIdx !== -1) {
-          this.myTicketsOpenAll.splice(openIdx, 1);
-        }
-        // INVALIDATE CACHE for affected status
-        this.ticketService.invalidateTabCache(['my_open', 'open']);
+        // INVALIDATE ALL CACHE
+        this.ticketService.clearAllCache();
+        this.ticketService.invalidateTabCache();
         this.messageService.success('Ticket closed');
+        this.cdr.markForCheck();
         this.cancelDialogs();
       },
       error: (err: any) => this.messageService.error(this.describeError(err, 'Close failed'))
@@ -2158,17 +2202,27 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
     this.ticketService.updateTicket(this.activeTicketId, data).subscribe({
       next: () => {
-        // 🚀 UPDATE LOCAL STATE instead of reloading all tickets
-        const ticketIndex = this.filteredTickets.findIndex(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
-        if (ticketIndex !== -1) {
-          if (status) this.filteredTickets[ticketIndex].status = status;
-          if (priority) this.filteredTickets[ticketIndex].priority = priority;
+        const updatedTicket = this.filteredTickets.find(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
+        if (updatedTicket) {
+          if (priority) updatedTicket.priority = priority;
+          if (status) {
+            const oldStatus = (updatedTicket.status || '').toLowerCase();
+            const newStatus = status.toLowerCase();
+            updatedTicket.status = status;
+            // If status changed between open/closed, remove from current view
+            const wasOpen = oldStatus.includes('open') || oldStatus.includes('progress');
+            const nowClosed = newStatus.includes('closed') || newStatus.includes('resolved');
+            const wasClosed = oldStatus.includes('closed') || oldStatus.includes('resolved');
+            const nowOpen = newStatus.includes('open') || newStatus.includes('progress');
+            if ((wasOpen && nowClosed) || (wasClosed && nowOpen)) {
+              this.filteredTickets = this.filteredTickets.filter(t => (t.id || t.ticketId) !== this.activeTicketId);
+            }
+          }
           this.cdr.markForCheck();
         }
-        // 💾 INVALIDATE CACHE if status changed
-        if (status) {
-          this.ticketService.invalidateTabCache(['open', 'closed', 'my_open', 'my_closed']);
-        }
+        // INVALIDATE ALL CACHE
+        this.ticketService.clearAllCache();
+        this.ticketService.invalidateTabCache();
         this.messageService.success('Ticket updated');
         this.cancelDialogs();
       },

@@ -29,6 +29,11 @@ export const routes: Routes = [
           import('./tickets/tickets.component').then(m => m.TicketsComponent)
       },
       {
+        path: 'recycle-bin',
+        loadComponent: () =>
+          import('./recycle-bin/recycle-bin.component').then(m => m.RecycleBinComponent)
+      },
+      {
         path: 'tickets/:id',
         component: TicketDetailComponent
       },

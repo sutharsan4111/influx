@@ -49,6 +49,12 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-network-wired"></i>
           <span>Infrastructure</span>
         </li>
+        <li class="menu-item"
+            routerLink="/recycle-bin"
+            [class.active]="isActive('/recycle-bin')">
+          <i class="fas fa-trash"></i>
+          <span>Recycle Bin</span>
+        </li>
       </ul>
 
       <div class="spacer"></div>

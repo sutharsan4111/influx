@@ -22,7 +22,7 @@ import { MsalService } from '../services/msal.service';
         <div class="welcome-stats">
           <span class="stat-pill">
             <i class="fas fa-ticket-alt"></i>
-            {{ openedCount }} open tickets
+            {{ openedCount }} {{ isAdmin ? 'open tickets' : 'my open tickets' }}
           </span>
           <span class="stat-pill urgent" *ngIf="slaAlertCount > 0">
             <i class="fas fa-exclamation-triangle"></i>
@@ -40,7 +40,7 @@ import { MsalService } from '../services/msal.service';
       </button>
       <button class="action-btn" (click)="navigateTo('/tickets')">
         <i class="fas fa-list"></i>
-        <span>View All Tickets</span>
+        <span>{{ isAdmin ? 'View All Tickets' : 'View My Tickets' }}</span>
       </button>
       <button class="action-btn" (click)="refreshDashboard()">
         <i class="fas fa-sync-alt" [class.spinning]="isRefreshing"></i>
@@ -55,8 +55,9 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-folder-open"></i>
         </div>
         <div class="metric-content">
-          <h3>Open Tickets</h3>
-          <div class="metric-value">{{ openedCount | number }}</div>
+          <h3>{{ isAdmin ? 'Open Tickets' : 'My Open Tickets' }}</h3>
+          <div class="metric-value" *ngIf="!countsLoading">{{ openedCount | number }}</div>
+          <div class="skeleton-value" *ngIf="countsLoading"><span class="shimmer"></span></div>
           <div class="metric-trend up" *ngIf="openTrend > 0">
           </div>
         </div>
@@ -67,8 +68,9 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-check-circle"></i>
         </div>
         <div class="metric-content">
-          <h3>Closed Tickets</h3>
-          <div class="metric-value">{{ closedCount | number }}</div>
+          <h3>{{ isAdmin ? 'Closed Tickets' : 'My Closed Tickets' }}</h3>
+          <div class="metric-value" *ngIf="!countsLoading">{{ closedCount | number }}</div>
+          <div class="skeleton-value" *ngIf="countsLoading"><span class="shimmer"></span></div>
           <div class="metric-trend up">
           </div>
         </div>
@@ -80,7 +82,8 @@ import { MsalService } from '../services/msal.service';
         </div>
         <div class="metric-content">
           <h3>My SLA Open</h3>
-          <div class="metric-value">{{ slaCount | number }}</div>
+          <div class="metric-value" *ngIf="!countsLoading">{{ slaCount | number }}</div>
+          <div class="skeleton-value" *ngIf="countsLoading"><span class="shimmer"></span></div>
           <div class="metric-subtext">Urgent/Critical assigned to me</div>
         </div>
       </div>
@@ -91,8 +94,9 @@ import { MsalService } from '../services/msal.service';
         </div>
         <div class="metric-content">
           <h3>Assigned to Me</h3>
-          <div class="metric-value">{{ assignedCount | number }}</div>
-          <div class="metric-subtext">My open tickets</div>
+          <div class="metric-value" *ngIf="!countsLoading">{{ assignedCount | number }}</div>
+          <div class="skeleton-value" *ngIf="countsLoading"><span class="shimmer"></span></div>
+          <div class="metric-subtext">My open assigned tickets</div>
         </div>
       </div>
     </div>
@@ -415,6 +419,34 @@ import { MsalService } from '../services/msal.service';
       font-weight: 700;
       color: #1e293b;
       line-height: 1.1;
+      animation: countFadeIn 0.4s ease-out;
+    }
+
+    @keyframes countFadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .skeleton-value {
+      height: 1.4rem;
+      width: 60px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #e2e8f0;
+    }
+
+    .skeleton-value .shimmer {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+
+    @keyframes shimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
     }
 
     .metric-trend {
@@ -901,6 +933,8 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   // User info
   userName = '';
+  userRole = 'user';
+  currentUserEmail = '';
   greeting = '';
   currentDate = '';
 
@@ -916,6 +950,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
   recentActivity: { type: string; icon: string; text: string; time: string }[] = [];
 
   isRefreshing = false;
+  countsLoading = true;
   grafanaDashboardUrl = '';
   safeGrafanaDashboardUrl?: SafeResourceUrl;
 
@@ -947,10 +982,19 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   ngOnDestroy() {}
 
+  get isAdmin(): boolean {
+    return this.userRole === 'admin';
+  }
+
   initUserInfo() {
+    this.userRole = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    this.currentUserEmail = (sessionStorage.getItem('username') || '').toLowerCase().trim();
     const account = this.msalService.getAccount();
     if (account) {
       this.userName = account.name || account.username?.split('@')[0] || 'User';
+      if (!this.currentUserEmail) {
+        this.currentUserEmail = (account.username || '').toLowerCase().trim();
+      }
     } else {
       const email = sessionStorage.getItem('username') || '';
       this.userName = email ? email.split('@')[0] : 'User';
@@ -973,12 +1017,17 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   loadCounts(silent = false, forceRefresh = false) {
+    this.countsLoading = true;
     this.ticketService.getTicketCounts(forceRefresh).subscribe({
       next: counts => {
         this.applyCounts(counts);
+        this.countsLoading = false;
         localStorage.setItem(this.COUNT_CACHE_KEY, JSON.stringify(counts));
       },
-      error: () => { if (!silent) this.messageService.error('Failed to load ticket counts'); }
+      error: () => {
+        this.countsLoading = false;
+        if (!silent) this.messageService.error('Failed to load ticket counts');
+      }
     });
   }
 
@@ -992,7 +1041,8 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   loadTickets() {
     this.loadingService.show();
-    this.ticketService.getTickets(1, 100, this.selectedTab).subscribe({
+    const filterEmail = !this.isAdmin ? this.currentUserEmail : undefined;
+    this.ticketService.getTickets(1, 100, this.selectedTab, undefined, filterEmail).subscribe({
       next: res => {
         this.tickets = res.data || [];
         this.filterTickets();
@@ -1073,10 +1123,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   refreshDashboard() {
     this.isRefreshing = true;
-    this.loadCounts(false);
+    this.ticketService.clearAllCache();
+    this.loadCounts(false, true);
     this.loadTickets();
     this.initGrafanaMonitoring();
-    setTimeout(() => this.isRefreshing = false, 1000);
+    setTimeout(() => this.isRefreshing = false, 2000);
   }
 
   private initGrafanaMonitoring() {
