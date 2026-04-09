@@ -972,7 +972,10 @@ export class DashboardComponent implements OnInit, OnDestroy {
     localStorage.removeItem('dashboard_ticket_counts');
 
     const cached = localStorage.getItem(this.COUNT_CACHE_KEY);
-    if (cached) { this.applyCounts(JSON.parse(cached)); }
+    if (cached) { 
+      this.applyCounts(JSON.parse(cached));
+      this.countsLoading = false; // Don't show skeleton if we have cached data
+    }
 
     // Force refresh to get accurate counts for this user
     this.loadCounts(true, true);

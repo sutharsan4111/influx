@@ -190,7 +190,17 @@ import { SslService } from '../services/ssl.service';
     </div>
 
     <ng-template #noTickets>
-      <div class="no-tickets">No tickets found.</div>
+      <div class="no-tickets">
+        <div *ngIf="searchTerm" class="empty-search">
+          <i class="fas fa-search"></i>
+          <p>No tickets match "{{ searchTerm }}"</p>
+          <small>Try different keywords or check your search term</small>
+        </div>
+        <div *ngIf="!searchTerm" class="empty-state">
+          <i class="fas fa-inbox"></i>
+          <p>No tickets found</p>
+        </div>
+      </div>
     </ng-template>
 
     <div class="pagination-controls" *ngIf="filteredTickets.length > 0 && !searchTerm">
@@ -1207,10 +1217,47 @@ import { SslService } from '../services/ssl.service';
     }
 
     .no-tickets {
-      padding: 32px;
+      padding: 48px 32px;
       text-align: center;
       color: #64748b;
       font-size: 12px;
+    }
+
+    .empty-search, .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .empty-search i, .empty-state i {
+      font-size: 32px;
+      color: #cbd5e1;
+      opacity: 0.6;
+    }
+
+    .empty-search p, .empty-state p {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 500;
+      color: #475569;
+    }
+
+    .empty-search small {
+      display: block;
+      font-size: 11px;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+
+    :host-context(.dark-theme) .empty-search i,
+    :host-context(.dark-theme) .empty-state i {
+      color: #475569;
+    }
+
+    :host-context(.dark-theme) .empty-search p,
+    :host-context(.dark-theme) .empty-state p {
+      color: #cbd5e1;
     }
 
     .action-buttons {
@@ -1585,7 +1632,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     }, 500);
 
     this.searchSub = this.searchTerm$
-      .pipe(debounceTime(300), distinctUntilChanged())
+      .pipe(debounceTime(500), distinctUntilChanged())
       .subscribe(term => {
         this.searchTerm = term.trim().toLowerCase();
         this.currentPage = 1;
@@ -1717,7 +1764,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     let page = 1;
     let hasMore = true;
     const allResults: Ticket[] = [];
-    let maxPages = 200; // Global search across large datasets (safety cap)
+    let maxPages = 10; // Limit search to 10 pages for better performance
 
     const searchLower = term.toLowerCase();
 

@@ -44,10 +44,10 @@ import { MsalService } from '../services/msal.service';
         </li>
         <li *ngIf="isAdmin()"
             class="menu-item"
-            routerLink="/infrastructure"
-            [class.active]="isInfrastructureSection()">
+            routerLink="/infrastructure/ssl"
+            [class.active]="isLicenceSection()">
           <i class="fas fa-network-wired"></i>
-          <span>Infrastructure</span>
+          <span>Licence</span>
         </li>
         <li class="menu-item"
             routerLink="/recycle-bin"
@@ -716,7 +716,7 @@ export class SidebarComponent implements OnInit {
     return this.router.url.startsWith('/admin');
   }
 
-  isInfrastructureSection() {
+  isLicenceSection() {
     return this.router.url.startsWith('/infrastructure') || this.router.url.startsWith('/ssl') || this.router.url.startsWith('/ihub');
   }
 

@@ -252,6 +252,7 @@ import { MsalService } from '../services/msal.service';
                 [(ngModel)]="formData.description"
                 placeholder="Please provide as much detail as possible about your issue..."
                 rows="6"
+                required
               ></textarea>
             </div>
 
@@ -296,7 +297,7 @@ import { MsalService } from '../services/msal.service';
           <button
             type="submit"
             class="submit-btn"
-            [disabled]="!ticketForm.valid"
+            [disabled]="!ticketForm.valid || isSubmitting"
           >
             <i class="fas fa-paper-plane"></i>
             Create Ticket
@@ -935,6 +936,7 @@ export class CreateTicketComponent implements OnInit {
   assigneeSearchTerm = '';
   showAssigneeDropdown = false;
   loadingOrgUsers = false;
+  isSubmitting = false;
 
   issueCategories = [
     'Deployment',
@@ -1098,6 +1100,9 @@ export class CreateTicketComponent implements OnInit {
   }
 
   onSubmit(): void {
+    if (this.isSubmitting) return; // Prevent duplicate submissions
+    
+    this.isSubmitting = true;
     const hasAttachments = this.attachments.length > 0;
     const assigneeEmailToSave = this.formData.assigneeEmail; // Save for Supabase assignment
 
@@ -1135,6 +1140,7 @@ export class CreateTicketComponent implements OnInit {
 
     this.ticketService.createTicket(ticket).subscribe({
       next: (response: any) => {
+        this.isSubmitting = false;
         if (response?.errorCode || response?.message?.includes('error')) {
           this.messageService.error(response?.message || 'Failed to create ticket');
           this.loadingService.hide();
@@ -1183,6 +1189,7 @@ export class CreateTicketComponent implements OnInit {
         this.router.navigate(['/tickets']);
       },
       error: (error: any) => {
+        this.isSubmitting = false;
         console.error('Error creating ticket:', error);
         const details = error?.error?.details
           ? ` (${JSON.stringify(error.error.details)})`

@@ -177,7 +177,19 @@ async function runMigrations() {
       ALTER COLUMN ip_address DROP NOT NULL,
       ALTER COLUMN application DROP NOT NULL
     `);
-    
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reply_authors (
+        id SERIAL PRIMARY KEY,
+        zoho_ticket_id TEXT NOT NULL,
+        zoho_conversation_id TEXT NOT NULL UNIQUE,
+        user_email TEXT NOT NULL,
+        user_name TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket ON reply_authors(zoho_ticket_id)`);
+
     console.log("✅ Database migrations applied");
   } catch (err) {
     console.error("⚠️ Migration warning:", err.message);
@@ -1173,74 +1185,89 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
       ? await getAllSupabaseAssignedOpenTickets()
       : new Set();
 
-    // Helper to count tickets with filters and pagination
-    async function countTicketsByStatus(status, options = {}) {
-      const {
-        onlyMine = false,
-        onlySla = false,
-        onlyAssigned = false
-      } = options;
-
-      let count = 0;
-      const limit = 100;
-      const PARALLEL = 5;
-      let batchStart = 0;
-      let keepGoing = true;
-      
-      while (keepGoing && batchStart < 10000) {
-        const batchPromises = [];
-        for (let i = 0; i < PARALLEL; i++) {
-          const offset = batchStart + i * limit;
-          if (offset >= 10000) break;
-          batchPromises.push(
-            zohoFetch(`/tickets?limit=${limit}&from=${offset}&status=${status}&include=assignee`)
-              .then(r => r.ok ? r.json() : { data: [] })
-              .then(d => ({ data: d.data || [], offset }))
-              .catch(() => ({ data: [], offset }))
-          );
+    // Helper to count tickets with filters and pagination.
+    // Fetch one page with a single 429-retry; returns { tickets, more }
+    const PAGE_SIZE = 100;
+    const PARALLEL_PAGES = 8; // 2 concurrent scans × 8 = 16 max Zoho requests (under rate-limit)
+    async function fetchPageWithRetry(status, from) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let res;
+        try {
+          res = await zohoFetch(`/tickets?limit=${PAGE_SIZE}&from=${from}&status=${status}&include=assignee`);
+        } catch (e) {
+          console.error(`Network error fetching ${status} at from=${from}:`, e?.message || e);
+          return { tickets: [], more: false };
         }
-
-        if (batchPromises.length === 0) break;
-        const batchResults = await Promise.all(batchPromises);
-
-        let anyFull = false;
-        for (const result of batchResults) {
-          const tickets = result.data;
-          if (tickets.length === limit) anyFull = true;
-
-          for (const t of tickets) {
-            const ticketId = (t.id || '').toString();
-            if (!ticketId || recycledTicketIds.has(ticketId)) continue;
-
-            const priority = (t.priority || '').toLowerCase();
-            const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-            const mineByZoho = !!userEmail && zohoAssignee === userEmail;
-            const mineBySupabase = !!userEmail && mySupabaseAssignedIds.has(ticketId);
-            const isMine = mineByZoho || mineBySupabase;
-            const isAssigned = !!zohoAssignee || allSupabaseAssignedOpenIds.has(ticketId);
-            const isSla = priority.includes('sla') || priority.includes('urgent') || priority.includes('critical');
-
-            if (onlyMine && !isMine) continue;
-            if (onlySla && !isSla) continue;
-            if (onlyAssigned && !isAssigned) continue;
-
-            count++;
-          }
+        if (res.status === 429) {
+          console.warn(`Zoho 429 for ${status} at from=${from}, retrying in 2s`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
         }
-
-        if (!anyFull) keepGoing = false;
-        batchStart += PARALLEL * limit;
+        if (!res.ok) {
+          console.error(`Zoho ${res.status} for ${status} at from=${from}`);
+          return { tickets: [], more: false };
+        }
+        let data;
+        try { data = await res.json(); } catch (e) { return { tickets: [], more: false }; }
+        const tickets = data.data || [];
+        const more = data.info?.moreRecords ?? (tickets.length >= PAGE_SIZE);
+        return { tickets, more };
       }
-
-      return count;
+      return { tickets: [], more: false };
     }
 
-    // Admin sees all tickets for open/closed; assigned & SLA are always personal.
-    const [openCount, closedCount, slaCount, assignedCount] = await Promise.all([
-      countTicketsByStatus('Open', isAdmin ? {} : { onlyMine: true }),
-      countTicketsByStatus('Closed', isAdmin ? {} : { onlyMine: true }),
-      countTicketsByStatus('Open', { onlyMine: true, onlySla: true }),
-      countTicketsByStatus('Open', { onlyMine: true })
+    // Scan all pages of a status in batches of PARALLEL_PAGES, calling perTicket for each
+    async function scanPages(status, perTicket) {
+      let from = 0;
+      while (from < 10000) {
+        const offsets = [];
+        for (let i = 0; i < PARALLEL_PAGES; i++) {
+          const o = from + i * PAGE_SIZE;
+          if (o >= 10000) break;
+          offsets.push(o);
+        }
+        if (!offsets.length) break;
+        const results = await Promise.all(offsets.map(o => fetchPageWithRetry(status, o)));
+        let anyMore = false;
+        for (const { tickets, more } of results) {
+          for (const t of tickets) {
+            const ticketId = (t.id || '').toString();
+            if (ticketId && !recycledTicketIds.has(ticketId)) perTicket(t, ticketId);
+          }
+          if (more) anyMore = true;
+        }
+        if (!anyMore) break;
+        from += offsets.length * PAGE_SIZE;
+      }
+    }
+
+    // Scan Open, Closed, and Resolved simultaneously; derive all 4 metrics in 3 passes.
+    // Resolved is a fallback status used when Zoho rejects 'Closed' (422), so both must be counted.
+    let openCount = 0, slaCount = 0, assignedCount = 0, closedCount = 0;
+
+    function countClosed(t, ticketId) {
+      if (isAdmin) {
+        closedCount++;
+      } else {
+        const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+        const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
+        if (isMine) closedCount++;
+      }
+    }
+
+    await Promise.all([
+      scanPages('Open', (t, ticketId) => {
+        const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+        const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
+        if (isAdmin || isMine) openCount++;
+        if (isMine) {
+          assignedCount++;
+          const priority = (t.priority || '').toLowerCase();
+          if (priority.includes('sla') || priority.includes('urgent') || priority.includes('critical')) slaCount++;
+        }
+      }),
+      scanPages('Closed',   countClosed),
+      scanPages('Resolved', countClosed)
     ]);
 
     console.log(`Counts for ${userEmail}: open=${openCount}, closed=${closedCount}, mySLA=${slaCount}, assigned=${assignedCount}`);
@@ -1725,6 +1752,46 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       }
     });
 
+    // Look up actual sender names for replies made through our app
+    const convIds = resultData.map(c => (c.id || '').toString()).filter(Boolean);
+    let replyAuthorMap = new Map();
+    if (convIds.length) {
+      try {
+        const ra = await pool.query(
+          `SELECT zoho_conversation_id, user_name FROM reply_authors WHERE zoho_conversation_id = ANY($1)`,
+          [convIds]
+        );
+        for (const r of ra.rows) replyAuthorMap.set(r.zoho_conversation_id, r.user_name);
+      } catch (e) { console.error('reply_authors lookup error:', e?.message); }
+    }
+
+    resultData.forEach(conv => {
+      const cid = (conv.id || '').toString();
+      if (replyAuthorMap.has(cid)) {
+        conv.resolvedAuthorName = replyAuthorMap.get(cid);
+        return;
+      }
+      const a = conv.author || {};
+      const c = conv.commenter || {};
+      const fullName = [a.firstName, a.lastName].filter(Boolean).join(' ').trim();
+      const commenterName = [c.firstName, c.lastName].filter(Boolean).join(' ').trim();
+      conv.resolvedAuthorName =
+        c.name ||
+        commenterName ||
+        a.name ||
+        fullName ||
+        conv.fromName ||
+        conv.submitter?.name ||
+        conv.contact?.name ||
+        [conv.contact?.firstName, conv.contact?.lastName].filter(Boolean).join(' ').trim() ||
+        c.email ||
+        conv.from ||
+        conv.fromEmailAddress ||
+        a.email ||
+        a.emailId ||
+        '';
+    });
+
     res.json({ ...data, data: resultData });
   } catch {
     res.status(500).json({ error: 'Failed to fetch ticket conversations' });
@@ -1902,6 +1969,8 @@ app.post('/api/tickets/:id/reply', upload.array('attachments'),  authenticateTok
   try {
     const files = Array.isArray(req.files) ? req.files : [];
     const content = req.body?.content || '';
+    const senderName = req.body?.senderName || req.user?.email?.split('@')[0] || '';
+    const senderEmail = req.user?.email || '';
     const isPublicStr = req.body?.isPublic === 'true' ? 'true' : 'false';
     const isPublicBool = req.body?.isPublic === 'true';
 
@@ -1959,6 +2028,14 @@ app.post('/api/tickets/:id/reply', upload.array('attachments'),  authenticateTok
       }
 
       if (response.ok) {
+        const convId = (data?.id || '').toString();
+        if (convId && senderEmail) {
+          pool.query(
+            `INSERT INTO reply_authors (zoho_ticket_id, zoho_conversation_id, user_email, user_name)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (zoho_conversation_id) DO NOTHING`,
+            [req.params.id, convId, senderEmail, senderName]
+          ).catch(e => console.error('Failed to save reply author:', e?.message));
+        }
         return res.json(data || { status: 'ok' });
       }
 

@@ -49,11 +49,6 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
       <div class="body">
         <main class="main">
 
-          <section class="desc" *ngIf="ticket?.description">
-            <h4>Description</h4>
-            <div class="desc-body" [innerHTML]="sanitize(ticket?.description)"></div>
-          </section>
-
           <!-- THREADS - Show for all tickets with conversations -->
           <section class="msgs" *ngIf="threads.length > 0">
 
@@ -68,7 +63,7 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
                 </div>
               </div>
 
-              <div class="mb" [innerHTML]="sanitize(t.content)"></div>
+              <div class="mb" [innerHTML]="renderContent(t.content)"></div>
               <div class="attachments" *ngIf="t.attachments?.length">
                 <div class="attachment" *ngFor="let a of t.attachments">
                   <span class="att-name">{{ a.fileName || a.name || a.id }}</span>
@@ -185,18 +180,26 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
     .btn { padding:4px 10px;border-radius:4px;border:none;cursor:pointer;background:#eef1f5;font-size:12px }
     .btn.primary { background:#0b66d1;color:#fff }
     .body { display:flex;gap:10px }
-    .main { flex:1;min-width:0 }
-    .side { width:220px;min-width:220px }
+    .main { flex:1;min-width:0;overflow:hidden }
+    .side { width:220px;min-width:220px;flex-shrink:0 }
     .subject { margin: 4px 0 8px }
     .subject h2 { margin: 0 0 2px; font-size: 15px; font-weight: 600 }
     .meta { color: #6b7280; font-size: 11px }
-    .desc { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px;margin-bottom:8px }
+    .desc { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px;margin-bottom:8px;overflow:hidden }
     .desc h4 { margin:0 0 6px;font-size:12px;color:#374151 }
-    .desc-body { color:#1f2937;font-size:13px;line-height:1.5;word-break:break-word;overflow-wrap:anywhere }
-    .desc-body img { max-width: 100%; height: auto; }
-    .desc-body a { color: #0b66d1; text-decoration: underline; }
-    .desc-body p { margin: 0 0 8px; }
-    .desc-body p:last-child { margin-bottom: 0; }
+    .desc-body { color:#1f2937;font-size:13px;line-height:1.6;word-break:break-word;overflow-wrap:anywhere;overflow-x:auto;max-width:100% }
+    :host ::ng-deep .desc-body img { max-width: 100%; height: auto; display: block; margin: 16px 0; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    :host ::ng-deep .desc-body p { margin: 0 0 10px; }
+    :host ::ng-deep .desc-body p img { margin: 12px 0; }
+    :host ::ng-deep .desc-body p:last-child { margin-bottom: 0; }
+    :host ::ng-deep .desc-body a { color: #0b66d1; text-decoration: underline; transition: color 0.2s; }
+    :host ::ng-deep .desc-body a:hover { color: #1d4ed8; }
+    :host ::ng-deep .desc-body table { border-collapse: collapse; margin: 12px 0; max-width: 100%; }
+    :host ::ng-deep .desc-body table td, :host ::ng-deep .desc-body table th { padding: 8px; border: 1px solid #e5e7eb; white-space: nowrap; }
+    :host ::ng-deep .desc-body ol, :host ::ng-deep .desc-body ul { margin: 4px 0; padding-left: 24px; list-style-position: outside; }
+    :host ::ng-deep .desc-body ol { list-style-type: decimal; }
+    :host ::ng-deep .desc-body ul { list-style-type: disc; }
+    :host ::ng-deep .desc-body li { margin: 4px 0; }
 
     .panel { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px }
     .panel + .panel { margin-top: 8px }
@@ -218,16 +221,19 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
       color: #1f2937;
       padding: 4px 0;
     }
-    .mb p { margin: 0 0 8px; }
-    .mb p:last-child { margin-bottom: 0; }
-    .mb a { color: #0b66d1; text-decoration: underline; }
-    .mb img { max-width: 100%; height: auto; }
-    .mb table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 6px 0; }
-    .mb td, .mb th { border: 1px solid #e5e7eb; padding: 6px 8px; }
-    .mb blockquote { border-left: 3px solid #d1d5db; margin: 8px 0; padding: 4px 10px; color: #6b7280; }
-    .mb hr { border: none; border-top: 1px solid #e5e7eb; margin: 10px 0; }
-    .mb ul, .mb ol { margin: 4px 0; padding-left: 20px; }
-    .mb h1, .mb h2, .mb h3, .mb h4, .mb h5, .mb h6 { margin: 8px 0 4px; }
+    :host ::ng-deep .mb p { margin: 0 0 8px; }
+    :host ::ng-deep .mb p:last-child { margin-bottom: 0; }
+    :host ::ng-deep .mb a { color: #0b66d1; text-decoration: underline; }
+    :host ::ng-deep .mb img { max-width: 100%; height: auto; display: block; margin: 8px 0; }
+    :host ::ng-deep .mb table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 6px 0; }
+    :host ::ng-deep .mb td, :host ::ng-deep .mb th { border: 1px solid #e5e7eb; padding: 6px 8px; }
+    :host ::ng-deep .mb blockquote { border-left: 3px solid #d1d5db; margin: 8px 0; padding: 4px 10px; color: #6b7280; }
+    :host ::ng-deep .mb hr { border: none; border-top: 1px solid #e5e7eb; margin: 10px 0; }
+    :host ::ng-deep .mb ul, :host ::ng-deep .mb ol { margin: 4px 0; padding-left: 24px; list-style-position: outside; }
+    :host ::ng-deep .mb ol { list-style-type: decimal; }
+    :host ::ng-deep .mb ul { list-style-type: disc; }
+    :host ::ng-deep .mb li { margin: 4px 0; }
+    :host ::ng-deep .mb h1, :host ::ng-deep .mb h2, :host ::ng-deep .mb h3, :host ::ng-deep .mb h4, :host ::ng-deep .mb h5, :host ::ng-deep .mb h6 { margin: 8px 0 4px; }
     .attachments { margin-top: 6px; display: grid; gap: 4px; }
     .attachment { display: flex; gap: 6px; align-items: center; font-size: 12px; }
     .att-name { color: #1f2937; font-weight: 600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -312,6 +318,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   sending = false;
   replyFiles: File[] = [];
   currentUserEmail = '';
+  currentUserName = '';
   userRole: 'admin' | 'user' = 'user';
   private inlineObjectUrls: string[] = [];
 
@@ -417,7 +424,17 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
         
         // Process messages/threads
         this.threads = (results.messages?.data || []).map((t: any) => ({
-          authorName: t.author?.name || 'User',
+          authorName: t.resolvedAuthorName
+            || t.commenter?.name
+            || [t.commenter?.firstName, t.commenter?.lastName].filter(Boolean).join(' ')
+            || t.author?.name
+            || [t.author?.firstName, t.author?.lastName].filter(Boolean).join(' ')
+            || t.fromName
+            || t.from
+            || t.fromEmailAddress
+            || t.commenter?.email
+            || t.author?.email
+            || 'Unknown',
           content: t.content || t.description || t.summary || '',
           createdTime: t.createdTime,
           attachments: this.normalizeAttachments(t)
@@ -501,7 +518,8 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     const hasFiles = this.replyFiles.length > 0;
     const payload = hasFiles ? new FormData() : {
       content: this.replyForm.value.body,
-      isPublic: this.replyForm.value.visibility === 'public' ? 'true' : 'false'
+      isPublic: this.replyForm.value.visibility === 'public' ? 'true' : 'false',
+      senderName: this.currentUserName
     };
 
     if (payload instanceof FormData) {
@@ -510,6 +528,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
         'isPublic',
         this.replyForm.value.visibility === 'public' ? 'true' : 'false'
       );
+      payload.append('senderName', this.currentUserName);
       this.replyFiles.forEach(file => payload.append('attachments', file));
     }
 
@@ -530,6 +549,14 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
 
   sanitize(html: string): SafeHtml {
     return this.sanitizer.bypassSecurityTrustHtml(html);
+  }
+
+  renderContent(content: string): SafeHtml {
+    if (!content) return this.sanitizer.bypassSecurityTrustHtml('');
+    // If content contains HTML tags, use as-is; otherwise convert newlines to <br>
+    const isHtml = /<[a-z][\s\S]*>/i.test(content);
+    const processed = isHtml ? content : content.replace(/\r\n/g, '<br>').replace(/\n/g, '<br>');
+    return this.sanitizer.bypassSecurityTrustHtml(processed);
   }
 
   private resolveInlineImagesInThreads(): void {
@@ -860,6 +887,11 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     const account = this.msalService.getAccount();
     const storedEmail = sessionStorage.getItem('username') || '';
     this.currentUserEmail = (account?.username || storedEmail || '').trim().toLowerCase();
+    this.currentUserName = account?.name || this.currentUserEmail.split('@')[0] || 'Unknown';
+    // Capitalize first letter
+    if (this.currentUserName) {
+      this.currentUserName = this.currentUserName.charAt(0).toUpperCase() + this.currentUserName.slice(1);
+    }
     
     // Load user role from sessionStorage
     const storedRole = sessionStorage.getItem('role');
