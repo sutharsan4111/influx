@@ -670,11 +670,18 @@ async function createAlertmanagerSslTicket(alert, milestoneDays) {
     payload.assigneeId = assigneeId;
   }
 
-  let response = await zohoFetch('/tickets', {
-    method: 'POST',
-    body: JSON.stringify(payload)
-  });
-  let data = await response.json().catch(() => null);
+  // Retry up to 3 times on 429 with exponential backoff before giving up
+  let response, data;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    response = await zohoFetch('/tickets', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    data = await response.json().catch(() => null);
+    if (response.status !== 429) break;
+    console.warn(`[Webhook] Zoho 429 on ticket create attempt ${attempt}/3, retrying in ${attempt * 3}s`);
+    await new Promise(r => setTimeout(r, attempt * 3000));
+  }
 
   if (!response.ok && payload.assigneeId) {
     const assigneeError = Array.isArray(data?.errors)
@@ -683,11 +690,16 @@ async function createAlertmanagerSslTicket(alert, milestoneDays) {
 
     if (assigneeError) {
       delete payload.assigneeId;
-      response = await zohoFetch('/tickets', {
-        method: 'POST',
-        body: JSON.stringify(payload)
-      });
-      data = await response.json().catch(() => null);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        response = await zohoFetch('/tickets', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        data = await response.json().catch(() => null);
+        if (response.status !== 429) break;
+        console.warn(`[Webhook] Zoho 429 on ticket create (no assignee) attempt ${attempt}/3, retrying in ${attempt * 3}s`);
+        await new Promise(r => setTimeout(r, attempt * 3000));
+      }
     }
   }
 
@@ -1200,7 +1212,7 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
     // Helper to count tickets with filters and pagination.
     // Fetch one page with a single 429-retry; returns { tickets, more }
     const PAGE_SIZE = 100;
-    const PARALLEL_PAGES = 8; // 2 concurrent scans × 8 = 16 max Zoho requests (under rate-limit)
+    const PARALLEL_PAGES = 3; // 2 pods × 3 statuses × 3 pages = 18 max concurrent Zoho requests
     async function fetchPageWithRetry(status, from) {
       for (let attempt = 0; attempt < 2; attempt++) {
         let res;
@@ -1240,6 +1252,7 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
         }
         if (!offsets.length) break;
         const results = await Promise.all(offsets.map(o => fetchPageWithRetry(status, o)));
+        await new Promise(r => setTimeout(r, 400)); // pace batches to avoid saturating rate limit
         let anyMore = false;
         for (const { tickets, more } of results) {
           for (const t of tickets) {
