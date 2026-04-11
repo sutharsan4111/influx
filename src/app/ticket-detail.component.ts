@@ -745,6 +745,24 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     return null;
   }
 
+  private extractZohoPathFromAttachment(att: any): string | null {
+    const candidates = [
+      att?.href,
+      att?.downloadUrl,
+      att?.contentUrl,
+      att?.url,
+      att?.link,
+      att?.path
+    ];
+
+    for (const candidate of candidates) {
+      const path = this.extractZohoPathFromSrc((candidate || '').toString());
+      if (path) return path;
+    }
+
+    return null;
+  }
+
   private findAttachmentById(attachmentId: string, attachments: any[]): any | null {
     const id = (attachmentId || '').toString().trim();
     if (!id) return null;
@@ -808,33 +826,54 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
 
   openAttachment(att: any, mode: 'preview' | 'download'): void {
     const id = att?.id || att?.attachmentId;
-    if (!id) {
+    const path = this.extractZohoPathFromAttachment(att);
+
+    if (!id && !path) {
       this.messageService.error('Attachment not found');
       return;
     }
 
-    const filename = (att?.fileName || att?.name || `attachment-${id}`).toString();
+    const filename = (att?.fileName || att?.name || `attachment-${id || 'file'}`).toString();
+
+    const handleBlob = (blob: Blob) => {
+      const url = URL.createObjectURL(blob);
+
+      if (mode === 'preview') {
+        const previewLink = document.createElement('a');
+        previewLink.href = url;
+        previewLink.target = '_blank';
+        previewLink.rel = 'noopener';
+        previewLink.click();
+      } else {
+        const downloadLink = document.createElement('a');
+        downloadLink.href = url;
+        downloadLink.download = filename;
+        downloadLink.click();
+      }
+
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
+    const fallbackToPath = () => {
+      if (!path) {
+        this.messageService.error('Attachment download failed');
+        return;
+      }
+
+      this.ticketService.getZohoContentByPath(path).subscribe({
+        next: (blob: Blob) => handleBlob(blob),
+        error: () => this.messageService.error('Attachment download failed')
+      });
+    };
+
+    if (!id) {
+      fallbackToPath();
+      return;
+    }
 
     this.ticketService.getAttachmentBlob(this.ticketId, id).subscribe({
-      next: (blob: Blob) => {
-        const url = URL.createObjectURL(blob);
-
-        if (mode === 'preview') {
-          const previewLink = document.createElement('a');
-          previewLink.href = url;
-          previewLink.target = '_blank';
-          previewLink.rel = 'noopener';
-          previewLink.click();
-        } else {
-          const downloadLink = document.createElement('a');
-          downloadLink.href = url;
-          downloadLink.download = filename;
-          downloadLink.click();
-        }
-
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-      },
-      error: () => this.messageService.error('Attachment download failed')
+      next: (blob: Blob) => handleBlob(blob),
+      error: () => fallbackToPath()
     });
   }
 

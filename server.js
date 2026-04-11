@@ -364,6 +364,18 @@ const AUTOMATION_SSL_ALERT_MILESTONES = [33, 18, 10, 7, 4, 3];
 const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
 const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
 
+function priorityForIhubAndSslMilestone(milestoneDays) {
+  if (milestoneDays === 3 || milestoneDays === 1) return 'SLA';
+  if (milestoneDays === 7) return 'High';
+  return 'Medium';
+}
+
+function priorityForAutomationSslMilestone(milestoneDays) {
+  if (milestoneDays === 7 || milestoneDays === 4 || milestoneDays === 3) return 'SLA';
+  if (milestoneDays === 10) return 'High';
+  return 'Medium';
+}
+
 // ------------------------
 // Serve Angular build
 // ------------------------
@@ -638,7 +650,7 @@ async function createAlertmanagerSslTicket(alert, milestoneDays) {
 
   const payload = {
     subject,
-    priority: milestoneDays <= 7 ? 'High' : 'Medium',
+    priority: priorityForAutomationSslMilestone(milestoneDays),
     status: 'Open',
     category: 'SSL',
     subCategory: 'SSL Expiry',
@@ -848,7 +860,7 @@ async function createIhubAlertTicket(asset, milestoneDays) {
 
   const payload = {
     subject,
-    priority: milestoneDays <= 7 ? 'High' : 'Medium',
+    priority: priorityForIhubAndSslMilestone(milestoneDays),
     status: 'Open',
     category: 'IHUB',
     subCategory: 'License Expiry',
@@ -1017,7 +1029,7 @@ async function createSslAlertTicket(asset, milestoneDays) {
 
   const payload = {
     subject,
-    priority: milestoneDays <= 7 ? 'High' : 'Medium',
+    priority: priorityForIhubAndSslMilestone(milestoneDays),
     status: 'Open',
     category: 'SSL',
     subCategory: 'SSL Expiry',
@@ -1814,10 +1826,20 @@ app.get('/api/tickets/:id/attachments',  authenticateToken,async (req, res) => {
 app.get('/api/tickets/:id/attachments/:attachmentId', authenticateToken, async (req, res) => {
   try {
     const { id, attachmentId } = req.params;
-    const response = await zohoFetch(`/tickets/${id}/attachments/${attachmentId}/content`);
+    let response = await zohoFetch(`/tickets/${id}/attachments/${attachmentId}/content`);
+
+    // Some Zoho attachment responses are available without the /content suffix.
+    if (!response.ok && response.status === 404) {
+      response = await zohoFetch(`/tickets/${id}/attachments/${attachmentId}`);
+    }
 
     if (!response.ok) {
-      const data = await response.json();
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = { error: 'Failed to fetch attachment content' };
+      }
       return res.status(response.status).json(data);
     }
 
