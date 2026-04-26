@@ -106,7 +106,7 @@ export class TicketService {
   // Cache with timestamp to prevent excessive reloading
   private ticketsCacheWithTime = new Map<string, { data: Observable<any>, timestamp: number }>();
   private cacheDurationMs = 5 * 60 * 1000; // 5 minutes cache - for full page navigation away and back
-  private countsCacheDurationMs = 2 * 60 * 1000; // 2 minutes for counts
+  private countsCacheDurationMs = 20 * 1000; // 20 seconds for near-real-time dashboard counts
   private countsCacheTime = 0;
 
   // 🚀 GLOBAL TAB CACHE - persists across navigation (component destroy/recreate)

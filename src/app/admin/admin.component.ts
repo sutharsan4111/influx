@@ -1,19 +1,27 @@
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
 
 @Component({
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, RouterLink],
   template: `
 <div class="admin-page">
 
   <div class="page-header-row">
-    <h2>User Access Management</h2>
-    <button class="btn-refresh" (click)="refreshUsers()" [disabled]="isRefreshing" title="Refresh">
-      <i class="fas fa-sync-alt" [class.spinning]="isRefreshing"></i>
-    </button>
+    <div>
+      <h2>Local User Management</h2>
+      <p class="subtitle">Manage local application users (for local JWT authentication)</p>
+    </div>
+    <div style="display: flex; gap: 10px;">
+      <button class="btn-nav" routerLink="/admin/user-roles" title="Manage Microsoft user roles">
+        <i class="fas fa-users-cog"></i> Microsoft User Roles
+      </button>
+      <button class="btn-refresh" (click)="refreshUsers()" [disabled]="isRefreshing" title="Refresh">
+        <i class="fas fa-sync-alt" [class.spinning]="isRefreshing"></i>
+      </button>
+    </div>
   </div>
 
   <!-- CREATE USER -->
@@ -88,7 +96,7 @@ import { Router } from '@angular/router';
 .page-header-row {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   margin-bottom: 20px;
 }
 
@@ -96,6 +104,34 @@ import { Router } from '@angular/router';
   margin: 0;
   font-weight: 600;
   color: #1f2937;
+}
+
+.page-header-row .subtitle {
+  margin: 5px 0 0 0;
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.btn-nav {
+  background: #10b981;
+  color: white;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 5px;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+
+.btn-nav:hover {
+  background: #059669;
+}
+
+.btn-nav i {
+  font-size: 14px;
 }
 
 .btn-refresh {

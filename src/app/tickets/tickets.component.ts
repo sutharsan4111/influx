@@ -1591,8 +1591,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
       this.myStatus = savedMyStatus;
     }
     
-    // Load assignments first (needed for "My Tickets" filtering)
-    await this.loadAssignmentsAsync();
+    // Load assignments in background; do not block first paint.
+    this.loadAssignmentsAsync();
     
     // 🚀 Try to restore from service-level cache first (persists across navigation)
     const cacheKey = this.selectedTab === 'my' ? `my_${this.myStatus}` : this.selectedTab;
@@ -1623,6 +1623,9 @@ export class TicketsComponent implements OnInit, OnDestroy {
       // No cache, load fresh
       this.loadTickets();
     }
+
+    // Prefetch likely next tab/status in background for faster switching.
+    this.prefetchLikelyNextView();
     
     this.loadAssignableUsers();
 
@@ -1690,6 +1693,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
         this.hasMore = cached.hasMore;
       }
       this.cdr.markForCheck();
+      this.prefetchLikelyNextView();
       return;
     }
     
@@ -1704,6 +1708,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
       this.myTicketsClosedAll = [];
     }
     this.loadTickets(true);
+    this.prefetchLikelyNextView();
   }
 
 
@@ -1737,6 +1742,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
         if (cached.myTicketsClosedLastApiPage !== undefined) this.myTicketsClosedLastApiPage = cached.myTicketsClosedLastApiPage;
       }
       this.cdr.markForCheck();
+      this.prefetchLikelyNextView();
       return;
     }
     
@@ -1751,6 +1757,64 @@ export class TicketsComponent implements OnInit, OnDestroy {
       this.myTicketsClosedAll = [];
     }
     this.loadTickets(true);
+    this.prefetchLikelyNextView();
+  }
+
+  private prefetchLikelyNextView(): void {
+    if (this.searchTerm) return;
+
+    if (this.selectedTab === 'my') {
+      const otherStatus: 'open' | 'closed' = this.myStatus === 'open' ? 'closed' : 'open';
+      const cacheKey = `my_${otherStatus}`;
+      if (this.ticketService.getTabCache(cacheKey)) return;
+
+      this.ticketService
+        .getTickets(1, this.limit, otherStatus, undefined, this.currentUserEmail)
+        .subscribe({
+          next: (res) => {
+            const data: Ticket[] = (res?.data || []).filter((t: Ticket) => this.isCorrectStatus(t, otherStatus));
+            if (otherStatus === 'open') {
+              this.myTicketsOpenAll = data;
+              this.myTicketsOpenLastApiPage = 1;
+              this.myTicketsOpenHasMore = !!res?.hasMore;
+            } else {
+              this.myTicketsClosedAll = data;
+              this.myTicketsClosedLastApiPage = 1;
+              this.myTicketsClosedHasMore = !!res?.hasMore;
+            }
+            this.ticketService.setTabCache(cacheKey, {
+              tickets: [...data],
+              page: 1,
+              hasMore: !!res?.hasMore,
+              myTicketsOpenAll: [...this.myTicketsOpenAll],
+              myTicketsClosedAll: [...this.myTicketsClosedAll],
+              myTicketsOpenLastApiPage: this.myTicketsOpenLastApiPage,
+              myTicketsClosedLastApiPage: this.myTicketsClosedLastApiPage
+            });
+          },
+          error: () => {
+            // Background prefetch only; ignore failures.
+          }
+        });
+      return;
+    }
+
+    const otherTab: 'open' | 'closed' = this.selectedTab === 'open' ? 'closed' : 'open';
+    if (this.ticketService.getTabCache(otherTab)) return;
+
+    this.ticketService.getTickets(1, this.limit, otherTab).subscribe({
+      next: (res) => {
+        const data: Ticket[] = (res?.data || []).filter((t: Ticket) => this.isCorrectStatus(t, otherTab));
+        this.ticketService.setTabCache(otherTab, {
+          tickets: [...data],
+          page: 1,
+          hasMore: !!res?.hasMore
+        });
+      },
+      error: () => {
+        // Background prefetch only; ignore failures.
+      }
+    });
   }
 
 
@@ -1831,6 +1895,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
   /* ================= CORE ================= */
 
 async loadTickets(showLoadingIndicator = true): Promise<void> {
+  const requestSeq = ++this.myLoadSeq;
+
   // Only show loading on initial page load, not on tab switches
   if (showLoadingIndicator) {
     this.loadingService.show();
@@ -1872,43 +1938,47 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
         this.searchCache.set(cacheKey, searchResults);
       }
 
+      if (requestSeq !== this.myLoadSeq) return;
       this.filteredTickets = searchResults;
       this.cdr.markForCheck();
-      this.loadingService.hide();
     } catch (err) {
+      if (requestSeq !== this.myLoadSeq) return;
       console.error('Search failed:', err);
       this.messageService.error('Search failed');
-      this.loadingService.hide();
+    } finally {
+      if (showLoadingIndicator) this.loadingService.hide();
     }
     return;
   }
 
   // No search term - use regular pagination
-  if (this.selectedTab === 'my') {
-    await this.loadMyTickets();
-    this.saveToServiceCache(); // 🚀 Save to cache after loading
-    this.loadingService.hide();
-  } else {
-    this.ticketService
-      .getTickets(this.currentPage, this.limit, this.selectedTab as 'open' | 'closed')
-      .subscribe({
-        next: res => {
-          const data: Ticket[] = res.data || [];
+  try {
+    if (this.selectedTab === 'my') {
+      await this.loadMyTickets();
+      if (requestSeq !== this.myLoadSeq) return;
+      this.saveToServiceCache();
+      this.cdr.markForCheck();
+    } else {
+      const res = await firstValueFrom(
+        this.ticketService.getTickets(this.currentPage, this.limit, this.selectedTab as 'open' | 'closed')
+      );
 
-          this.filteredTickets = data.filter((t: Ticket) =>
-            this.isCorrectStatus(t, this.selectedTab as 'open' | 'closed')
-          );
+      if (requestSeq !== this.myLoadSeq) return;
 
-          this.hasMore = !!res.hasMore;
-          this.saveToServiceCache(); // 🚀 Save to cache after loading
-          this.cdr.markForCheck();
-          this.loadingService.hide();   // ✅ move here
-        },
-        error: () => {
-          this.messageService.error('Failed to load tickets');
-          this.loadingService.hide();   // ✅ move here
-        }
-      });
+      const data: Ticket[] = res?.data || [];
+      this.filteredTickets = data.filter((t: Ticket) =>
+        this.isCorrectStatus(t, this.selectedTab as 'open' | 'closed')
+      );
+
+      this.hasMore = !!res?.hasMore;
+      this.saveToServiceCache();
+      this.cdr.markForCheck();
+    }
+  } catch {
+    if (requestSeq !== this.myLoadSeq) return;
+    this.messageService.error('Failed to load tickets');
+  } finally {
+    if (showLoadingIndicator) this.loadingService.hide();
   }
 }
 

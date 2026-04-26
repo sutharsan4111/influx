@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const path = require("path");
 const bodyParser = require("body-parser");
 const cors = require("cors");
+const compression = require("compression");
 const fs = require("fs");
 const multer = require("multer");
 const FormData = require("form-data");
@@ -22,8 +23,23 @@ const upload = multer({ storage: multer.memoryStorage() });
 // Middleware
 // ===============================
 app.use(cors());
+app.use(compression()); // 🚀 Enable gzip compression for responses
 app.use(express.json());
 app.use(bodyParser.json());
+
+// 🚀 Production: Smart caching headers
+app.use((req, res, next) => {
+  // Static assets: 1 year (immutable)
+  if (req.url.match(/\.(js|css|woff|woff2|ttf|eot|svg)$/i)) {
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+  // API responses: use cache-control from individual endpoints
+  // HTML: no cache
+  else if (!req.url.startsWith('/api/')) {
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+  next();
+});
 
 // 🏥 Health check
 app.get('/api/health', (req, res) => {
@@ -1132,10 +1148,12 @@ async function processSslAlerts() {
 //                     API ROUTES
 // -------------------------------------------------------
 
-// 🚀 OPTIMIZED: Server-side cache for counts
-let countsCache = null;
-let countsCacheTime = 0;
-const COUNTS_CACHE_MS = 5 * 60 * 1000; // 5 minutes cache (larger datasets need more time)
+// 🚀 OPTIMIZED: Production-grade caching system
+const countsCache = new Map(); // Cache per user role
+const COUNTS_CACHE_MS = 20 * 1000; // 20 seconds for near-real-time dashboard updates
+let agentsCache = null;
+let agentsCacheTime = 0;
+const AGENTS_CACHE_MS = 30 * 60 * 1000; // 30 minutes for agents list
 
 async function getActiveRecycledTicketIds() {
   try {
@@ -1153,26 +1171,26 @@ async function getActiveRecycledTicketIds() {
 }
 
 app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
-  // Disable browser caching for this endpoint
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  // Prevent browser/proxy caching; rely only on short-lived server cache.
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
-  res.removeHeader('ETag');
   
   try {
     const userEmail = req.user?.email?.toLowerCase() || '';
     const userRole = (req.user?.role || 'user').toLowerCase();
     const isAdmin = userRole === 'admin';
     
-    // Return cached counts if still valid (5 min cache for large datasets)
-    // Use user-specific cache key for assigned count
-    const cacheKey = `counts_${userRole}_${userEmail}`;
-    if (countsCache && countsCache._key === cacheKey && (Date.now() - countsCacheTime) < COUNTS_CACHE_MS) {
-      console.log('Returning cached counts:', countsCache);
-      return res.json(countsCache);
+    // Role-based cache key (admins all see the same counts)
+    const cacheKey = isAdmin ? 'counts_admin' : `counts_user_${userEmail}`;
+    const cached = countsCache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.time) < COUNTS_CACHE_MS) {
+      console.log(`[CACHE HIT] ${cacheKey}`);
+      return res.json(cached.data);
     }
-
-    console.log(`Fetching fresh counts for user: ${userEmail}`);
+    
+    console.log(`[CACHE MISS] ${cacheKey} - fetching fresh counts`);
     
     const recycledTicketIds = await getActiveRecycledTicketIds();
 
@@ -1180,7 +1198,7 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
       if (!email) return new Set();
       try {
         const result = await pool.query(
-          "SELECT zoho_ticket_id FROM ticket_assignments WHERE LOWER(primary_assignee) = $1",
+          "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
           [email]
         );
         return new Set(result.rows.map(r => r.zoho_ticket_id));
@@ -1297,8 +1315,7 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
 
     console.log(`Counts for ${userEmail}: open=${openCount}, closed=${closedCount}, mySLA=${slaCount}, assigned=${assignedCount}`);
 
-    countsCache = {
-      _key: cacheKey,
+    const countData = {
       scope: isAdmin ? 'all' : 'mine',
       open: openCount,
       closed: closedCount,
@@ -1306,9 +1323,11 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
       assigned: assignedCount,
       total: openCount + closedCount
     };
-    countsCacheTime = Date.now();
+    
+    // Cache the result
+    countsCache.set(cacheKey, { data: countData, time: Date.now() });
 
-    res.json(countsCache);
+    res.json(countData);
   } catch (err) {
     console.error('Counts error:', err);
     res.status(500).json({ error: 'Failed to fetch ticket counts' });
@@ -1316,9 +1335,6 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
 });
 
 // 🔧 GET ZOHO DESK AGENTS for assignment dropdown
-let agentsCache = null;
-let agentsCacheTime = 0;
-const AGENTS_CACHE_MS = 10 * 60 * 1000; // 10 minutes cache
 
 app.get('/api/agents', authenticateToken, async (req, res) => {
   try {
@@ -1360,7 +1376,12 @@ app.get('/api/agents', authenticateToken, async (req, res) => {
 
 // Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
 const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
-const USER_TICKETS_CACHE_MS = 5 * 60 * 1000; // 5 minutes
+const USER_TICKETS_CACHE_MS = 30 * 1000; // 30 seconds for faster reflection after changes
+
+function invalidateRuntimeCaches() {
+  countsCache.clear();
+  userTicketsCache.clear();
+}
 
 app.get('/api/tickets', authenticateToken, async (req, res) => {
   try {
@@ -1376,9 +1397,12 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
     if (filterByEmail) {
       const userEmail = filterByEmail.toLowerCase();
       const cacheKey = `${userEmail}_${status || 'all'}`;
+      const startIdx = (page - 1) * limit;
+      const neededForPage = startIdx + limit + 1;
       const cached = userTicketsCache.get(cacheKey);
 
       let allUserTickets;
+      let partialPageOnly = false;
       if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) {
         allUserTickets = cached.tickets;
       } else {
@@ -1390,7 +1414,7 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
         const [recycledIds, supabaseResult] = await Promise.all([
           getActiveRecycledTicketIds(),
           pool.query(
-            "SELECT zoho_ticket_id FROM ticket_assignments WHERE LOWER(primary_assignee) = $1",
+            "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
             [userEmail]
           ).catch(e => { console.error('Supabase assignment fetch error:', e); return { rows: [] }; })
         ]);
@@ -1450,8 +1474,18 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
           for (const result of batchResults) {
             const myTickets = filterMyTickets(result.data);
             allUserTickets.push(...myTickets);
+
+            // Short-circuit once we have enough rows for the requested page.
+            if (allUserTickets.length >= neededForPage) {
+              partialPageOnly = true;
+              keepScanning = false;
+              break;
+            }
+
             if (result.data.length === apiPageSize) anyPageFull = true;
           }
+
+          if (!keepScanning) break;
 
           // If no page in batch was full, we've reached the end
           if (!anyPageFull) {
@@ -1462,20 +1496,24 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
           }
         }
 
-        // Cache all user tickets
-        userTicketsCache.set(cacheKey, { tickets: allUserTickets, time: Date.now() });
+        // Cache only full scans. Partial scans are page-optimized and should not poison cache.
+        if (!partialPageOnly) {
+          userTicketsCache.set(cacheKey, { tickets: allUserTickets, time: Date.now() });
+        }
         console.log(`Cached ${allUserTickets.length} tickets for ${userEmail} (${status || 'all'}) in ${Date.now() - startTime}ms`);
       }
 
       // Paginate from cached results
-      const startIdx = (page - 1) * limit;
       const pageData = allUserTickets.slice(startIdx, startIdx + limit);
+      const hasMore = partialPageOnly
+        ? pageData.length === limit
+        : startIdx + limit < allUserTickets.length;
 
       return res.json({
         page,
         limit,
         count: pageData.length,
-        hasMore: startIdx + limit < allUserTickets.length,
+        hasMore,
         data: pageData
       });
     }
@@ -1536,6 +1574,8 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
 
 app.get('/api/tickets/recycle-bin', authenticateToken, async (req, res) => {
   try {
+    const userEmail = (req.user?.email || '').toLowerCase();
+
     await pool.query(
       `DELETE FROM recycled_tickets
        WHERE restored_at IS NULL
@@ -1555,8 +1595,10 @@ app.get('/api/tickets/recycle-bin', authenticateToken, async (req, res) => {
          GREATEST(0, CEIL(EXTRACT(EPOCH FROM (expires_at - NOW())) / 86400))::INT AS expires_in_days
        FROM recycled_tickets
        WHERE restored_at IS NULL
+         AND LOWER(deleted_by) = $1
          AND expires_at > NOW()
-       ORDER BY deleted_at DESC`
+       ORDER BY deleted_at DESC`,
+      [userEmail]
     );
 
     return res.json({ data: result.rows });
@@ -1568,9 +1610,7 @@ app.get('/api/tickets/recycle-bin', authenticateToken, async (req, res) => {
 
 app.post('/api/tickets/:id/recycle', authenticateToken, async (req, res) => {
   // Invalidate caches
-  userTicketsCache.clear();
-  countsCache = null;
-  countsCacheTime = 0;
+  invalidateRuntimeCaches();
   try {
     const ticketId = (req.params.id || '').toString();
     if (!ticketId) {
@@ -1613,8 +1653,7 @@ app.post('/api/tickets/:id/recycle', authenticateToken, async (req, res) => {
       [ticketId, `${ticketNumber}`, subject, email, priority, deletedBy, JSON.stringify(source || {})]
     );
 
-    countsCache = null;
-    countsCacheTime = 0;
+    invalidateRuntimeCaches();
 
     return res.json({ message: 'Ticket moved to recycle bin' });
   } catch (err) {
@@ -1625,26 +1664,25 @@ app.post('/api/tickets/:id/recycle', authenticateToken, async (req, res) => {
 
 app.post('/api/tickets/recycle-bin/:ticketId/restore', authenticateToken, async (req, res) => {
   // Invalidate caches
-  userTicketsCache.clear();
-  countsCache = null;
-  countsCacheTime = 0;
+  invalidateRuntimeCaches();
   try {
     const ticketId = (req.params.ticketId || '').toString();
+    const userEmail = (req.user?.email || '').toLowerCase();
     const result = await pool.query(
       `UPDATE recycled_tickets
        SET restored_at = NOW(), updated_at = NOW()
        WHERE zoho_ticket_id = $1
          AND restored_at IS NULL
+         AND LOWER(deleted_by) = $2
        RETURNING zoho_ticket_id`,
-      [ticketId]
+      [ticketId, userEmail]
     );
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Ticket not found in recycle bin' });
     }
 
-    countsCache = null;
-    countsCacheTime = 0;
+    invalidateRuntimeCaches();
 
     return res.json({ message: 'Ticket restored successfully' });
   } catch (err) {
@@ -1656,19 +1694,20 @@ app.post('/api/tickets/recycle-bin/:ticketId/restore', authenticateToken, async 
 app.delete('/api/tickets/recycle-bin/:ticketId', authenticateToken, async (req, res) => {
   try {
     const ticketId = (req.params.ticketId || '').toString();
+    const userEmail = (req.user?.email || '').toLowerCase();
     const result = await pool.query(
       `DELETE FROM recycled_tickets
        WHERE zoho_ticket_id = $1
+         AND LOWER(deleted_by) = $2
        RETURNING zoho_ticket_id`,
-      [ticketId]
+      [ticketId, userEmail]
     );
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Ticket not found in recycle bin' });
     }
 
-    countsCache = null;
-    countsCacheTime = 0;
+    invalidateRuntimeCaches();
 
     return res.json({ message: 'Ticket permanently deleted from recycle bin' });
   } catch (err) {
@@ -1679,7 +1718,8 @@ app.delete('/api/tickets/recycle-bin/:ticketId', authenticateToken, async (req, 
 
 app.get('/api/tickets/:id',  authenticateToken,async (req, res) => {
   try {
-    const response = await zohoFetch(`/tickets/${req.params.id}`);
+    // Include assignee/contact fields so permission checks on the UI are accurate for assigned users.
+    const response = await zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`);
     res.json(await response.json());
   } catch {
     res.status(500).json({ error: 'Failed to fetch ticket' });
@@ -1709,10 +1749,9 @@ app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
       return res.status(response.status).json(data || { error: 'Failed to update ticket' });
     }
 
-    // Invalidate user tickets cache and counts cache on ticket update
+    // Invalidate counts caches on ticket update (status changes affect counts)
+    countsCache.clear();
     userTicketsCache.clear();
-    countsCache = null;
-    countsCacheTime = 0;
 
     return res.json(data || { status: 'ok' });
   } catch (err) {
@@ -1961,40 +2000,90 @@ app.post("/api/msal-login", async (req, res) => {
       return res.status(400).json({ message: "Missing data" });
     }
 
-    const graphResponse = await fetch(
-      "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=mail",
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
+    const normalize = (v) => (v || '').toString().trim().toLowerCase();
+    const normalizedEmail = normalize(email);
 
-    if (!graphResponse.ok) {
-      return res.status(401).json({ message: "Graph validation failed" });
+    // Step 1: Check Microsoft Graph for cloudops@muraai.com group membership
+    let isInAdminGroup = false;
+    let roleSource = 'default';
+    
+    try {
+      let url = 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=mail,displayName,mailNickname';
+      
+      while (url && !isInAdminGroup) {
+        const graphResponse = await fetch(url, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+
+        if (!graphResponse.ok) {
+          console.warn(`[MSAL LOGIN] Graph API check failed for ${normalizedEmail}: ${graphResponse.status}`);
+          break;
+        }
+
+        const data = await graphResponse.json();
+        const groups = Array.isArray(data?.value) ? data.value : [];
+
+        isInAdminGroup = groups.some((g) => {
+          const mail = normalize(g.mail);
+          const displayName = normalize(g.displayName);
+          const nickname = normalize(g.mailNickname);
+          return mail === 'cloudops@muraai.com' || displayName === 'cloudops' || nickname === 'cloudops';
+        });
+
+        url = data['@odata.nextLink'] || '';
+      }
+      
+      if (isInAdminGroup) {
+        roleSource = 'graph-cloudops-group';
+      }
+    } catch (graphErr) {
+      console.warn(`[MSAL LOGIN] Graph API error for ${normalizedEmail}:`, graphErr?.message || graphErr);
     }
 
-    const data = await graphResponse.json();
-    const groups = data.value || [];
+    // Step 2: Check user_roles table for explicit role assignment (can override Graph membership)
+    let dbRole = null;
+    try {
+      const roleResult = await pool.query(
+        `SELECT role FROM user_roles WHERE LOWER(microsoft_email) = $1 LIMIT 1`,
+        [normalizedEmail]
+      );
+      if (roleResult.rows.length > 0) {
+        dbRole = (roleResult.rows[0]?.role || '').toString().toLowerCase();
+        roleSource = 'user_roles-db';
+        console.log(`[MSAL LOGIN] Found explicit DB role for ${normalizedEmail}: ${dbRole}`);
+      }
+    } catch (dbErr) {
+      console.warn(`[MSAL LOGIN] DB role check failed for ${normalizedEmail}:`, dbErr?.message || dbErr);
+    }
 
-    const isAdmin = groups.some(
-      g => (g.mail || "").toLowerCase() === "cloudops@muraai.com"
+    // Step 3: Determine final role
+    let role = 'user'; // default
+    if (dbRole) {
+      // DB role takes priority (explicit admin assignment)
+      role = dbRole;
+    } else if (isInAdminGroup) {
+      // Graph group membership (cloudops@muraai.com)
+      role = 'admin';
+    }
+    
+    console.log(`[MSAL LOGIN] ${normalizedEmail} resolved role=${role} via ${roleSource}`);
+
+    const newAccessToken = jwt.sign(
+      { email: normalizedEmail, role },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" }
     );
 
-    const role = isAdmin ? "admin" : "user";
+    const refreshToken = jwt.sign(
+      { email: normalizedEmail, role },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: "7d" }
+    );
 
-const newAccessToken = jwt.sign(
-  { email, role },
-  process.env.JWT_SECRET,
-  { expiresIn: "1h" }
-);
-
-const refreshToken = jwt.sign(
-  { email, role },
-  process.env.JWT_REFRESH_SECRET,
-  { expiresIn: "7d" }
-);
-
-res.json({ accessToken: newAccessToken, refreshToken, role });
-
+    res.json({ accessToken: newAccessToken, refreshToken, role });
 
   } catch (err) {
+    console.error('MSAL login error:', err?.message);
     res.status(500).json({ error: "MSAL login failed" });
   }
 });
@@ -2201,12 +2290,14 @@ app.post('/api/tickets', upload.array('attachments'), authenticateToken, async (
         const upData = await upRes.json();
         uploaded.push({ ok: upRes.ok, data: upData });
       }
+      invalidateRuntimeCaches();
       return res.status(response.status).json({
         ...data,
         attachments: uploaded
       });
     }
 
+    invalidateRuntimeCaches();
     res.status(response.status).json(data);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create ticket' });
@@ -3024,6 +3115,7 @@ app.post("/api/assignments", authenticateToken, async (req, res) => {
       // Don't fail the request, Supabase record is created
     }
 
+    invalidateRuntimeCaches();
     res.json(result.rows[0]);
   } catch (err) {
     console.error("Failed to create assignment:", err);
@@ -3082,6 +3174,7 @@ app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
       // Silently fail; DB record is primary source of truth
     }
 
+    invalidateRuntimeCaches();
     res.json(result.rows[0]);
   } catch (err) {
     console.error("Failed to reassign:", err);
@@ -3146,6 +3239,7 @@ app.post("/api/assignments/bulk", authenticateToken, async (req, res) => {
       }
     }
 
+    invalidateRuntimeCaches();
     res.json({ success, failed });
   } catch (err) {
     console.error("Bulk assign failed:", err);
@@ -3173,6 +3267,7 @@ app.put("/api/assignments/:zohoTicketId/close", authenticateToken, async (req, r
       return res.status(404).json({ message: "Assignment not found" });
     }
 
+    invalidateRuntimeCaches();
     res.json(result.rows[0]);
   } catch (err) {
     console.error("Failed to close assignment:", err);
@@ -3192,6 +3287,7 @@ app.delete("/api/assignments/:zohoTicketId", authenticateToken, authorizeAdmin, 
       return res.status(404).json({ message: "Assignment not found" });
     }
 
+    invalidateRuntimeCaches();
     res.json({ message: "Assignment deleted" });
   } catch (err) {
     console.error("Failed to delete assignment:", err);
@@ -3305,7 +3401,202 @@ app.get("/api/admin/assignments-report", authenticateToken, authorizeAdmin, asyn
 });
 
 // -------------------------------------------------------
-// SPA fallback (Angular routing)
+// ADMIN: USER ROLE MANAGEMENT API
+// -------------------------------------------------------
+
+// GET /api/admin/user-roles - List all stored user roles from database
+app.get('/api/admin/user-roles', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+         id,
+         microsoft_email,
+         role,
+         assigned_by,
+         assigned_at,
+         updated_at,
+         notes
+       FROM user_roles
+       ORDER BY updated_at DESC`
+    );
+
+    return res.json({ 
+      users: result.rows,
+      count: result.rows.length
+    });
+  } catch (err) {
+    console.error('Failed to fetch user roles:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to fetch user roles' });
+  }
+});
+
+// POST /api/admin/users/:email/role - Assign/update role for a user
+app.post('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const { role: newRole, notes } = req.body;
+    const userEmail = (req.params.email || '').toString().toLowerCase().trim();
+    const adminEmail = (req.user?.email || '').toLowerCase();
+
+    if (!userEmail) {
+      return res.status(400).json({ error: 'User email is required' });
+    }
+
+    const allowedRoles = ['admin', 'support', 'user'];
+    if (!newRole || !allowedRoles.includes(newRole)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${allowedRoles.join(', ')}` });
+    }
+
+    // Upsert into user_roles table
+    const result = await pool.query(
+      `INSERT INTO user_roles (microsoft_email, role, assigned_by, notes, assigned_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       ON CONFLICT (microsoft_email)
+       DO UPDATE SET
+         role = EXCLUDED.role,
+         assigned_by = EXCLUDED.assigned_by,
+         notes = EXCLUDED.notes,
+         updated_at = NOW()
+       RETURNING id, microsoft_email, role, assigned_by, assigned_at, updated_at, notes`,
+      [userEmail, newRole, adminEmail, notes || null]
+    );
+
+    console.log(`[ADMIN] Role assigned: ${userEmail} → ${newRole} by ${adminEmail}`);
+
+    return res.json({
+      success: true,
+      message: `Role updated for ${userEmail}`,
+      user: result.rows[0]
+    });
+  } catch (err) {
+    console.error('Failed to assign role:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to assign role' });
+  }
+});
+
+// GET /api/admin/users - Get paginated list of Microsoft users (from Graph)
+app.get('/api/admin/users', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.pageSize) || 50;
+    const skip = (page - 1) * pageSize;
+    const searchText = (req.query.search || '').toString().trim();
+
+    // Use explicit Graph token from frontend (MSAL), not app JWT.
+    const adminAccessToken = (req.headers['x-graph-token'] || '').toString().trim();
+    
+    if (!adminAccessToken) {
+      return res.status(400).json({ error: 'No Microsoft Graph token provided' });
+    }
+
+    // Fetch users from Microsoft Graph
+    let graphUrl = `https://graph.microsoft.com/v1.0/users?$select=id,userPrincipalName,displayName,mail&$top=${pageSize}&$skip=${skip}&$orderby=displayName`;
+
+    if (searchText) {
+      graphUrl += `&$filter=contains(displayName,'${searchText}') or contains(mail,'${searchText}')`;
+    }
+
+    const graphResponse = await fetch(graphUrl, {
+      headers: { 
+        Authorization: `Bearer ${adminAccessToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!graphResponse.ok) {
+      console.warn(`Graph API users fetch failed: ${graphResponse.status}`);
+      return res.status(graphResponse.status).json({ 
+        error: 'Failed to fetch users from Microsoft Graph',
+        details: `Graph API returned ${graphResponse.status}`
+      });
+    }
+
+    const graphData = await graphResponse.json();
+    const graphUsers = Array.isArray(graphData?.value) ? graphData.value : [];
+
+    // Enrich with stored roles from DB
+    const userEmails = graphUsers.map(u => (u.mail || '').toLowerCase()).filter(Boolean);
+    let storedRoles = new Map();
+
+    if (userEmails.length > 0) {
+      const roleResult = await pool.query(
+        `SELECT microsoft_email, role, assigned_by, assigned_at, updated_at
+         FROM user_roles
+         WHERE LOWER(microsoft_email) = ANY($1)`,
+        [userEmails]
+      );
+      
+      roleResult.rows.forEach(row => {
+        storedRoles.set((row.microsoft_email || '').toLowerCase(), row);
+      });
+    }
+
+    const enrichedUsers = graphUsers.map(u => {
+      const email = (u.mail || '').toLowerCase();
+      const storedRole = storedRoles.get(email);
+      return {
+        id: u.id,
+        email: u.mail || u.userPrincipalName,
+        displayName: u.displayName,
+        userPrincipalName: u.userPrincipalName,
+        currentRole: storedRole?.role || 'user', // default to 'user' if not in DB
+        assignedBy: storedRole?.assigned_by || null,
+        assignedAt: storedRole?.assigned_at || null,
+        updatedAt: storedRole?.updated_at || null
+      };
+    });
+
+    return res.json({
+      users: enrichedUsers,
+      page,
+      pageSize,
+      count: enrichedUsers.length,
+      hasMore: enrichedUsers.length === pageSize
+    });
+  } catch (err) {
+    console.error('Failed to fetch Graph users:', err?.message || err);
+    return res.status(500).json({ 
+      error: 'Failed to fetch users',
+      details: err?.message
+    });
+  }
+});
+
+// DELETE /api/admin/users/:email/role - Remove stored role assignment (reverts to Graph group + default)
+app.delete('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const userEmail = (req.params.email || '').toString().toLowerCase().trim();
+    const adminEmail = (req.user?.email || '').toLowerCase();
+
+    if (!userEmail) {
+      return res.status(400).json({ error: 'User email is required' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM user_roles
+       WHERE LOWER(microsoft_email) = $1
+       RETURNING microsoft_email, role`,
+      [userEmail]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'No role assignment found for this user' });
+    }
+
+    console.log(`[ADMIN] Role assignment deleted: ${userEmail} by ${adminEmail}`);
+
+    return res.json({
+      success: true,
+      message: `Role assignment removed for ${userEmail}. User will revert to Graph group-based role.`,
+      user: result.rows[0]
+    });
+  } catch (err) {
+    console.error('Failed to delete role assignment:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to delete role assignment' });
+  }
+});
+
+// -------------------------------------------------------
+// SPA fallback (Angular routing) - MUST BE LAST
 // -------------------------------------------------------
 app.get("*", (req, res) => {
   const indexPath =

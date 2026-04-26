@@ -330,6 +330,7 @@ async loginWithMicrosoft() {
     // 2️⃣ Get active account
     const account = this.msalService.getActiveAccount();
     const email = account?.username;
+    const displayName = account?.name || '';
 
     if (!email) {
       this.error = 'Unable to retrieve email';
@@ -357,6 +358,7 @@ async loginWithMicrosoft() {
       sessionStorage.setItem('refreshToken', data.refreshToken);
       sessionStorage.setItem('role', data.role);
       sessionStorage.setItem('username', email);
+      sessionStorage.setItem('displayName', displayName);
 
       this.router.navigate(['/dashboard']);
     } else {

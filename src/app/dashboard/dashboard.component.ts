@@ -915,6 +915,18 @@ export class DashboardComponent implements OnInit, OnDestroy {
     return `dashboard_ticket_counts_${userRole}_${userEmail}`;
   }
 
+  private get TICKETS_CACHE_KEY(): string {
+    const userEmail = sessionStorage.getItem('username') || 'guest';
+    const userRole = sessionStorage.getItem('role') || 'user';
+    return `dashboard_tickets_${userRole}_${userEmail}_${this.selectedTab}`;
+  }
+
+  private get TICKETS_CACHE_KEY_BASE(): string {
+    const userEmail = sessionStorage.getItem('username') || 'guest';
+    const userRole = sessionStorage.getItem('role') || 'user';
+    return `dashboard_tickets_${userRole}_${userEmail}`;
+  }
+
   tickets: Ticket[] = [];
   filteredTickets: Ticket[] = [];
   slaTickets: Ticket[] = [];
@@ -972,14 +984,31 @@ export class DashboardComponent implements OnInit, OnDestroy {
     localStorage.removeItem('dashboard_ticket_counts');
 
     const cached = localStorage.getItem(this.COUNT_CACHE_KEY);
-    if (cached) { 
-      this.applyCounts(JSON.parse(cached));
-      this.countsLoading = false; // Don't show skeleton if we have cached data
+    if (cached) {
+      try {
+        this.applyCounts(JSON.parse(cached));
+        this.countsLoading = false; // Don't show skeleton if we have cached data
+      } catch {
+        localStorage.removeItem(this.COUNT_CACHE_KEY);
+      }
     }
 
-    // Force refresh to get accurate counts for this user
-    this.loadCounts(true, true);
-    this.loadTickets();
+    const cachedTickets = localStorage.getItem(this.TICKETS_CACHE_KEY);
+    if (cachedTickets) {
+      try {
+        this.tickets = JSON.parse(cachedTickets) || [];
+        this.filterTickets();
+        this.calculatePriorityStats();
+        this.findSLATickets();
+        this.generateRecentActivity();
+      } catch {
+        localStorage.removeItem(this.TICKETS_CACHE_KEY);
+      }
+    }
+
+    // Refresh in background without showing full-page loading on route revisit.
+    this.loadCounts(true, false);
+    this.loadTickets(true);
     this.initGrafanaMonitoring();
   }
 
@@ -1020,7 +1049,9 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   loadCounts(silent = false, forceRefresh = false) {
-    this.countsLoading = true;
+    if (forceRefresh || this.countsLoading) {
+      this.countsLoading = true;
+    }
     this.ticketService.getTicketCounts(forceRefresh).subscribe({
       next: counts => {
         this.applyCounts(counts);
@@ -1042,21 +1073,29 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.slaCount = counts.sla ?? this.slaCount;
   }
 
-  loadTickets() {
-    this.loadingService.show();
+  loadTickets(silent = false) {
+    if (!silent) {
+      this.loadingService.show();
+    }
     const filterEmail = !this.isAdmin ? this.currentUserEmail : undefined;
-    this.ticketService.getTickets(1, 100, this.selectedTab, undefined, filterEmail).subscribe({
+    // 50 records is enough for dashboard widgets and faster than 100.
+    this.ticketService.getTickets(1, 50, this.selectedTab, undefined, filterEmail).subscribe({
       next: res => {
         this.tickets = res.data || [];
         this.filterTickets();
         this.calculatePriorityStats();
         this.findSLATickets();
         this.generateRecentActivity();
-        this.loadingService.hide();
+        localStorage.setItem(this.TICKETS_CACHE_KEY, JSON.stringify(this.tickets));
+        if (!silent) {
+          this.loadingService.hide();
+        }
       },
       error: () => {
-        this.messageService.error('Failed to load tickets');
-        this.loadingService.hide();
+        if (!silent) {
+          this.messageService.error('Failed to load tickets');
+          this.loadingService.hide();
+        }
       }
     });
   }
@@ -1121,14 +1160,28 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   changeTab(tab: 'open' | 'closed') {
     this.selectedTab = tab;
-    this.loadTickets();
+    const cachedTickets = localStorage.getItem(this.TICKETS_CACHE_KEY);
+    if (cachedTickets) {
+      try {
+        this.tickets = JSON.parse(cachedTickets) || [];
+        this.filterTickets();
+        this.calculatePriorityStats();
+        this.findSLATickets();
+        this.generateRecentActivity();
+      } catch {
+        localStorage.removeItem(this.TICKETS_CACHE_KEY);
+      }
+    }
+    this.loadTickets(true);
   }
 
   refreshDashboard() {
     this.isRefreshing = true;
     this.ticketService.clearAllCache();
+    localStorage.removeItem(`${this.TICKETS_CACHE_KEY_BASE}_open`);
+    localStorage.removeItem(`${this.TICKETS_CACHE_KEY_BASE}_closed`);
     this.loadCounts(false, true);
-    this.loadTickets();
+    this.loadTickets(false);
     this.initGrafanaMonitoring();
     setTimeout(() => this.isRefreshing = false, 2000);
   }

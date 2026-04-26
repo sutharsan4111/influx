@@ -1185,6 +1185,10 @@ export class CreateTicketComponent implements OnInit {
         this.priorityTouched = false;
         this.attachments = [];
 
+        // Ensure tickets list and dashboard counts reflect the new ticket immediately.
+        this.ticketService.clearAllCache();
+        this.ticketService.invalidateTabCache();
+
         this.loadingService.hide();
         this.router.navigate(['/tickets']);
       },
