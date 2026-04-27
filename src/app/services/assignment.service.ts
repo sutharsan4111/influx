@@ -38,6 +38,7 @@ export interface ReassignPayload {
   zoho_ticket_id: string;
   new_assigned_users: string[];
   reassigned_by: string;
+  category?: string;
 }
 
 export interface BulkAssignPayload {
@@ -98,6 +99,14 @@ export class AssignmentService {
       `${this.adminUrl}/assignments-report`,
       { headers: this.getAuthHeaders() }
     ).pipe(map(result => result.assignments || []));
+  }
+
+  backfillCategories(): Observable<{ total: number; updated: number; failed: number }> {
+    return this.http.post<{ total: number; updated: number; failed: number }>(
+      `${this.adminUrl}/backfill-categories`,
+      {},
+      { headers: this.getAuthHeaders() }
+    );
   }
 
   getGroupMembers(groupEmail: string, graphToken: string): Observable<GroupMember[]> {

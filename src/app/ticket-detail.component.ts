@@ -30,11 +30,6 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
 
         <div class="actions">
           <button class="btn" (click)="reload()">⟳</button>
-          <button class="btn primary"
-                  (click)="closeTicket()"
-                  [disabled]="(ticket?.status || '').toLowerCase().includes('closed')">
-            Close
-          </button>
         </div>
       </div>
 

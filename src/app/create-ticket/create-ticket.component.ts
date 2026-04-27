@@ -1152,10 +1152,13 @@ export class CreateTicketComponent implements OnInit {
 
         // Save assignment to Supabase if user selected an assignee
         if (assigneeEmailToSave && ticketId) {
+          const normalizedCategory = (this.formData.issueCategory || '').trim();
           this.assignmentService.assignTicket({
             zoho_ticket_id: ticketId,
+            zoho_ticket_number: response?.ticketNumber || response?.number,
             assigned_users: [assigneeEmailToSave],
-            assigned_by: this.formData.email
+            assigned_by: this.formData.email,
+            ...(normalizedCategory ? { category: normalizedCategory } : {})
           }).subscribe({
             next: () => {
               console.log('Assignment saved to Supabase');

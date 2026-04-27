@@ -3230,7 +3230,7 @@ app.post("/api/assignments", authenticateToken, async (req, res) => {
 // Reassign ticket
 app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
   try {
-    const { zoho_ticket_id, new_assigned_users, reassigned_by } = req.body;
+    const { zoho_ticket_id, new_assigned_users, reassigned_by, category } = req.body;
 
     if (!zoho_ticket_id || !new_assigned_users || new_assigned_users.length === 0 || !reassigned_by) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -3238,6 +3238,7 @@ app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
 
     const new_primary = new_assigned_users[0].toLowerCase();
     const normalizedUsers = new_assigned_users.map(u => u.toLowerCase());
+    const normalizedCategory = (category || '').trim() || null;
 
     // Get current assignment
     const current = await pool.query(
@@ -3255,10 +3256,11 @@ app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
          reassigned_user = $3,
          reassigned_at = NOW(),
          reassigned_by = $4,
+         category = COALESCE($5, category),
          updated_at = NOW()
-       WHERE zoho_ticket_id = $5
+       WHERE zoho_ticket_id = $6
        RETURNING *`,
-      [normalizedUsers, new_primary, old_primary, reassigned_by.toLowerCase(), zoho_ticket_id]
+      [normalizedUsers, new_primary, old_primary, reassigned_by.toLowerCase(), normalizedCategory, zoho_ticket_id]
     );
 
     if (result.rows.length === 0) {
@@ -3501,6 +3503,90 @@ app.get("/api/admin/assignments-report", authenticateToken, authorizeAdmin, asyn
     res.json({ assignments: result.rows });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch assignments report" });
+  }
+});
+
+function extractCategoryFromZohoTicket(rawTicket) {
+  const ticket = rawTicket?.data || rawTicket || {};
+
+  const readValue = (value) => {
+    if (!value) return '';
+    if (typeof value === 'string') return value.trim();
+    if (typeof value === 'object') {
+      const candidate = value.name || value.displayName || value.label || value.value;
+      return typeof candidate === 'string' ? candidate.trim() : '';
+    }
+    return '';
+  };
+
+  const directCandidates = [
+    ticket.category,
+    ticket.ticketCategory,
+    ticket.issueCategory,
+    ticket.subCategory,
+    ticket.subcategory
+  ];
+
+  for (const candidate of directCandidates) {
+    const val = readValue(candidate);
+    if (val) return val;
+  }
+
+  const fieldContainers = [
+    ticket.customFields,
+    ticket.custom_fields,
+    ticket.cf,
+    ticket.fields
+  ].filter(Boolean);
+
+  for (const container of fieldContainers) {
+    for (const [key, value] of Object.entries(container)) {
+      if (!/category/i.test(key)) continue;
+      const val = readValue(value);
+      if (val) return val;
+    }
+  }
+
+  return '';
+}
+
+// Admin: backfill categories from Zoho for assignments that are NULL/Uncategorized
+app.post("/api/admin/backfill-categories", authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT zoho_ticket_id FROM ticket_assignments
+       WHERE category IS NULL
+          OR TRIM(category) = ''
+          OR LOWER(TRIM(category)) IN ('uncategorized', 'uncategorised', 'uncategory')
+       ORDER BY assigned_at DESC`
+    );
+
+    const rows = result.rows;
+    let updated = 0;
+    let failed = 0;
+
+    for (const row of rows) {
+      try {
+        const ticketRes = await zohoFetch(`/tickets/${row.zoho_ticket_id}`);
+        if (!ticketRes.ok) { failed++; continue; }
+        const ticket = await ticketRes.json();
+        const category = extractCategoryFromZohoTicket(ticket);
+        if (!category) { failed++; continue; }
+
+        await pool.query(
+          `UPDATE ticket_assignments SET category = $1, updated_at = NOW() WHERE zoho_ticket_id = $2`,
+          [category, row.zoho_ticket_id]
+        );
+        updated++;
+      } catch (innerErr) {
+        failed++;
+      }
+    }
+
+    res.json({ total: rows.length, updated, failed });
+  } catch (err) {
+    console.error("Backfill categories failed:", err);
+    res.status(500).json({ message: "Backfill failed" });
   }
 });
 

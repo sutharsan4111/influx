@@ -2710,16 +2710,18 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     this.loadingService.show();
 
     try {
+      const ticket = this.filteredTickets.find(t => (t.id || t.ticketId) === this.assignTicketId);
+      const category = this.normalizeCategoryValue(ticket?.category);
+
       if (this.isReassigning) {
         await firstValueFrom(this.assignmentService.reassignTicket({
           zoho_ticket_id: this.assignTicketId,
           new_assigned_users: this.selectedAssignees,
-          reassigned_by: this.currentUserEmail
+          reassigned_by: this.currentUserEmail,
+          ...(category ? { category } : {})
         }));
         this.messageService.success('Ticket reassigned successfully');
       } else {
-        const ticket = this.filteredTickets.find(t => (t.id || t.ticketId) === this.assignTicketId);
-        const category = this.normalizeCategoryValue(ticket?.category);
         await firstValueFrom(this.assignmentService.assignTicket({
           zoho_ticket_id: this.assignTicketId,
           zoho_ticket_number: ticket?.ticketNumber,
