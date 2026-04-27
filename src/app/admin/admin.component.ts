@@ -12,7 +12,6 @@ import { Router, RouterLink } from '@angular/router';
   <div class="page-header-row">
     <div>
       <h2>Local User Management</h2>
-      <p class="subtitle">Manage local application users (for local JWT authentication)</p>
     </div>
     <div style="display: flex; gap: 10px;">
       <button class="btn-nav" routerLink="/admin/user-roles" title="Manage Microsoft user roles">

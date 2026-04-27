@@ -20,6 +20,12 @@ import { Router, RouterModule, RouterOutlet } from '@angular/router';
           [class.active]="isActive('/infrastructure/ihub')">
           IHUB
         </a>
+        <a
+          class="infra-tab"
+          routerLink="/infrastructure/automation-ssl"
+          [class.active]="isActive('/infrastructure/automation-ssl')">
+          Automation SSL
+        </a>
       </div>
 
       <div class="infra-content">

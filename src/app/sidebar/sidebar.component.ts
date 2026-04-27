@@ -717,7 +717,7 @@ export class SidebarComponent implements OnInit {
   }
 
   isLicenceSection() {
-    return this.router.url.startsWith('/infrastructure') || this.router.url.startsWith('/ssl') || this.router.url.startsWith('/ihub');
+    return this.router.url.startsWith('/infrastructure') || this.router.url.startsWith('/ssl') || this.router.url.startsWith('/ihub') || this.router.url.startsWith('/automation-ssl');
   }
 
   isAdmin() { return this.role === 'admin'; }

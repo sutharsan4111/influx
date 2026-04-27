@@ -377,6 +377,7 @@ const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
 const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const AUTOMATION_SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
+const AUTOMATION_PROMETHEUS_URL = (process.env.AUTOMATION_PROMETHEUS_URL || '').trim();
 const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
 const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
 
@@ -2565,6 +2566,103 @@ app.get('/api/ssl', authenticateToken, authorizeAdmin, async (req, res) => {
   } catch (err) {
     console.error('Failed to fetch SSL assets:', err);
     res.status(500).json({ message: 'Failed to fetch SSL assets' });
+  }
+});
+
+app.get('/api/automation-ssl', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const statusFilter = (req.query.status || '').toString().trim().toLowerCase();
+    const status = statusFilter && statusFilter !== 'all' ? statusFilter : null;
+
+    const result = await pool.query(
+      `SELECT
+        a.id,
+        a.alertname,
+        a.milestone_days,
+        a.client,
+        a.environment,
+        a.application,
+        a.instance AS ssl_url,
+        a.responsible,
+        a.responsible_email,
+        a.zoho_ticket_id,
+        a.zoho_ticket_number,
+        a.status,
+        a.created_at,
+        a.updated_at,
+        a.closed_at,
+        (a.created_at::date + make_interval(days => a.milestone_days))::date AS estimated_expiry_on,
+        ((a.created_at::date + make_interval(days => a.milestone_days))::date - CURRENT_DATE) AS estimated_days_to_expiry
+       FROM alertmanager_ssl_tickets a
+       WHERE ($1::text IS NULL OR LOWER(a.status) = $1)
+       ORDER BY estimated_days_to_expiry ASC NULLS LAST, a.created_at DESC`,
+      [status]
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    console.error('Failed to fetch automation SSL entries:', err);
+    return res.status(500).json({ message: 'Failed to fetch automation SSL entries' });
+  }
+});
+
+app.get('/api/automation-ssl/monitored-urls', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    if (!AUTOMATION_PROMETHEUS_URL) {
+      return res.status(400).json({
+        message: 'AUTOMATION_PROMETHEUS_URL is not configured'
+      });
+    }
+
+    const query = 'probe_ssl_earliest_cert_expiry';
+    const url = `${AUTOMATION_PROMETHEUS_URL.replace(/\/$/, '')}/api/v1/query?query=${encodeURIComponent(query)}`;
+    const response = await fetch(url, { method: 'GET' });
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok || payload?.status !== 'success') {
+      return res.status(502).json({
+        message: 'Failed to fetch SSL expiry metrics from Prometheus'
+      });
+    }
+
+    const rows = Array.isArray(payload?.data?.result) ? payload.data.result : [];
+    const today = toStartOfDay(new Date());
+
+    const mapped = rows
+      .map((row) => {
+        const metric = row?.metric || {};
+        const value = Number(Array.isArray(row?.value) ? row.value[1] : NaN);
+        const expiryDate = Number.isFinite(value) ? toStartOfDay(new Date(value * 1000)) : null;
+        const daysToExpiry = expiryDate
+          ? Math.floor((expiryDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))
+          : null;
+
+        return {
+          client: (metric.client || '').trim() || 'Unknown',
+          environment: (metric.environment || '').trim() || 'Unknown',
+          application: (metric.application || '').trim() || 'Unknown',
+          ssl_url: (metric.instance || metric.target || '').trim() || '',
+          responsible: (metric.responsible || '').trim() || null,
+          responsible_email: (metric.responsible_email || metric.owner_email || metric.email || '').trim().toLowerCase() || null,
+          hostname: (metric.hostname || '').trim() || null,
+          ip_address: (metric.ip_address || '').trim() || null,
+          version: (metric.version || '').trim() || null,
+          estimated_expiry_on: expiryDate ? expiryDate.toISOString().slice(0, 10) : null,
+          estimated_days_to_expiry: daysToExpiry,
+          metric_value: Number.isFinite(value) ? value : null
+        };
+      })
+      .sort((a, b) => {
+        const aDays = Number.isFinite(a.estimated_days_to_expiry) ? a.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
+        const bDays = Number.isFinite(b.estimated_days_to_expiry) ? b.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
+        if (aDays !== bDays) return aDays - bDays;
+        return (a.client || '').localeCompare(b.client || '');
+      });
+
+    return res.json(mapped);
+  } catch (err) {
+    console.error('Failed to fetch monitored automation SSL URLs:', err);
+    return res.status(500).json({ message: 'Failed to fetch monitored automation SSL URLs' });
   }
 });
 

@@ -1,7 +1,6 @@
 import { Component, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
-import { DomSanitizer, SafeResourceUrl } from '@angular/platform-browser';
 import { TicketService, Ticket } from '../services/ticket.service';
 import { LoadingService } from '../services/loading.service';
 import { MessageService } from '../services/message.service';
@@ -235,30 +234,6 @@ import { MsalService } from '../services/msal.service';
       </div>
     </div>
 
-    <!-- SSL Monitoring -->
-    <div class="card ssl-monitoring-card">
-      <div class="card-header">
-        <h2><i class="fas fa-shield-alt"></i> SSL Monitoring</h2>
-        <button class="grafana-open-btn" (click)="openGrafanaMonitoring()" [disabled]="!grafanaDashboardUrl">
-          <i class="fas fa-external-link-alt"></i>
-          Open Grafana
-        </button>
-      </div>
-
-      <div class="grafana-empty" *ngIf="!grafanaDashboardUrl">
-        <p>Grafana URL is not configured.</p>
-        <p class="hint">Set browser localStorage key GRAFANA_SSL_DASHBOARD_URL to your Grafana dashboard URL, then refresh this page.</p>
-      </div>
-
-      <div class="grafana-frame-wrap" *ngIf="grafanaDashboardUrl">
-        <iframe
-          class="grafana-frame"
-          [src]="safeGrafanaDashboardUrl"
-          title="SSL Monitoring Dashboard"
-          loading="lazy">
-        </iframe>
-      </div>
-    </div>
   `,
   styles: [`
     /* Welcome Banner */
@@ -819,92 +794,6 @@ import { MsalService } from '../services/msal.service';
     :host-context(.dark-theme) .card-header { border-color: #334155; }
     :host-context(.dark-theme) .activity-item { border-color: #334155; }
 
-    /* SSL Monitoring */
-    .ssl-monitoring-card {
-      margin-top: 16px;
-    }
-
-    .grafana-open-btn {
-      border: 1px solid #dbeafe;
-      background: #eff6ff;
-      color: #1d4ed8;
-      border-radius: 8px;
-      padding: 6px 10px;
-      font-size: 0.72rem;
-      font-weight: 600;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .grafana-open-btn:hover:not(:disabled) {
-      background: #dbeafe;
-      border-color: #bfdbfe;
-    }
-
-    .grafana-open-btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-
-    .grafana-empty {
-      padding: 18px 14px;
-      color: #475569;
-      font-size: 0.8rem;
-      border-top: 1px solid #f1f5f9;
-    }
-
-    .grafana-empty .hint {
-      margin-top: 6px;
-      color: #64748b;
-      font-size: 0.72rem;
-    }
-
-    .grafana-frame-wrap {
-      border-top: 1px solid #f1f5f9;
-      padding: 8px;
-      background: #f8fafc;
-    }
-
-    .grafana-frame {
-      width: 100%;
-      min-height: 520px;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      background: #ffffff;
-    }
-
-    :host-context(.dark-theme) .grafana-open-btn {
-      background: #1e293b;
-      border-color: #334155;
-      color: #93c5fd;
-    }
-
-    :host-context(.dark-theme) .grafana-open-btn:hover:not(:disabled) {
-      background: #0f172a;
-      border-color: #475569;
-    }
-
-    :host-context(.dark-theme) .grafana-empty {
-      border-top-color: #334155;
-      color: #cbd5e1;
-    }
-
-    :host-context(.dark-theme) .grafana-empty .hint {
-      color: #94a3b8;
-    }
-
-    :host-context(.dark-theme) .grafana-frame-wrap {
-      background: #0f172a;
-      border-top-color: #334155;
-    }
-
-    :host-context(.dark-theme) .grafana-frame {
-      background: #0f172a;
-      border-color: #334155;
-    }
   `]
 })
 export class DashboardComponent implements OnInit, OnDestroy {
@@ -963,15 +852,12 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   isRefreshing = false;
   countsLoading = true;
-  grafanaDashboardUrl = '';
-  safeGrafanaDashboardUrl?: SafeResourceUrl;
 
   constructor(
     private ticketService: TicketService,
     private loadingService: LoadingService,
     private messageService: MessageService,
     private msalService: MsalService,
-    private sanitizer: DomSanitizer,
     private router: Router
   ) {}
 
@@ -1009,7 +895,6 @@ export class DashboardComponent implements OnInit, OnDestroy {
     // Refresh in background without showing full-page loading on route revisit.
     this.loadCounts(true, false);
     this.loadTickets(true);
-    this.initGrafanaMonitoring();
   }
 
   ngOnDestroy() {}
@@ -1182,27 +1067,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
     localStorage.removeItem(`${this.TICKETS_CACHE_KEY_BASE}_closed`);
     this.loadCounts(false, true);
     this.loadTickets(false);
-    this.initGrafanaMonitoring();
     setTimeout(() => this.isRefreshing = false, 2000);
-  }
-
-  private initGrafanaMonitoring() {
-    const urlFromWindow = ((window as any).__env?.GRAFANA_SSL_DASHBOARD_URL || '').trim();
-    const urlFromStorage = (localStorage.getItem('GRAFANA_SSL_DASHBOARD_URL') || '').trim();
-    this.grafanaDashboardUrl = urlFromWindow || urlFromStorage;
-
-    this.safeGrafanaDashboardUrl = this.grafanaDashboardUrl
-      ? this.sanitizer.bypassSecurityTrustResourceUrl(this.grafanaDashboardUrl)
-      : undefined;
-  }
-
-  openGrafanaMonitoring() {
-    if (!this.grafanaDashboardUrl) {
-      this.messageService.error('Grafana dashboard URL is not configured');
-      return;
-    }
-
-    window.open(this.grafanaDashboardUrl, '_blank', 'noopener,noreferrer');
   }
 
   navigateTo(path: string) { this.router.navigate([path]); }
