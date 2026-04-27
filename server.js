@@ -376,7 +376,7 @@ const ZOHO_DEPARTMENT_ID = process.env.ZOHO_DEPARTMENT_ID;
 const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
 const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
-const AUTOMATION_SSL_ALERT_MILESTONES = [33, 18, 10, 7, 4, 3];
+const AUTOMATION_SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
 const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
 
@@ -387,8 +387,8 @@ function priorityForIhubAndSslMilestone(milestoneDays) {
 }
 
 function priorityForAutomationSslMilestone(milestoneDays) {
-  if (milestoneDays === 7 || milestoneDays === 4 || milestoneDays === 3) return 'SLA';
-  if (milestoneDays === 10) return 'High';
+  if (milestoneDays === 3 || milestoneDays === 1) return 'SLA';
+  if (milestoneDays === 7) return 'High';
   return 'Medium';
 }
 
@@ -551,7 +551,7 @@ function parseMilestoneDays(alert) {
   ];
 
   for (const text of sources) {
-    const match = /\b(\d{1,3})\s*day/i.exec(text);
+    const match = /(?:^|[^\d])(\d{1,3})\s*[_-]?\s*days?(?=$|[^A-Za-z])/i.exec(text);
     if (match) {
       const value = parseInt(match[1], 10);
       if (Number.isInteger(value)) return value;
@@ -760,6 +760,12 @@ app.post('/api/webhook/alertmanager', async (req, res) => {
     for (const alert of firingAlerts) {
       const milestoneDays = parseMilestoneDays(alert);
       if (!Number.isInteger(milestoneDays) || !AUTOMATION_SSL_ALERT_MILESTONES.includes(milestoneDays)) {
+        console.warn(
+          `[Webhook] Ignored SSL alert: alertname=${alert?.labels?.alertname || 'unknown'} ` +
+          `instance=${alert?.labels?.instance || alert?.labels?.target || alert?.labels?.url || 'unknown'} ` +
+          `milestone=${Number.isInteger(milestoneDays) ? milestoneDays : 'unparsed'} ` +
+          `allowed=[${AUTOMATION_SSL_ALERT_MILESTONES.join(',')}]`
+        );
         results.push({
           status: 'ignored',
           reason: 'milestone not in configured automation list',
