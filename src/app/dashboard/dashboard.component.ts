@@ -1,6 +1,7 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
+import { Subject, takeUntil } from 'rxjs';
 import { TicketService, Ticket } from '../services/ticket.service';
 import { LoadingService } from '../services/loading.service';
 import { MessageService } from '../services/message.service';
@@ -9,6 +10,7 @@ import { MsalService } from '../services/msal.service';
 @Component({
   selector: 'app-dashboard',
   standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [CommonModule],
   template: `
     <!-- Welcome Banner -->
@@ -462,6 +464,12 @@ import { MsalService } from '../services/msal.service';
       overflow: hidden;
     }
 
+    .dashboard-sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
     .card-header {
       padding: 10px 14px;
       border-bottom: 1px solid #f1f5f9;
@@ -853,12 +861,21 @@ export class DashboardComponent implements OnInit, OnDestroy {
   isRefreshing = false;
   countsLoading = true;
 
+  // Server-side counts cache TTL is 20s; only force a network refresh if our
+  // local snapshot is older than this. Eliminates redundant Zoho scans on
+  // every dashboard route revisit.
+  private static readonly LOCAL_COUNTS_TTL_MS = 25_000;
+  private static readonly LOCAL_TICKETS_TTL_MS = 25_000;
+
+  private destroy$ = new Subject<void>();
+
   constructor(
     private ticketService: TicketService,
     private loadingService: LoadingService,
     private messageService: MessageService,
     private msalService: MsalService,
-    private router: Router
+    private router: Router,
+    private cdr: ChangeDetectorRef
   ) {}
 
   ngOnInit() {
@@ -869,35 +886,52 @@ export class DashboardComponent implements OnInit, OnDestroy {
     // Clean up old cache keys (before per-user caching was added)
     localStorage.removeItem('dashboard_ticket_counts');
 
+    let countsCacheFresh = false;
     const cached = localStorage.getItem(this.COUNT_CACHE_KEY);
     if (cached) {
       try {
-        this.applyCounts(JSON.parse(cached));
+        const parsed = JSON.parse(cached);
+        const payload = parsed?.data ?? parsed;
+        const ts = parsed?.timestamp ?? 0;
+        this.applyCounts(payload);
         this.countsLoading = false; // Don't show skeleton if we have cached data
+        countsCacheFresh = ts && (Date.now() - ts) < DashboardComponent.LOCAL_COUNTS_TTL_MS;
       } catch {
         localStorage.removeItem(this.COUNT_CACHE_KEY);
       }
     }
 
+    let ticketsCacheFresh = false;
     const cachedTickets = localStorage.getItem(this.TICKETS_CACHE_KEY);
     if (cachedTickets) {
       try {
-        this.tickets = JSON.parse(cachedTickets) || [];
+        const parsed = JSON.parse(cachedTickets);
+        const payload = parsed?.data ?? parsed;
+        const ts = parsed?.timestamp ?? 0;
+        this.tickets = Array.isArray(payload) ? payload : [];
         this.filterTickets();
         this.calculatePriorityStats();
         this.findSLATickets();
         this.generateRecentActivity();
+        ticketsCacheFresh = ts && (Date.now() - ts) < DashboardComponent.LOCAL_TICKETS_TTL_MS;
       } catch {
         localStorage.removeItem(this.TICKETS_CACHE_KEY);
       }
     }
 
-    // Refresh in background without showing full-page loading on route revisit.
-    this.loadCounts(true, false);
-    this.loadTickets(true);
+    // Skip network refresh entirely if local cache is still warm.
+    if (!countsCacheFresh) {
+      this.loadCounts(true, false);
+    }
+    if (!ticketsCacheFresh) {
+      this.loadTickets(true);
+    }
   }
 
-  ngOnDestroy() {}
+  ngOnDestroy() {
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
 
   get isAdmin(): boolean {
     return this.userRole === 'admin';
@@ -937,17 +971,24 @@ export class DashboardComponent implements OnInit, OnDestroy {
     if (forceRefresh || this.countsLoading) {
       this.countsLoading = true;
     }
-    this.ticketService.getTicketCounts(forceRefresh).subscribe({
-      next: counts => {
-        this.applyCounts(counts);
-        this.countsLoading = false;
-        localStorage.setItem(this.COUNT_CACHE_KEY, JSON.stringify(counts));
-      },
-      error: () => {
-        this.countsLoading = false;
-        if (!silent) this.messageService.error('Failed to load ticket counts');
-      }
-    });
+    this.ticketService.getTicketCounts(forceRefresh)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
+        next: counts => {
+          this.applyCounts(counts);
+          this.countsLoading = false;
+          localStorage.setItem(
+            this.COUNT_CACHE_KEY,
+            JSON.stringify({ data: counts, timestamp: Date.now() })
+          );
+          this.cdr.markForCheck();
+        },
+        error: () => {
+          this.countsLoading = false;
+          if (!silent) this.messageService.error('Failed to load ticket counts');
+          this.cdr.markForCheck();
+        }
+      });
   }
 
   private applyCounts(counts: any) {
@@ -964,25 +1005,32 @@ export class DashboardComponent implements OnInit, OnDestroy {
     }
     const filterEmail = !this.isAdmin ? this.currentUserEmail : undefined;
     // 50 records is enough for dashboard widgets and faster than 100.
-    this.ticketService.getTickets(1, 50, this.selectedTab, undefined, filterEmail).subscribe({
-      next: res => {
-        this.tickets = res.data || [];
-        this.filterTickets();
-        this.calculatePriorityStats();
-        this.findSLATickets();
-        this.generateRecentActivity();
-        localStorage.setItem(this.TICKETS_CACHE_KEY, JSON.stringify(this.tickets));
-        if (!silent) {
-          this.loadingService.hide();
+    this.ticketService.getTickets(1, 50, this.selectedTab, undefined, filterEmail)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
+        next: res => {
+          this.tickets = res.data || [];
+          this.filterTickets();
+          this.calculatePriorityStats();
+          this.findSLATickets();
+          this.generateRecentActivity();
+          localStorage.setItem(
+            this.TICKETS_CACHE_KEY,
+            JSON.stringify({ data: this.tickets, timestamp: Date.now() })
+          );
+          if (!silent) {
+            this.loadingService.hide();
+          }
+          this.cdr.markForCheck();
+        },
+        error: () => {
+          if (!silent) {
+            this.messageService.error('Failed to load tickets');
+            this.loadingService.hide();
+          }
+          this.cdr.markForCheck();
         }
-      },
-      error: () => {
-        if (!silent) {
-          this.messageService.error('Failed to load tickets');
-          this.loadingService.hide();
-        }
-      }
-    });
+      });
   }
 
   filterTickets() {
@@ -1027,7 +1075,18 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   generateRecentActivity() {
-    this.recentActivity = this.tickets.slice(0, 5).map(t => {
+    // For non-admin users, only show the logged-in user's own tickets.
+    let source = this.tickets;
+    if (!this.isAdmin && this.currentUserEmail) {
+      const email = this.currentUserEmail;
+      source = this.tickets.filter(t => {
+        const contact = (t.email || t.contact?.email || '').toLowerCase();
+        const assignee = (t.assignedTo || t.assignee?.email || '').toLowerCase();
+        return contact === email || assignee === email;
+      });
+    }
+
+    this.recentActivity = source.slice(0, 5).map(t => {
       const status = (t.status || '').toLowerCase();
       let type = 'created', icon = 'fas fa-plus';
 
@@ -1035,10 +1094,25 @@ export class DashboardComponent implements OnInit, OnDestroy {
       else if (status === 'in progress') { type = 'updated'; icon = 'fas fa-edit'; }
       else if (t.assignedTo) { type = 'assigned'; icon = 'fas fa-user'; }
 
+      // Show a readable relative time if a date is available.
+      let time = 'Recently';
+      const raw = (t as any).modifiedTime || (t as any).createdTime;
+      if (raw) {
+        const d = new Date(raw);
+        if (!isNaN(d.getTime())) {
+          const diffMs = Date.now() - d.getTime();
+          const diffMin = Math.floor(diffMs / 60000);
+          if (diffMin < 1) time = 'Just now';
+          else if (diffMin < 60) time = `${diffMin}m ago`;
+          else if (diffMin < 1440) time = `${Math.floor(diffMin / 60)}h ago`;
+          else time = `${Math.floor(diffMin / 1440)}d ago`;
+        }
+      }
+
       return {
         type, icon,
         text: `Ticket #${t.ticketNumber || t.id} - ${(t.subject || 'No Subject').substring(0, 35)}...`,
-        time: 'Recently'
+        time
       };
     });
   }

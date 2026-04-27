@@ -395,6 +395,132 @@ interface GraphUser {
       font-size: 14px;
       color: var(--text-secondary, #666);
     }
+
+    /* ════════════════════════════════════════════
+       DARK THEME OVERRIDES
+       ════════════════════════════════════════════ */
+    :host-context(body.dark-theme) .user-roles-page {
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    :host-context(body.dark-theme) .page-header-row h2 { color: #f1f5f9; }
+
+    :host-context(body.dark-theme) .btn-refresh {
+      background: #2563eb;
+      color: #f0f9ff;
+    }
+    :host-context(body.dark-theme) .btn-refresh:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+
+    /* Cards */
+    :host-context(body.dark-theme) .card {
+      background: #1e293b;
+      border-color: #334155;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+      color: #e2e8f0;
+    }
+
+    /* Inputs */
+    :host-context(body.dark-theme) .search-input,
+    :host-context(body.dark-theme) .filter-select,
+    :host-context(body.dark-theme) .role-select {
+      background: #0b1220;
+      border-color: #334155;
+      color: #e2e8f0;
+    }
+    :host-context(body.dark-theme) .search-input::placeholder { color: #64748b; }
+    :host-context(body.dark-theme) .search-input:focus,
+    :host-context(body.dark-theme) .filter-select:focus,
+    :host-context(body.dark-theme) .role-select:focus {
+      outline: none;
+      border-color: #60a5fa;
+    }
+
+    :host-context(body.dark-theme) .form-row button {
+      background: #2563eb;
+      color: #f0f9ff;
+    }
+    :host-context(body.dark-theme) .form-row button:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+    :host-context(body.dark-theme) .form-row button:disabled {
+      background: #334155;
+      color: #64748b;
+    }
+
+    :host-context(body.dark-theme) .page-info { color: #94a3b8; }
+
+    /* Info box */
+    :host-context(body.dark-theme) .info-box {
+      background: rgba(59, 130, 246, 0.12);
+      border-left-color: #60a5fa;
+      color: #cbd5e1;
+    }
+    :host-context(body.dark-theme) .info-box i { color: #60a5fa; }
+    :host-context(body.dark-theme) .info-box code {
+      background: #0b1220;
+      color: #f1f5f9;
+      border: 1px solid #334155;
+    }
+
+    /* Table */
+    :host-context(body.dark-theme) .table-card { background: #1e293b; }
+    :host-context(body.dark-theme) thead {
+      background: #0b1220;
+      border-bottom-color: #334155;
+    }
+    :host-context(body.dark-theme) th {
+      color: #cbd5e1;
+      background: #0b1220;
+    }
+    :host-context(body.dark-theme) td {
+      color: #e2e8f0;
+      border-bottom-color: #1f2937;
+    }
+    :host-context(body.dark-theme) tr:hover { background: #273449; }
+    :host-context(body.dark-theme) tr.role-admin { background: rgba(59, 130, 246, 0.10); }
+    :host-context(body.dark-theme) tr.role-admin:hover { background: rgba(59, 130, 246, 0.18); }
+
+    :host-context(body.dark-theme) .email-cell { color: #94a3b8; }
+    :host-context(body.dark-theme) .text-small { color: #64748b; }
+
+    /* Role badges */
+    :host-context(body.dark-theme) .role-badge.role-admin {
+      background: rgba(52, 211, 153, 0.18);
+      color: #6ee7b7;
+    }
+    :host-context(body.dark-theme) .role-badge.role-user {
+      background: rgba(148, 163, 184, 0.18);
+      color: #cbd5e1;
+    }
+
+    /* Action buttons */
+    :host-context(body.dark-theme) .btn-remove {
+      background: #b91c1c;
+      color: #fee2e2;
+    }
+    :host-context(body.dark-theme) .btn-remove:hover { background: #991b1b; }
+
+    :host-context(body.dark-theme) .no-data { color: #94a3b8; }
+
+    /* Pagination footer */
+    :host-context(body.dark-theme) .pagination-footer {
+      background: #1e293b;
+      border-color: #334155;
+    }
+    :host-context(body.dark-theme) .pagination-footer button {
+      background: #2563eb;
+      color: #f0f9ff;
+    }
+    :host-context(body.dark-theme) .pagination-footer button:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+    :host-context(body.dark-theme) .pagination-footer button:disabled {
+      background: #334155;
+      color: #64748b;
+    }
+    :host-context(body.dark-theme) .pagination-footer span { color: #cbd5e1; }
   `]
 })
 export class UserRolesComponent implements OnInit, OnDestroy {

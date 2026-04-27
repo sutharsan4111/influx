@@ -1,8 +1,8 @@
 import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
-import { Subject, Subscription, firstValueFrom, interval } from 'rxjs';
+import { Router, ActivatedRoute } from '@angular/router';
+import { Subject, Subscription, firstValueFrom, interval, takeUntil } from 'rxjs';
 import { debounceTime, distinctUntilChanged } from 'rxjs/operators';
 
 import { TicketService, Ticket } from '../services/ticket.service';
@@ -1528,9 +1528,11 @@ export class TicketsComponent implements OnInit, OnDestroy {
   searchTerm = '';
   private searchTerm$ = new Subject<string>();
   private searchSub?: Subscription;
+  private destroy$ = new Subject<void>();
   private searchCache = new Map<string, Ticket[]>(); // 🚀 Cache search results
   private isInitialLoad = true; // Track if first load or tab switch
   isRefreshing = false;
+  private dashboardQuickFilter: 'all' | 'sla' | 'assigned' = 'all';
 
   showCloseDialog = false;
   showUpdateDialog = false;
@@ -1570,25 +1572,35 @@ export class TicketsComponent implements OnInit, OnDestroy {
     private ihubService: IhubService,
     private sslService: SslService,
     private cdr: ChangeDetectorRef,
-    private router: Router
+    private router: Router,
+    private route: ActivatedRoute
   ) {}
 
   async ngOnInit(): Promise<void> {
     await this.initCurrentUser();
+
+    const dashboardStatus = (this.route.snapshot.queryParamMap.get('status') || '').toLowerCase().trim();
     
     // 🔥 Restore tab state from sessionStorage (persists across refresh/back navigation)
     const savedTab = sessionStorage.getItem('ITSM_SELECTED_TAB') as 'open' | 'closed' | 'my' | null;
     const savedMyStatus = sessionStorage.getItem('ITSM_MY_STATUS') as 'open' | 'closed' | null;
-    
-    if (savedTab && ['open', 'closed', 'my'].includes(savedTab)) {
-      this.selectedTab = savedTab;
+
+    // If we came from dashboard card click, override saved tab and apply matching filter.
+    if (dashboardStatus) {
+      this.applyDashboardNavigationFilter(dashboardStatus);
+      sessionStorage.setItem('ITSM_SELECTED_TAB', this.selectedTab);
+      sessionStorage.setItem('ITSM_MY_STATUS', this.myStatus);
     } else {
-      // Set default tab based on user role
-      this.selectedTab = this.isAdmin ? 'open' : 'my';
-    }
-    
-    if (savedMyStatus && ['open', 'closed'].includes(savedMyStatus)) {
-      this.myStatus = savedMyStatus;
+      if (savedTab && ['open', 'closed', 'my'].includes(savedTab)) {
+        this.selectedTab = savedTab;
+      } else {
+        // Set default tab based on user role
+        this.selectedTab = this.isAdmin ? 'open' : 'my';
+      }
+
+      if (savedMyStatus && ['open', 'closed'].includes(savedMyStatus)) {
+        this.myStatus = savedMyStatus;
+      }
     }
     
     // Load assignments in background; do not block first paint.
@@ -1600,7 +1612,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     
     if (cached) {
       // Restore from cache - no loading needed
-      this.filteredTickets = cached.tickets;
+      this.filteredTickets = this.applyDashboardQuickFilter(cached.tickets || []);
       if (this.selectedTab === 'my') {
         if (this.myStatus === 'open') {
           this.myTicketsOpenPage = cached.page;
@@ -1649,6 +1661,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.searchSub?.unsubscribe();
+    this.destroy$.next();
+    this.destroy$.complete();
     // 🚀 Save current state to service-level cache before component is destroyed
     this.saveToServiceCache();
   }
@@ -1659,6 +1673,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
 
   switchTab(tab: 'open' | 'closed' | 'my'): void {
     if (this.selectedTab === tab) return;
+    this.dashboardQuickFilter = 'all';
     
     // 🚀 Save current tab state to service cache before switching
     this.saveToServiceCache();
@@ -1674,7 +1689,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     
     if (cached) {
       // Restore from cache - no loading indicator needed
-      this.filteredTickets = cached.tickets;
+      this.filteredTickets = this.applyDashboardQuickFilter(cached.tickets || []);
       if (tab === 'my') {
         if (this.myStatus === 'open') {
           this.myTicketsOpenPage = cached.page;
@@ -1714,6 +1729,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
 
   switchMyStatus(status: 'open' | 'closed'): void {
     if (this.myStatus === status) return;
+    this.dashboardQuickFilter = 'all';
     
     // 🚀 Save current my-status state to service cache before switching
     this.saveToServiceCache();
@@ -1729,7 +1745,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     
     if (cached) {
       // Restore from cache - no loading indicator needed
-      this.filteredTickets = cached.tickets;
+      this.filteredTickets = this.applyDashboardQuickFilter(cached.tickets || []);
       if (status === 'open') {
         this.myTicketsOpenPage = cached.page;
         this.myTicketsOpenHasMore = cached.hasMore;
@@ -1770,6 +1786,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
 
       this.ticketService
         .getTickets(1, this.limit, otherStatus, undefined, this.currentUserEmail)
+        .pipe(takeUntil(this.destroy$))
         .subscribe({
           next: (res) => {
             const data: Ticket[] = (res?.data || []).filter((t: Ticket) => this.isCorrectStatus(t, otherStatus));
@@ -1802,7 +1819,9 @@ export class TicketsComponent implements OnInit, OnDestroy {
     const otherTab: 'open' | 'closed' = this.selectedTab === 'open' ? 'closed' : 'open';
     if (this.ticketService.getTabCache(otherTab)) return;
 
-    this.ticketService.getTickets(1, this.limit, otherTab).subscribe({
+    this.ticketService.getTickets(1, this.limit, otherTab)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
       next: (res) => {
         const data: Ticket[] = (res?.data || []).filter((t: Ticket) => this.isCorrectStatus(t, otherTab));
         this.ticketService.setTabCache(otherTab, {
@@ -1939,7 +1958,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       }
 
       if (requestSeq !== this.myLoadSeq) return;
-      this.filteredTickets = searchResults;
+      this.filteredTickets = this.applyDashboardQuickFilter(searchResults);
       this.cdr.markForCheck();
     } catch (err) {
       if (requestSeq !== this.myLoadSeq) return;
@@ -1966,9 +1985,10 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       if (requestSeq !== this.myLoadSeq) return;
 
       const data: Ticket[] = res?.data || [];
-      this.filteredTickets = data.filter((t: Ticket) =>
+      const tabFiltered = data.filter((t: Ticket) =>
         this.isCorrectStatus(t, this.selectedTab as 'open' | 'closed')
       );
+      this.filteredTickets = this.applyDashboardQuickFilter(tabFiltered);
 
       this.hasMore = !!res?.hasMore;
       this.saveToServiceCache();
@@ -2019,6 +2039,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
     this.ticketService
       .getTickets(this.currentPage, this.limit, statusParam)
+      .pipe(takeUntil(this.destroy$))
       .subscribe({
         next: res => {
           const data: Ticket[] = res.data || [];
@@ -2055,7 +2076,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       // If cache has enough, just slice and display (instant)
       if (cache.length >= neededIndex) {
         const startIdx = (currentPage - 1) * pageSize;
-        this.filteredTickets = cache.slice(startIdx, neededIndex);
+        this.filteredTickets = this.applyDashboardQuickFilter(cache.slice(startIdx, neededIndex));
         this.cdr.markForCheck();
         return;
       }
@@ -2099,7 +2120,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
       // Display current page
       const startIdx = (currentPage - 1) * pageSize;
-      this.filteredTickets = allMyTickets.slice(startIdx, neededIndex);
+      this.filteredTickets = this.applyDashboardQuickFilter(allMyTickets.slice(startIdx, neededIndex));
       this.cdr.markForCheck();
     } catch (err) {
       console.error('Failed to load my tickets:', err);
@@ -2120,6 +2141,69 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     } else {
       return ticketStatus.includes('closed') || ticketStatus.includes('resolved');
     }
+  }
+
+  private applyDashboardNavigationFilter(statusParam: string): void {
+    const status = (statusParam || '').trim().toLowerCase();
+    this.dashboardQuickFilter = 'all';
+
+    if (status === 'open') {
+      this.selectedTab = this.isAdmin ? 'open' : 'my';
+      this.myStatus = 'open';
+      return;
+    }
+
+    if (status === 'closed') {
+      this.selectedTab = this.isAdmin ? 'closed' : 'my';
+      this.myStatus = 'closed';
+      return;
+    }
+
+    if (status === 'sla') {
+      this.selectedTab = 'my';
+      this.myStatus = 'open';
+      this.dashboardQuickFilter = 'sla';
+      return;
+    }
+
+    if (status === 'assigned') {
+      this.selectedTab = 'my';
+      this.myStatus = 'open';
+      this.dashboardQuickFilter = 'assigned';
+    }
+  }
+
+  private applyDashboardQuickFilter(items: Ticket[]): Ticket[] {
+    if (this.dashboardQuickFilter === 'all') return items;
+
+    if (this.dashboardQuickFilter === 'sla') {
+      return items.filter(ticket => {
+        const statusOk = this.isCorrectStatus(ticket, 'open');
+        const prio = this.priorityClass(ticket.priority);
+        return statusOk && prio === 'priority-sla';
+      });
+    }
+
+    if (this.dashboardQuickFilter === 'assigned') {
+      const userEmail = (this.currentUserEmail || '').trim().toLowerCase();
+      return items.filter(ticket => {
+        if (!this.isCorrectStatus(ticket, 'open')) return false;
+
+        const ticketId = ticket.id || ticket.ticketId || '';
+        const assignment = this.assignmentsMap.get(ticketId);
+        const isSupabaseAssignee = assignment?.assigned_users?.some(
+          u => (u || '').toLowerCase() === userEmail
+        ) || false;
+
+        const assigneeEmail = (
+          ticket.assignedTo || ticket.assignee?.email || ''
+        ).trim().toLowerCase();
+
+        return isSupabaseAssignee || assigneeEmail === userEmail;
+      });
+    }
+
+    return items;
   }
 
   nextPage(): void {
@@ -2194,7 +2278,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
   openTicket(ticketId: string): void {
     if (!ticketId) return;
-    this.ticketService.openTicket(ticketId).subscribe({
+    this.ticketService.openTicket(ticketId)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
       next: () => {
         // Remove reopened ticket from current view immediately
         const openedTicket = this.filteredTickets.find(t => t.id === ticketId || t.ticketId === ticketId);
@@ -2223,7 +2309,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     const ok = window.confirm('Move this ticket to recycle bin?');
     if (!ok) return;
 
-    this.ticketService.moveToRecycleBin(ticketId, ticket).subscribe({
+    this.ticketService.moveToRecycleBin(ticketId, ticket)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
       next: () => {
         this.filteredTickets = this.filteredTickets.filter(t => (t.id || t.ticketId) !== ticketId);
         this.tickets = this.tickets.filter(t => (t.id || t.ticketId) !== ticketId);
@@ -2280,7 +2368,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       closeRequest$ = this.ticketService.closeTicket(this.activeTicketId, this.currentUserEmail);
     }
 
-    closeRequest$.subscribe({
+    closeRequest$.pipe(takeUntil(this.destroy$)).subscribe({
       next: () => {
         // Remove closed ticket from current view immediately
         const closedTicket = this.filteredTickets.find(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
@@ -2317,7 +2405,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     if (status) data.status = status;
     if (priority) data.priority = priority;
 
-    this.ticketService.updateTicket(this.activeTicketId, data).subscribe({
+    this.ticketService.updateTicket(this.activeTicketId, data)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
       next: () => {
         const updatedTicket = this.filteredTickets.find(t => t.id === this.activeTicketId || t.ticketId === this.activeTicketId);
         if (updatedTicket) {
@@ -2584,7 +2674,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   }
 
   loadAssignments(): void {
-    this.assignmentService.getAllAssignments().subscribe({
+    this.assignmentService.getAllAssignments()
+      .pipe(takeUntil(this.destroy$))
+      .subscribe({
       next: assignments => {
         this.assignmentsMap.clear();
         assignments.forEach(a => this.assignmentsMap.set(a.zoho_ticket_id, a));
@@ -2599,6 +2691,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       const assignments = await firstValueFrom(this.assignmentService.getAllAssignments());
       this.assignmentsMap.clear();
       assignments.forEach(a => this.assignmentsMap.set(a.zoho_ticket_id, a));
+      if (this.dashboardQuickFilter === 'assigned') {
+        this.filteredTickets = this.applyDashboardQuickFilter(this.filteredTickets || []);
+      }
       this.cdr.markForCheck();
     } catch (err) {
       console.error('Failed to load assignments:', err);

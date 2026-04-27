@@ -268,59 +268,128 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
     .btns { margin-top:6px }
     @media(max-width:900px){ .body{flex-direction:column}.side{width:100%;min-width:unset} }
 
-    :host-context(.dark-theme) { color: #e2e8f0; }
-
-    :host-context(.dark-theme) .meta {
-      color: #94a3b8;
+    /* ════════════════════════════════════════════
+       DARK THEME OVERRIDES
+       ════════════════════════════════════════════ */
+    :host-context(body.dark-theme) {
+      color: #e2e8f0;
     }
+    :host-context(body.dark-theme) :host { color: #e2e8f0; }
 
-    :host-context(.dark-theme) .desc,
-    :host-context(.dark-theme) .panel,
-    :host-context(.dark-theme) .msg,
-    :host-context(.dark-theme) textarea {
-      background: #0f172a;
-      border-color: #1f2937;
+    /* Header / status pills */
+    :host-context(body.dark-theme) .back { color: #60a5fa; }
+    :host-context(body.dark-theme) .pill.status-open       { background: #1d4ed8; color: #f0f9ff; }
+    :host-context(body.dark-theme) .pill.status-inprogress { background: #b45309; color: #fffbeb; }
+    :host-context(body.dark-theme) .pill.status-resolved   { background: #047857; color: #ecfdf5; }
+    :host-context(body.dark-theme) .pill.status-closed     { background: #475569; color: #f1f5f9; }
+
+    /* Subject + meta */
+    :host-context(body.dark-theme) .subject h2 { color: #f1f5f9; }
+    :host-context(body.dark-theme) .meta { color: #94a3b8; }
+
+    /* Description card */
+    :host-context(body.dark-theme) .desc {
+      background: #1e293b;
+      border-color: #334155;
+    }
+    :host-context(body.dark-theme) .desc h4 { color: #cbd5e1; }
+    :host-context(body.dark-theme) .desc-body { color: #e2e8f0; }
+    :host-context(body.dark-theme) ::ng-deep .desc-body a { color: #60a5fa; }
+    :host-context(body.dark-theme) ::ng-deep .desc-body a:hover { color: #93c5fd; }
+    :host-context(body.dark-theme) ::ng-deep .desc-body img {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+    }
+    :host-context(body.dark-theme) ::ng-deep .desc-body table td,
+    :host-context(body.dark-theme) ::ng-deep .desc-body table th {
+      border-color: #334155;
       color: #e2e8f0;
     }
 
-    :host-context(.dark-theme) .desc-body,
-    :host-context(.dark-theme) .row span,
-    :host-context(.dark-theme) .row strong,
-    :host-context(.dark-theme) .att-name,
-    :host-context(.dark-theme) .file-item {
-      color: #e2e8f0;
+    /* Side panels */
+    :host-context(body.dark-theme) .panel {
+      background: #1e293b;
+      border-color: #334155;
     }
+    :host-context(body.dark-theme) .row strong { color: #94a3b8; }
+    :host-context(body.dark-theme) .row span   { color: #f1f5f9; }
 
-    :host-context(.dark-theme) .msg {
+    /* Conversation messages */
+    :host-context(body.dark-theme) .msg {
       background: #0b1220;
+      border-color: #334155;
     }
-
-    :host-context(.dark-theme) .no-msg {
-      background: #0b1220;
-      color: #94a3b8;
-      border: 1px solid #1f2937;
-    }
-
-    :host-context(.dark-theme) .av {
-      background: #1f2a44;
+    :host-context(body.dark-theme) .av {
+      background: #1e3a8a;
       color: #93c5fd;
     }
-
-    :host-context(.dark-theme) .btn {
-      background: #1f2937;
-      color: #e2e8f0;
+    :host-context(body.dark-theme) .who { color: #f1f5f9; }
+    :host-context(body.dark-theme) .when { color: #94a3b8; }
+    :host-context(body.dark-theme) .mb { color: #e2e8f0; }
+    :host-context(body.dark-theme) ::ng-deep .mb a { color: #60a5fa; }
+    :host-context(body.dark-theme) ::ng-deep .mb td,
+    :host-context(body.dark-theme) ::ng-deep .mb th { border-color: #334155; }
+    :host-context(body.dark-theme) ::ng-deep .mb blockquote {
+      border-left-color: #475569;
+      color: #94a3b8;
+    }
+    :host-context(body.dark-theme) ::ng-deep .mb hr { border-top-color: #334155; }
+    :host-context(body.dark-theme) ::ng-deep .mb img {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
     }
 
-    :host-context(.dark-theme) .btn.primary {
-      background: #2563eb;
-      color: #fff;
-    }
+    /* Attachments */
+    :host-context(body.dark-theme) .att-name { color: #e2e8f0; }
+    :host-context(body.dark-theme) .att-link { color: #60a5fa; }
+    :host-context(body.dark-theme) .att-link:hover { color: #93c5fd; }
 
-    :host-context(.dark-theme) textarea::placeholder {
+    /* Empty messages */
+    :host-context(body.dark-theme) .no-msg {
+      background: #0b1220;
+      border: 1px solid #334155;
       color: #94a3b8;
     }
 
+    /* Reply form */
+    :host-context(body.dark-theme) .reply h4 { color: #f1f5f9; }
+    :host-context(body.dark-theme) textarea {
+      background: #0b1220;
+      border-color: #334155;
+      color: #e2e8f0;
+    }
+    :host-context(body.dark-theme) textarea::placeholder { color: #64748b; }
+    :host-context(body.dark-theme) textarea:focus {
+      outline: none;
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.18);
+    }
+    :host-context(body.dark-theme) .file-btn { color: #60a5fa; }
+    :host-context(body.dark-theme) .file-item { color: #cbd5e1; }
+    :host-context(body.dark-theme) .link { color: #fca5a5; }
+    :host-context(body.dark-theme) .controls { color: #cbd5e1; }
+    :host-context(body.dark-theme) .controls input[type="checkbox"],
+    :host-context(body.dark-theme) .controls input[type="radio"] { accent-color: #60a5fa; }
 
+    /* Buttons */
+    :host-context(body.dark-theme) .btn {
+      background: #1e293b;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+    }
+    :host-context(body.dark-theme) .btn:hover:not(:disabled) {
+      background: #273449;
+      border-color: #475569;
+    }
+    :host-context(body.dark-theme) .btn.primary {
+      background: #2563eb;
+      border-color: #3b82f6;
+      color: #f0f9ff;
+    }
+    :host-context(body.dark-theme) .btn.primary:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+
+    /* Loading */
+    :host-context(body.dark-theme) .loading { color: #94a3b8; }
   `]
 })
 export class TicketDetailComponent implements OnInit, OnDestroy {

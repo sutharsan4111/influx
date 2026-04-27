@@ -206,6 +206,29 @@ async function runMigrations() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket ON reply_authors(zoho_ticket_id)`);
 
+    // 🚀 Production performance indexes (007). Idempotent.
+    try {
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_ticket_assignments_status_open
+          ON ticket_assignments (status)
+          WHERE status IS NULL OR LOWER(status) NOT IN ('closed', 'resolved');
+        CREATE INDEX IF NOT EXISTS idx_ticket_assignments_assigned_users_gin
+          ON ticket_assignments USING GIN (assigned_users);
+        CREATE INDEX IF NOT EXISTS idx_ticket_assignments_primary_assignee
+          ON ticket_assignments (primary_assignee);
+        CREATE INDEX IF NOT EXISTS idx_ticket_assignments_zoho_ticket_id
+          ON ticket_assignments (zoho_ticket_id);
+        CREATE INDEX IF NOT EXISTS idx_recycled_tickets_active
+          ON recycled_tickets (zoho_ticket_id) WHERE restored_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_reply_authors_conv_id
+          ON reply_authors (zoho_conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket_conv
+          ON reply_authors (zoho_ticket_id, zoho_conversation_id);
+      `);
+    } catch (e) {
+      console.warn('⚠️ Performance index creation warning:', e?.message);
+    }
+
     console.log("✅ Database migrations applied");
   } catch (err) {
     console.error("⚠️ Migration warning:", err.message);
@@ -1157,7 +1180,9 @@ async function processSslAlerts() {
 
 // 🚀 OPTIMIZED: Production-grade caching system
 const countsCache = new Map(); // Cache per user role
-const COUNTS_CACHE_MS = 20 * 1000; // 20 seconds for near-real-time dashboard updates
+const COUNTS_CACHE_MS = 5 * 60 * 1000;        // 5 min "fresh" window
+const COUNTS_STALE_MS = 30 * 60 * 1000;       // 30 min serve-stale-while-revalidate window
+const countsRefreshInFlight = new Map();      // Dedupe concurrent background refreshes
 let agentsCache = null;
 let agentsCacheTime = 0;
 const AGENTS_CACHE_MS = 30 * 60 * 1000; // 30 minutes for agents list
@@ -1178,168 +1203,197 @@ async function getActiveRecycledTicketIds() {
 }
 
 app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
-  // Prevent browser/proxy caching; rely only on short-lived server cache.
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  // Stale-while-revalidate: ALWAYS return immediately from cache when available,
+  // refresh in the background. Browser may also use ETag for 304s.
+  res.set('Cache-Control', 'private, max-age=0, must-revalidate');
   res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
-  
+
   try {
     const userEmail = req.user?.email?.toLowerCase() || '';
     const userRole = (req.user?.role || 'user').toLowerCase();
     const isAdmin = userRole === 'admin';
-    
+
     // Role-based cache key (admins all see the same counts)
     const cacheKey = isAdmin ? 'counts_admin' : `counts_user_${userEmail}`;
     const cached = countsCache.get(cacheKey);
-    
-    if (cached && (Date.now() - cached.time) < COUNTS_CACHE_MS) {
-      console.log(`[CACHE HIT] ${cacheKey}`);
+    const now = Date.now();
+    const age = cached ? now - cached.time : Infinity;
+
+    // 1) Fresh cache → instant response.
+    if (cached && age < COUNTS_CACHE_MS) {
+      console.log(`[CACHE HIT-FRESH] ${cacheKey} age=${age}ms`);
+      res.set('ETag', cached.etag);
+      if (req.get('if-none-match') === cached.etag) return res.status(304).end();
+      // Pre-warm user-tickets if their cache has gone cold meanwhile.
+      prewarmUserTickets(userEmail);
       return res.json(cached.data);
     }
-    
-    console.log(`[CACHE MISS] ${cacheKey} - fetching fresh counts`);
-    
-    const recycledTicketIds = await getActiveRecycledTicketIds();
 
-    async function getSupabaseAssignedTickets(email) {
-      if (!email) return new Set();
-      try {
-        const result = await pool.query(
-          "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
-          [email]
-        );
-        return new Set(result.rows.map(r => r.zoho_ticket_id));
-      } catch (e) {
-        console.error('Error fetching Supabase assignments:', e);
-        return new Set();
-      }
-    }
-
-    async function getAllSupabaseAssignedOpenTickets() {
-      try {
-        const result = await pool.query(
-          `SELECT zoho_ticket_id
-           FROM ticket_assignments
-           WHERE status IS NULL OR LOWER(status) NOT IN ('closed', 'resolved')`
-        );
-        return new Set(result.rows.map(r => r.zoho_ticket_id));
-      } catch (e) {
-        console.error('Error fetching all Supabase open assignments:', e);
-        return new Set();
-      }
-    }
-
-    const mySupabaseAssignedIds = await getSupabaseAssignedTickets(userEmail);
-    const allSupabaseAssignedOpenIds = isAdmin
-      ? await getAllSupabaseAssignedOpenTickets()
-      : new Set();
-
-    // Helper to count tickets with filters and pagination.
-    // Fetch one page with a single 429-retry; returns { tickets, more }
-    const PAGE_SIZE = 100;
-    const PARALLEL_PAGES = 3; // 2 pods × 3 statuses × 3 pages = 18 max concurrent Zoho requests
-    async function fetchPageWithRetry(status, from) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        let res;
-        try {
-          res = await zohoFetch(`/tickets?limit=${PAGE_SIZE}&from=${from}&status=${status}&include=assignee`);
-        } catch (e) {
-          console.error(`Network error fetching ${status} at from=${from}:`, e?.message || e);
-          return { tickets: [], more: false };
-        }
-        if (res.status === 429) {
-          console.warn(`Zoho 429 for ${status} at from=${from}, retrying in 2s`);
-          await new Promise(r => setTimeout(r, 2000));
-          continue;
-        }
-        if (!res.ok) {
-          console.error(`Zoho ${res.status} for ${status} at from=${from}`);
-          return { tickets: [], more: false };
-        }
-        let data;
-        try { data = await res.json(); } catch (e) { return { tickets: [], more: false }; }
-        const tickets = data.data || [];
-        const more = data.info?.moreRecords ?? (tickets.length >= PAGE_SIZE);
-        return { tickets, more };
-      }
-      return { tickets: [], more: false };
-    }
-
-    // Scan all pages of a status in batches of PARALLEL_PAGES, calling perTicket for each
-    async function scanPages(status, perTicket) {
-      let from = 0;
-      while (from < 10000) {
-        const offsets = [];
-        for (let i = 0; i < PARALLEL_PAGES; i++) {
-          const o = from + i * PAGE_SIZE;
-          if (o >= 10000) break;
-          offsets.push(o);
-        }
-        if (!offsets.length) break;
-        const results = await Promise.all(offsets.map(o => fetchPageWithRetry(status, o)));
-        await new Promise(r => setTimeout(r, 400)); // pace batches to avoid saturating rate limit
-        let anyMore = false;
-        for (const { tickets, more } of results) {
-          for (const t of tickets) {
-            const ticketId = (t.id || '').toString();
-            if (ticketId && !recycledTicketIds.has(ticketId)) perTicket(t, ticketId);
-          }
-          if (more) anyMore = true;
-        }
-        if (!anyMore) break;
-        from += offsets.length * PAGE_SIZE;
-      }
-    }
-
-    // Scan Open, Closed, and Resolved simultaneously; derive all 4 metrics in 3 passes.
-    // Resolved is a fallback status used when Zoho rejects 'Closed' (422), so both must be counted.
-    let openCount = 0, slaCount = 0, assignedCount = 0, closedCount = 0;
-
-    function countClosed(t, ticketId) {
-      if (isAdmin) {
-        closedCount++;
+    // 2) Stale cache → instant response + background refresh.
+    if (cached && age < COUNTS_STALE_MS) {
+      console.log(`[CACHE HIT-STALE] ${cacheKey} age=${age}ms (refreshing in background)`);
+      res.set('ETag', cached.etag);
+      if (req.get('if-none-match') !== cached.etag) {
+        res.json(cached.data);
       } else {
-        const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-        const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
-        if (isMine) closedCount++;
+        res.status(304).end();
       }
+      // Fire-and-forget refresh, deduped per cache key.
+      refreshCountsCache(cacheKey, userEmail, isAdmin).catch(err =>
+        console.error(`Background counts refresh failed for ${cacheKey}:`, err?.message || err)
+      );
+      // Pre-warm user's "My Tickets" caches so the next page nav is instant.
+      prewarmUserTickets(userEmail);
+      return;
     }
 
-    await Promise.all([
-      scanPages('Open', (t, ticketId) => {
-        const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-        const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
-        if (isAdmin || isMine) openCount++;
-        if (isMine) {
-          assignedCount++;
-          const priority = (t.priority || '').toLowerCase();
-          if (priority.includes('sla') || priority.includes('urgent') || priority.includes('critical')) slaCount++;
-        }
-      }),
-      scanPages('Closed',   countClosed),
-      scanPages('Resolved', countClosed)
-    ]);
-
-    console.log(`Counts for ${userEmail}: open=${openCount}, closed=${closedCount}, mySLA=${slaCount}, assigned=${assignedCount}`);
-
-    const countData = {
-      scope: isAdmin ? 'all' : 'mine',
-      open: openCount,
-      closed: closedCount,
-      sla: slaCount,
-      assigned: assignedCount,
-      total: openCount + closedCount
-    };
-    
-    // Cache the result
-    countsCache.set(cacheKey, { data: countData, time: Date.now() });
-
+    // 3) Cold cache → must compute synchronously.
+    console.log(`[CACHE MISS] ${cacheKey} - computing fresh counts`);
+    const countData = await refreshCountsCache(cacheKey, userEmail, isAdmin);
+    const fresh = countsCache.get(cacheKey);
+    res.set('ETag', fresh.etag);
+    if (req.get('if-none-match') === fresh.etag) return res.status(304).end();
+    // Pre-warm user's "My Tickets" caches in background after responding.
+    prewarmUserTickets(userEmail);
     res.json(countData);
   } catch (err) {
     console.error('Counts error:', err);
     res.status(500).json({ error: 'Failed to fetch ticket counts' });
   }
 });
+
+// Background-prefetch a user's My Tickets (open + closed) if not already fresh.
+function prewarmUserTickets(userEmail) {
+  if (!userEmail) return;
+  for (const status of ['open', 'closed']) {
+    const cacheKey = `${userEmail}_${status}`;
+    const cached = userTicketsCache.get(cacheKey);
+    if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) continue;
+    refreshUserTicketsCache(cacheKey, userEmail, status).catch(err =>
+      console.error(`Pre-warm user-tickets failed for ${cacheKey}:`, err?.message || err)
+    );
+  }
+}
+
+// ---- Counts computation (extracted so it can run in background + at startup) ----
+async function computeCounts(userEmail, isAdmin) {
+  const recycledTicketIds = await getActiveRecycledTicketIds();
+
+  let mySupabaseAssignedIds = new Set();
+  if (userEmail) {
+    try {
+      const r = await pool.query(
+        "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
+        [userEmail]
+      );
+      mySupabaseAssignedIds = new Set(r.rows.map(x => x.zoho_ticket_id));
+    } catch (e) {
+      console.error('Error fetching Supabase assignments:', e?.message || e);
+    }
+  }
+
+  const PAGE_SIZE = 100;
+  const PARALLEL_PAGES = 3;
+  async function fetchPageWithRetry(status, from) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let r;
+      try {
+        r = await zohoFetch(`/tickets?limit=${PAGE_SIZE}&from=${from}&status=${status}&include=assignee`);
+      } catch (e) {
+        console.error(`Network error fetching ${status} at from=${from}:`, e?.message || e);
+        return { tickets: [], more: false };
+      }
+      if (r.status === 429) {
+        await new Promise(rs => setTimeout(rs, 2000));
+        continue;
+      }
+      if (!r.ok) return { tickets: [], more: false };
+      let data; try { data = await r.json(); } catch { return { tickets: [], more: false }; }
+      const tickets = data.data || [];
+      const more = data.info?.moreRecords ?? (tickets.length >= PAGE_SIZE);
+      return { tickets, more };
+    }
+    return { tickets: [], more: false };
+  }
+
+  async function scanPages(status, perTicket) {
+    let from = 0;
+    while (from < 10000) {
+      const offsets = [];
+      for (let i = 0; i < PARALLEL_PAGES; i++) {
+        const o = from + i * PAGE_SIZE;
+        if (o >= 10000) break;
+        offsets.push(o);
+      }
+      if (!offsets.length) break;
+      const results = await Promise.all(offsets.map(o => fetchPageWithRetry(status, o)));
+      await new Promise(r => setTimeout(r, 400));
+      let anyMore = false;
+      for (const { tickets, more } of results) {
+        for (const t of tickets) {
+          const ticketId = (t.id || '').toString();
+          if (ticketId && !recycledTicketIds.has(ticketId)) perTicket(t, ticketId);
+        }
+        if (more) anyMore = true;
+      }
+      if (!anyMore) break;
+      from += offsets.length * PAGE_SIZE;
+    }
+  }
+
+  let openCount = 0, slaCount = 0, assignedCount = 0, closedCount = 0;
+  function countClosed(t, ticketId) {
+    if (isAdmin) {
+      closedCount++;
+    } else {
+      const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+      const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
+      if (isMine) closedCount++;
+    }
+  }
+
+  await Promise.all([
+    scanPages('Open', (t, ticketId) => {
+      const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+      const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
+      if (isAdmin || isMine) openCount++;
+      if (isMine) {
+        assignedCount++;
+        const priority = (t.priority || '').toLowerCase();
+        if (priority.includes('sla') || priority.includes('urgent') || priority.includes('critical')) slaCount++;
+      }
+    }),
+    scanPages('Closed',   countClosed),
+    scanPages('Resolved', countClosed)
+  ]);
+
+  return {
+    scope: isAdmin ? 'all' : 'mine',
+    open: openCount,
+    closed: closedCount,
+    sla: slaCount,
+    assigned: assignedCount,
+    total: openCount + closedCount
+  };
+}
+
+// Dedupe concurrent refreshes for the same cache key.
+async function refreshCountsCache(cacheKey, userEmail, isAdmin) {
+  const inflight = countsRefreshInFlight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const start = Date.now();
+    const countData = await computeCounts(userEmail, isAdmin);
+    const etag = '"' + crypto.createHash('md5').update(JSON.stringify(countData)).digest('hex') + '"';
+    countsCache.set(cacheKey, { data: countData, time: Date.now(), etag });
+    console.log(`[COUNTS REFRESHED] ${cacheKey} in ${Date.now() - start}ms`);
+    return countData;
+  })().finally(() => countsRefreshInFlight.delete(cacheKey));
+
+  countsRefreshInFlight.set(cacheKey, promise);
+  return promise;
+}
 
 // 🔧 GET ZOHO DESK AGENTS for assignment dropdown
 
@@ -1383,11 +1437,115 @@ app.get('/api/agents', authenticateToken, async (req, res) => {
 
 // Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
 const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
-const USER_TICKETS_CACHE_MS = 30 * 1000; // 30 seconds for faster reflection after changes
+const USER_TICKETS_CACHE_MS  = 5 * 60 * 1000;   // 5 min "fresh" window
+const USER_TICKETS_STALE_MS  = 30 * 60 * 1000;  // 30 min serve-stale-while-revalidate
+const userTicketsRefreshInFlight = new Map();   // Dedupe concurrent refreshes
 
 function invalidateRuntimeCaches() {
-  countsCache.clear();
-  userTicketsCache.clear();
+  // Mark all counts entries as stale (so SWR refreshes them) instead of
+  // wiping them, which would force the next dashboard hit to wait 5-7s.
+  for (const [key, entry] of countsCache.entries()) {
+    entry.time = 0; // age = Infinity → still served as stale, refresh kicked off
+    countsCache.set(key, entry);
+  }
+  // Same SWR treatment for per-user ticket caches.
+  for (const [key, entry] of userTicketsCache.entries()) {
+    entry.time = 0;
+    userTicketsCache.set(key, entry);
+  }
+  // Kick off an immediate background refresh of admin counts so the next
+  // dashboard view sees fresh data without paying the latency.
+  refreshCountsCache('counts_admin', '', true)
+    .catch(err => console.error('Post-mutation counts refresh failed:', err?.message || err));
+}
+
+// ── Compute the full filtered ticket list for a user (cold path) ──
+async function computeUserTickets(userEmail, status) {
+  const include = 'contacts,assignee';
+  const apiPageSize = 100;
+  const PARALLEL_BATCH = 5;
+
+  const [recycledIds, supabaseResult] = await Promise.all([
+    getActiveRecycledTicketIds(),
+    pool.query(
+      "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
+      [userEmail]
+    ).catch(e => { console.error('Supabase assignment fetch error:', e?.message || e); return { rows: [] }; })
+  ]);
+  const supabaseAssignedIds = new Set(supabaseResult.rows.map(r => r.zoho_ticket_id));
+
+  function filterMyTickets(tickets) {
+    const out = [];
+    for (const t of tickets) {
+      const ticketId = (t.id || '').toString();
+      if (!ticketId || recycledIds.has(ticketId)) continue;
+      const contactEmail  = (t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail || '').toLowerCase();
+      const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+      if (contactEmail === userEmail || assigneeEmail === userEmail || supabaseAssignedIds.has(ticketId)) {
+        out.push({
+          ...t,
+          email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
+          assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+        });
+      }
+    }
+    return out;
+  }
+
+  let statusParam = '';
+  if (status === 'open') statusParam = '&status=Open';
+  else if (status === 'closed') statusParam = '&status=Closed';
+
+  const allUserTickets = [];
+  let zohoFrom = 0;
+  let keepScanning = true;
+
+  while (keepScanning) {
+    const batchPromises = [];
+    for (let i = 0; i < PARALLEL_BATCH; i++) {
+      const offset = zohoFrom + i * apiPageSize;
+      if (offset > 5000) break;
+      const ep = `/tickets?limit=${apiPageSize}&from=${offset}&include=${include}${statusParam}`;
+      batchPromises.push(
+        zohoFetch(ep)
+          .then(r => r.ok ? r.json() : { data: [] })
+          .then(d => ({ data: d.data || [], offset }))
+          .catch(() => ({ data: [], offset }))
+      );
+    }
+    if (batchPromises.length === 0) break;
+
+    const batchResults = await Promise.all(batchPromises);
+    batchResults.sort((a, b) => a.offset - b.offset);
+
+    let anyPageFull = false;
+    for (const r of batchResults) {
+      allUserTickets.push(...filterMyTickets(r.data));
+      if (r.data.length === apiPageSize) anyPageFull = true;
+    }
+    if (!anyPageFull) break;
+    zohoFrom += PARALLEL_BATCH * apiPageSize;
+    if (zohoFrom > 5000) break;
+  }
+
+  return allUserTickets;
+}
+
+// ── Refresh user-tickets cache; deduped per cache key ──
+async function refreshUserTicketsCache(cacheKey, userEmail, status) {
+  const inflight = userTicketsRefreshInFlight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const start = Date.now();
+    const tickets = await computeUserTickets(userEmail, status);
+    userTicketsCache.set(cacheKey, { tickets, time: Date.now() });
+    console.log(`[USER-TICKETS REFRESHED] ${cacheKey} → ${tickets.length} rows in ${Date.now() - start}ms`);
+    return tickets;
+  })().finally(() => userTicketsRefreshInFlight.delete(cacheKey));
+
+  userTicketsRefreshInFlight.set(cacheKey, promise);
+  return promise;
 }
 
 app.get('/api/tickets', authenticateToken, async (req, res) => {
@@ -1400,121 +1558,31 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
     const from = (page - 1) * limit;
     const include = 'contacts,assignee';
 
-    // If filterByEmail is set, use cached user tickets
     if (filterByEmail) {
       const userEmail = filterByEmail.toLowerCase();
       const cacheKey = `${userEmail}_${status || 'all'}`;
       const startIdx = (page - 1) * limit;
-      const neededForPage = startIdx + limit + 1;
       const cached = userTicketsCache.get(cacheKey);
+      const age = cached ? Date.now() - cached.time : Infinity;
 
       let allUserTickets;
-      let partialPageOnly = false;
-      if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) {
+
+      if (cached && age < USER_TICKETS_CACHE_MS) {
+        // Fresh — instant
         allUserTickets = cached.tickets;
+      } else if (cached && age < USER_TICKETS_STALE_MS) {
+        // Stale — serve cached + refresh in background
+        allUserTickets = cached.tickets;
+        refreshUserTicketsCache(cacheKey, userEmail, status).catch(err =>
+          console.error(`Background user-tickets refresh failed for ${cacheKey}:`, err?.message || err)
+        );
       } else {
-        // Scan Zoho in PARALLEL batches for speed
-        const startTime = Date.now();
-        const apiPageSize = 100;
-        const PARALLEL_BATCH = 5; // 5 parallel requests at a time
-
-        const [recycledIds, supabaseResult] = await Promise.all([
-          getActiveRecycledTicketIds(),
-          pool.query(
-            "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
-            [userEmail]
-          ).catch(e => { console.error('Supabase assignment fetch error:', e); return { rows: [] }; })
-        ]);
-        const supabaseAssignedIds = new Set(supabaseResult.rows.map(r => r.zoho_ticket_id));
-
-        // Helper to filter tickets from a Zoho response
-        function filterMyTickets(tickets) {
-          const result = [];
-          for (const t of tickets) {
-            const ticketId = (t.id || '').toString();
-            if (!ticketId || recycledIds.has(ticketId)) continue;
-            const contactEmail = (t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail || '').toLowerCase();
-            const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-            if (contactEmail === userEmail || assigneeEmail === userEmail || supabaseAssignedIds.has(ticketId)) {
-              result.push({
-                ...t,
-                email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
-                assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
-              });
-            }
-          }
-          return result;
-        }
-
-        // First, do a quick probe to find how many pages exist
-        let statusParam = '';
-        if (status === 'open') statusParam = '&status=Open';
-        else if (status === 'closed') statusParam = '&status=Closed';
-
-        allUserTickets = [];
-        let zohoFrom = 0;
-        let keepScanning = true;
-
-        while (keepScanning) {
-          // Launch PARALLEL_BATCH requests at once
-          const batchPromises = [];
-          for (let i = 0; i < PARALLEL_BATCH; i++) {
-            const offset = zohoFrom + i * apiPageSize;
-            if (offset > 5000) break; // Safety cap
-            const ep = `/tickets?limit=${apiPageSize}&from=${offset}&include=${include}${statusParam}`;
-            batchPromises.push(
-              zohoFetch(ep)
-                .then(r => r.ok ? r.json() : { data: [] })
-                .then(d => ({ data: d.data || [], offset }))
-                .catch(() => ({ data: [], offset }))
-            );
-          }
-
-          if (batchPromises.length === 0) break;
-
-          const batchResults = await Promise.all(batchPromises);
-
-          // Sort by offset to maintain order
-          batchResults.sort((a, b) => a.offset - b.offset);
-
-          let anyPageFull = false;
-          for (const result of batchResults) {
-            const myTickets = filterMyTickets(result.data);
-            allUserTickets.push(...myTickets);
-
-            // Short-circuit once we have enough rows for the requested page.
-            if (allUserTickets.length >= neededForPage) {
-              partialPageOnly = true;
-              keepScanning = false;
-              break;
-            }
-
-            if (result.data.length === apiPageSize) anyPageFull = true;
-          }
-
-          if (!keepScanning) break;
-
-          // If no page in batch was full, we've reached the end
-          if (!anyPageFull) {
-            keepScanning = false;
-          } else {
-            zohoFrom += PARALLEL_BATCH * apiPageSize;
-            if (zohoFrom > 5000) keepScanning = false;
-          }
-        }
-
-        // Cache only full scans. Partial scans are page-optimized and should not poison cache.
-        if (!partialPageOnly) {
-          userTicketsCache.set(cacheKey, { tickets: allUserTickets, time: Date.now() });
-        }
-        console.log(`Cached ${allUserTickets.length} tickets for ${userEmail} (${status || 'all'}) in ${Date.now() - startTime}ms`);
+        // Cold — must compute synchronously
+        allUserTickets = await refreshUserTicketsCache(cacheKey, userEmail, status);
       }
 
-      // Paginate from cached results
       const pageData = allUserTickets.slice(startIdx, startIdx + limit);
-      const hasMore = partialPageOnly
-        ? pageData.length === limit
-        : startIdx + limit < allUserTickets.length;
+      const hasMore = startIdx + limit < allUserTickets.length;
 
       return res.json({
         page,
@@ -1757,8 +1825,7 @@ app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
     }
 
     // Invalidate counts caches on ticket update (status changes affect counts)
-    countsCache.clear();
-    userTicketsCache.clear();
+    invalidateRuntimeCaches();
 
     return res.json(data || { status: 'ok' });
   } catch (err) {
@@ -1778,50 +1845,45 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
     }
 
     // Always fetch full conversation details for every conversation
-    // Zoho uses /threads/{id} for email threads and /comments/{id} for comments
-    const detailRequests = data.data.map(async (conv, idx) => {
+    // Zoho uses /threads/{id} for email threads and /comments/{id} for comments.
+    // Throttle to CONV_ENRICH_BATCH parallel requests to avoid Zoho 429s and
+    // long ticket-detail load times when a ticket has many conversations.
+    const CONV_ENRICH_BATCH = 6;
+    const enrichOne = async (conv) => {
       try {
-        // Determine the correct sub-endpoint based on conversation type
         const convType = (conv.type || '').toLowerCase();
-        let detailEndpoint;
-        if (convType === 'comment') {
-          detailEndpoint = `/tickets/${req.params.id}/comments/${conv.id}`;
-        } else {
-          // Default to threads for email-type conversations
-          detailEndpoint = `/tickets/${req.params.id}/threads/${conv.id}`;
-        }
+        const detailEndpoint = convType === 'comment'
+          ? `/tickets/${req.params.id}/comments/${conv.id}`
+          : `/tickets/${req.params.id}/threads/${conv.id}`;
 
         const detailRes = await zohoFetch(detailEndpoint);
         if (detailRes.ok) {
           const detail = await detailRes.json();
           const detailData = detail?.data || detail;
-          return { idx, enriched: { ...conv, ...detailData } };
-        } else {
-          // Try the other endpoint as fallback
-          const fallbackEndpoint = convType === 'comment'
-            ? `/tickets/${req.params.id}/threads/${conv.id}`
-            : `/tickets/${req.params.id}/comments/${conv.id}`;
-          const fallbackRes = await zohoFetch(fallbackEndpoint);
-          if (fallbackRes.ok) {
-            const fallback = await fallbackRes.json();
-            const fallbackData = fallback?.data || fallback;
-            return { idx, enriched: { ...conv, ...fallbackData } };
-          }
+          return { ...conv, ...detailData };
+        }
+
+        const fallbackEndpoint = convType === 'comment'
+          ? `/tickets/${req.params.id}/threads/${conv.id}`
+          : `/tickets/${req.params.id}/comments/${conv.id}`;
+        const fallbackRes = await zohoFetch(fallbackEndpoint);
+        if (fallbackRes.ok) {
+          const fallback = await fallbackRes.json();
+          const fallbackData = fallback?.data || fallback;
+          return { ...conv, ...fallbackData };
         }
       } catch {
         // ignore enrichment errors, fall back to original
       }
-      return { idx, enriched: conv };
-    });
+      return conv;
+    };
 
-    const enriched = await Promise.allSettled(detailRequests);
-    const resultData = [...data.data];
-
-    enriched.forEach((result) => {
-      if (result.status === 'fulfilled') {
-        resultData[result.value.idx] = result.value.enriched;
-      }
-    });
+    const resultData = [];
+    for (let i = 0; i < data.data.length; i += CONV_ENRICH_BATCH) {
+      const slice = data.data.slice(i, i + CONV_ENRICH_BATCH);
+      const enrichedSlice = await Promise.all(slice.map(enrichOne));
+      resultData.push(...enrichedSlice);
+    }
 
     // Look up actual sender names for replies made through our app
     const convIds = resultData.map(c => (c.id || '').toString()).filter(Boolean);
@@ -3803,4 +3865,16 @@ app.get("*", (req, res) => {
 // ------------------------
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+
+  // 🔥 Pre-warm admin counts cache so first dashboard hit returns instantly.
+  refreshCountsCache('counts_admin', '', true)
+    .then(() => console.log('🔥 Admin counts cache pre-warmed'))
+    .catch(err => console.error('Pre-warm failed:', err?.message || err));
+
+  // 🔁 Keep the admin cache hot — refreshes every 4 minutes (under the 5-min
+  // fresh window) so requests almost always hit a fresh entry (<50 ms response).
+  setInterval(() => {
+    refreshCountsCache('counts_admin', '', true)
+      .catch(err => console.error('Periodic counts refresh failed:', err?.message || err));
+  }, 4 * 60 * 1000).unref?.();
 });

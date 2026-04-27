@@ -1,7 +1,7 @@
 import { bootstrapApplication } from '@angular/platform-browser';
 import { AppComponent } from './app/app.component';
 import { provideHttpClient, withInterceptors } from '@angular/common/http';
-import { provideRouter } from '@angular/router';
+import { provideRouter, withPreloading, PreloadAllModules } from '@angular/router';
 import { routes } from './app/app.routes';
 import { PublicClientApplication } from '@azure/msal-browser';
 import { authInterceptor } from './app/auth.interceptor';
@@ -33,7 +33,7 @@ msal.initialize()
         provideHttpClient(
           withInterceptors([authInterceptor])
         ),
-        provideRouter(routes),
+        provideRouter(routes, withPreloading(PreloadAllModules)),
         { provide: 'MSAL_INSTANCE', useValue: msal }
       ]
     });

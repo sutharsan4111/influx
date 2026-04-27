@@ -35,8 +35,8 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-cog"></i>
           <span>Admin Panel</span>
         </li>
-        <li *ngIf="isAdmin() && isAdminSection()"
-            class="menu-item sub-item"
+        <li *ngIf="isAdmin()"
+            class="menu-item"
             routerLink="/admin/report"
             [class.active]="isActive('/admin/report')">
           <i class="fas fa-chart-bar"></i>
