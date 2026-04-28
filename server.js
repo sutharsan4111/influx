@@ -1213,8 +1213,8 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
     const userRole = (req.user?.role || 'user').toLowerCase();
     const isAdmin = userRole === 'admin';
 
-    // Role-based cache key (admins all see the same counts)
-    const cacheKey = isAdmin ? 'counts_admin' : `counts_user_${userEmail}`;
+    // Per-user cache key — assigned/SLA counts are personal even for admins.
+    const cacheKey = `counts_${isAdmin ? 'admin_' : 'user_'}${userEmail}`;
     const cached = countsCache.get(cacheKey);
     const now = Date.now();
     const age = cached ? now - cached.time : Infinity;
@@ -1453,10 +1453,8 @@ function invalidateRuntimeCaches() {
     entry.time = 0;
     userTicketsCache.set(key, entry);
   }
-  // Kick off an immediate background refresh of admin counts so the next
-  // dashboard view sees fresh data without paying the latency.
-  refreshCountsCache('counts_admin', '', true)
-    .catch(err => console.error('Post-mutation counts refresh failed:', err?.message || err));
+  // Per-user caches are already stale-marked above; they'll self-refresh on
+  // the next request via SWR — no shared-admin pre-warm needed here.
 }
 
 // ── Compute the full filtered ticket list for a user (cold path) ──
@@ -1492,40 +1490,53 @@ async function computeUserTickets(userEmail, status) {
     return out;
   }
 
-  let statusParam = '';
-  if (status === 'open') statusParam = '&status=Open';
-  else if (status === 'closed') statusParam = '&status=Closed';
+  // Zoho has distinct status values — 'open' tab needs both Open AND In Progress,
+  // 'closed' tab needs both Closed AND Resolved to avoid missing tickets.
+  let statusParamList;
+  if (status === 'open') statusParamList = ['&status=Open', '&status=In%20Progress'];
+  else if (status === 'closed') statusParamList = ['&status=Closed', '&status=Resolved'];
+  else statusParamList = [''];
 
   const allUserTickets = [];
-  let zohoFrom = 0;
-  let keepScanning = true;
+  const seenTicketIds = new Set();
 
-  while (keepScanning) {
-    const batchPromises = [];
-    for (let i = 0; i < PARALLEL_BATCH; i++) {
-      const offset = zohoFrom + i * apiPageSize;
-      if (offset > 5000) break;
-      const ep = `/tickets?limit=${apiPageSize}&from=${offset}&include=${include}${statusParam}`;
-      batchPromises.push(
-        zohoFetch(ep)
-          .then(r => r.ok ? r.json() : { data: [] })
-          .then(d => ({ data: d.data || [], offset }))
-          .catch(() => ({ data: [], offset }))
-      );
+  for (const statusParam of statusParamList) {
+    let zohoFrom = 0;
+    let keepScanning = true;
+
+    while (keepScanning) {
+      const batchPromises = [];
+      for (let i = 0; i < PARALLEL_BATCH; i++) {
+        const offset = zohoFrom + i * apiPageSize;
+        if (offset > 5000) break;
+        const ep = `/tickets?limit=${apiPageSize}&from=${offset}&include=${include}${statusParam}`;
+        batchPromises.push(
+          zohoFetch(ep)
+            .then(r => r.ok ? r.json() : { data: [] })
+            .then(d => ({ data: d.data || [], offset }))
+            .catch(() => ({ data: [], offset }))
+        );
+      }
+      if (batchPromises.length === 0) break;
+
+      const batchResults = await Promise.all(batchPromises);
+      batchResults.sort((a, b) => a.offset - b.offset);
+
+      let anyPageFull = false;
+      for (const r of batchResults) {
+        for (const t of filterMyTickets(r.data)) {
+          const tid = (t.id || '').toString();
+          if (tid && !seenTicketIds.has(tid)) {
+            seenTicketIds.add(tid);
+            allUserTickets.push(t);
+          }
+        }
+        if (r.data.length === apiPageSize) anyPageFull = true;
+      }
+      if (!anyPageFull) break;
+      zohoFrom += PARALLEL_BATCH * apiPageSize;
+      if (zohoFrom > 5000) break;
     }
-    if (batchPromises.length === 0) break;
-
-    const batchResults = await Promise.all(batchPromises);
-    batchResults.sort((a, b) => a.offset - b.offset);
-
-    let anyPageFull = false;
-    for (const r of batchResults) {
-      allUserTickets.push(...filterMyTickets(r.data));
-      if (r.data.length === apiPageSize) anyPageFull = true;
-    }
-    if (!anyPageFull) break;
-    zohoFrom += PARALLEL_BATCH * apiPageSize;
-    if (zohoFrom > 5000) break;
   }
 
   return allUserTickets;
@@ -3866,15 +3877,7 @@ app.get("*", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 
-  // 🔥 Pre-warm admin counts cache so first dashboard hit returns instantly.
-  refreshCountsCache('counts_admin', '', true)
-    .then(() => console.log('🔥 Admin counts cache pre-warmed'))
-    .catch(err => console.error('Pre-warm failed:', err?.message || err));
-
-  // 🔁 Keep the admin cache hot — refreshes every 4 minutes (under the 5-min
-  // fresh window) so requests almost always hit a fresh entry (<50 ms response).
-  setInterval(() => {
-    refreshCountsCache('counts_admin', '', true)
-      .catch(err => console.error('Periodic counts refresh failed:', err?.message || err));
-  }, 4 * 60 * 1000).unref?.();
+  // Per-user counts caches are warmed on each user's first dashboard request
+  // via the SWR pattern. No shared pre-warm needed (it caused wrong 0-counts
+  // for assigned/SLA metrics because no real userEmail was available at boot).
 });

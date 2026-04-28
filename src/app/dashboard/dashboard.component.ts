@@ -686,8 +686,6 @@ import { MsalService } from '../services/msal.service';
     /* Activity Feed */
     .activity-list {
       padding: 8px 12px;
-      max-height: 240px;
-      overflow-y: auto;
     }
 
     .activity-item {
