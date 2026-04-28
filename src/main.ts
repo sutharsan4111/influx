@@ -10,7 +10,7 @@ import { authInterceptor } from './app/auth.interceptor';
 const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
 const redirectUri = isLocalhost
   ? `${window.location.protocol}//${window.location.host}/`
-  : 'https://muraai-itsm.demos.muraai.com/';
+  : 'http://localhost:3000/';
 
 const msal = new PublicClientApplication({
   auth: {
