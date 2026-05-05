@@ -14,5 +14,5 @@ services:
       - /usr/src/app/node_modules
     # Production deployment: build once, then serve. Avoids `ng watch` overhead
     # and ships the optimized/minified Angular bundle to clients.
-    command: sh -c "npm install --legacy-peer-deps && npm run build:prod && npm start"
+    command: sh -c "npm install --include=dev --legacy-peer-deps && npm run build:prod && npm start"
     restart: unless-stopped

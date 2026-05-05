@@ -79,6 +79,7 @@ interface SlaMemberRow {
 }
 
 type SortMetric = 'total' | 'assigned' | 'closed' | 'resolution';
+type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual';
 
 @Component({
   selector: 'app-admin-report',
@@ -95,10 +96,23 @@ type SortMetric = 'total' | 'assigned' | 'closed' | 'resolution';
         </div>
         <div class="header-actions">
           <div class="date-filters">
-            <label><span>From</span><input type="date" [(ngModel)]="startDate" /></label>
-            <label><span>To</span><input type="date" [(ngModel)]="endDate" /></label>
+            <label>
+              <span>Period</span>
+              <select [(ngModel)]="selectedPeriod" (ngModelChange)="onPeriodChange()">
+                <option value="custom">Custom</option>
+                <option value="monthly">Monthly</option>
+                <option value="quarterly">Quarterly</option>
+                <option value="halfyearly">Half-Yearly</option>
+                <option value="annual">Annual</option>
+              </select>
+            </label>
+            <label><span>From</span><input type="date" [(ngModel)]="startDate" (ngModelChange)="onDateInputChange()" /></label>
+            <label><span>To</span><input type="date" [(ngModel)]="endDate" (ngModelChange)="onDateInputChange()" /></label>
           </div>
           <div class="btn-row">
+            <button class="btn" (click)="applyDateRange()" [disabled]="loading">
+              Apply
+            </button>
             <button class="btn btn-primary" (click)="downloadExcel()" [disabled]="loading || summaryRows.length === 0">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               Export Excel
@@ -524,7 +538,16 @@ type SortMetric = 'total' | 'assigned' | 'closed' | 'resolution';
       border-radius: 6px;
       font-size: 12px;
     }
+    .date-filters select {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      color: #0f172a;
+      padding: 5px 9px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
     .date-filters input:focus { outline: none; border-color: #06b6d4; }
+    .date-filters select:focus { outline: none; border-color: #06b6d4; }
     .group-pill {
       background: #eff6ff;
       border: 1px solid #bfdbfe;
@@ -997,8 +1020,14 @@ type SortMetric = 'total' | 'assigned' | 'closed' | 'resolution';
       border-color: #334155;
       color: #e2e8f0;
     }
+    :host-context(body.dark-theme) .date-filters select {
+      background: #0b1220;
+      border-color: #334155;
+      color: #e2e8f0;
+    }
     :host-context(body.dark-theme) .date-filters input::placeholder { color: #64748b; }
     :host-context(body.dark-theme) .date-filters input:focus { border-color: #22d3ee; }
+    :host-context(body.dark-theme) .date-filters select:focus { border-color: #22d3ee; }
     :host-context(body.dark-theme) .group-pill {
       background: rgba(59, 130, 246, 0.15);
       border-color: rgba(96, 165, 250, 0.35);
@@ -1211,6 +1240,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   groupEmail = 'cloudops@muraai.com';
   startDate = '';
   endDate = '';
+  selectedPeriod: ReportPeriod = 'monthly';
 
   loading = false;
   backfilling = false;
@@ -1323,11 +1353,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   ) {}
 
   ngOnInit(): void {
-    const today = new Date();
-    const prior = new Date();
-    prior.setDate(today.getDate() - 30);
-    this.startDate = this.formatDate(prior);
-    this.endDate = this.formatDate(today);
+    this.applyPresetDateRange('monthly');
 
     if (this.isAdmin) {
       this.loadReport();
@@ -1335,6 +1361,21 @@ export class ReportComponent implements OnInit, AfterViewInit {
   }
 
   ngAfterViewInit(): void {}
+
+  onPeriodChange(): void {
+    if (this.selectedPeriod === 'custom') return;
+    this.applyPresetDateRange(this.selectedPeriod);
+    this.applyDateRange();
+  }
+
+  onDateInputChange(): void {
+    this.selectedPeriod = 'custom';
+  }
+
+  applyDateRange(): void {
+    sessionStorage.removeItem(this.reportCacheKey);
+    this.loadReport();
+  }
 
   async loadReport(): Promise<void> {
     if (!this.isAdmin) return;
@@ -1751,6 +1792,27 @@ export class ReportComponent implements OnInit, AfterViewInit {
 
   private formatDate(date: Date): string {
     return date.toISOString().slice(0, 10);
+  }
+
+  private applyPresetDateRange(period: Exclude<ReportPeriod, 'custom'>): void {
+    const now = new Date();
+    const start = new Date(now);
+
+    if (period === 'monthly') {
+      start.setDate(1);
+    } else if (period === 'quarterly') {
+      const quarterStartMonth = Math.floor(now.getMonth() / 3) * 3;
+      start.setMonth(quarterStartMonth, 1);
+    } else if (period === 'halfyearly') {
+      const halfStartMonth = now.getMonth() < 6 ? 0 : 6;
+      start.setMonth(halfStartMonth, 1);
+    } else {
+      start.setMonth(0, 1);
+    }
+
+    start.setHours(0, 0, 0, 0);
+    this.startDate = this.formatDate(start);
+    this.endDate = this.formatDate(now);
   }
 
   private getRange(): { start: Date; end: Date } {

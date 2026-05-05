@@ -14,7 +14,7 @@ const redirectUri = isLocalhost
 
 const msal = new PublicClientApplication({
   auth: {
-    clientId: '65368371-568a-4d2b-b2e6-5239833d4f95',
+    clientId: '88dd992a-c3c2-4629-920c-b8d035e9e3b1',
     authority: 'https://login.microsoftonline.com/583bbc8b-b4b7-4e5f-900d-c0554b41e2eb',
     redirectUri: redirectUri,
     navigateToLoginRequestUrl: false
