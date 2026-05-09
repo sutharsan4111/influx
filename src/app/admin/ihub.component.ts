@@ -30,6 +30,7 @@ import { MessageService } from '../services/message.service';
         <table>
           <thead>
             <tr>
+              <th>SNO</th>
               <th>Client</th>
               <th>Environment</th>
               <th>Hostname</th>
@@ -41,7 +42,8 @@ import { MessageService } from '../services/message.service';
             </tr>
           </thead>
           <tbody>
-            <tr *ngFor="let item of assets">
+            <tr *ngFor="let item of assets; let i = index">
+              <td>{{ i + 1 }}</td>
               <td>{{ item.client }}</td>
               <td>{{ item.environment }}</td>
               <td>{{ item.hostname }}</td>
@@ -60,7 +62,7 @@ import { MessageService } from '../services/message.service';
               </td>
             </tr>
             <tr *ngIf="assets.length === 0">
-              <td colspan="8" class="empty">No IHUB records found.</td>
+              <td colspan="9" class="empty">No IHUB records found.</td>
             </tr>
           </tbody>
         </table>

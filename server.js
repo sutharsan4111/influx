@@ -460,9 +460,11 @@ refreshZohoToken();
 setTimeout(() => {
   processIhubAlerts();
   processSslAlerts();
+  processAutomationSslAlerts();
 }, 15 * 1000);
 setInterval(processIhubAlerts, 12 * 60 * 60 * 1000);
 setInterval(processSslAlerts, 12 * 60 * 60 * 1000);
+setInterval(processAutomationSslAlerts, 12 * 60 * 60 * 1000);
 
 // ------------------------
 // ZOHO API HELPER
@@ -568,10 +570,13 @@ function parseMilestoneDays(alert) {
   const fromLabel = parseInt(labels.milestone_days || labels.days_left || '', 10);
   if (Number.isInteger(fromLabel)) return fromLabel;
 
+  // Prefer annotation text because some alert names encode technical windows
+  // (e.g., SSLCert_33Days) while summary/description carry business milestones
+  // (30/15/7/3/1 days) used by ticketing.
   const sources = [
-    labels.alertname || '',
     annotations.summary || '',
-    annotations.description || ''
+    annotations.description || '',
+    labels.alertname || ''
   ];
 
   for (const text of sources) {
@@ -595,6 +600,210 @@ function buildAlertFingerprint(alert, milestoneDays) {
     String(milestoneDays)
   ].join('|');
   return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+async function fetchAutomationSslMonitoredUrls() {
+  if (!AUTOMATION_PROMETHEUS_URL) {
+    throw new Error('AUTOMATION_PROMETHEUS_URL is not configured');
+  }
+
+  const diagnostics = {
+    timestamp: new Date().toISOString(),
+    targetsWithProbeSuccess: 0,
+    targetsWithSslMetric: 0,
+    targetsWithoutSslMetric: [],
+    missingMetricDetails: []
+  };
+
+  const baseUrl = AUTOMATION_PROMETHEUS_URL.replace(/\/$/, '');
+  const queryPrometheus = async (query, errorMessage) => {
+    const url = `${baseUrl}/api/v1/query?query=${encodeURIComponent(query)}`;
+    const response = await fetch(url, { method: 'GET' });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || payload?.status !== 'success') {
+      throw new Error(errorMessage);
+    }
+    return Array.isArray(payload?.data?.result) ? payload.data.result : [];
+  };
+
+  // Use probe_success as the baseline so all configured targets are visible,
+  // even when certificate-expiry metric is unavailable for failed probes.
+  const successRows = await queryPrometheus(
+    'probe_success',
+    'Failed to fetch probe availability metrics from Prometheus'
+  );
+  const expiryRows = await queryPrometheus(
+    'probe_ssl_earliest_cert_expiry',
+    'Failed to fetch SSL expiry metrics from Prometheus'
+  );
+
+  const today = toStartOfDay(new Date());
+  diagnostics.targetsWithProbeSuccess = successRows.length;
+  diagnostics.targetsWithSslMetric = expiryRows.length;
+
+  const keyFromMetric = (metric = {}) => {
+    const instance = (metric.instance || metric.target || '').trim().toLowerCase();
+    const client = (metric.client || '').trim().toLowerCase();
+    const environment = (metric.environment || '').trim().toLowerCase();
+    const application = (metric.application || '').trim().toLowerCase();
+    return [instance, client, environment, application].join('|');
+  };
+
+  const mappedByKey = new Map();
+  const expiryKeySet = new Set(expiryRows.map(r => keyFromMetric(r?.metric || {})));
+
+  for (const row of successRows) {
+    const metric = row?.metric || {};
+    const value = Number(Array.isArray(row?.value) ? row.value[1] : NaN);
+    const key = keyFromMetric(metric);
+
+    if (!expiryKeySet.has(key)) {
+      const instance = (metric.instance || metric.target || '').trim();
+      diagnostics.targetsWithoutSslMetric.push(instance);
+      diagnostics.missingMetricDetails.push({
+        instance,
+        client: (metric.client || '').trim() || 'Unknown',
+        environment: (metric.environment || '').trim() || 'Unknown',
+        application: (metric.application || '').trim() || 'Unknown',
+        probeSuccess: Number.isFinite(value) ? value === 1 : null
+      });
+    }
+
+    mappedByKey.set(key, {
+      client: (metric.client || '').trim() || 'Unknown',
+      environment: (metric.environment || '').trim() || 'Unknown',
+      application: (metric.application || '').trim() || 'Unknown',
+      ssl_url: (metric.instance || metric.target || '').trim() || '',
+      responsible: (metric.responsible || '').trim() || null,
+      responsible_email: (metric.responsible_email || metric.owner_email || metric.email || '').trim().toLowerCase() || null,
+      hostname: (metric.hostname || '').trim() || null,
+      ip_address: (metric.ip_address || '').trim() || null,
+      version: (metric.version || '').trim() || null,
+      estimated_expiry_on: null,
+      estimated_days_to_expiry: null,
+      metric_value: null,
+      probe_success: Number.isFinite(value) ? value === 1 : null
+    });
+  }
+
+  for (const row of expiryRows) {
+    const metric = row?.metric || {};
+    const value = Number(Array.isArray(row?.value) ? row.value[1] : NaN);
+    const expiryDate = Number.isFinite(value) ? toStartOfDay(new Date(value * 1000)) : null;
+    const daysToExpiry = expiryDate
+      ? Math.floor((expiryDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))
+      : null;
+    const key = keyFromMetric(metric);
+
+    const existing = mappedByKey.get(key) || {
+      client: (metric.client || '').trim() || 'Unknown',
+      environment: (metric.environment || '').trim() || 'Unknown',
+      application: (metric.application || '').trim() || 'Unknown',
+      ssl_url: (metric.instance || metric.target || '').trim() || '',
+      responsible: (metric.responsible || '').trim() || null,
+      responsible_email: (metric.responsible_email || metric.owner_email || metric.email || '').trim().toLowerCase() || null,
+      hostname: (metric.hostname || '').trim() || null,
+      ip_address: (metric.ip_address || '').trim() || null,
+      version: (metric.version || '').trim() || null,
+      probe_success: null
+    };
+
+    mappedByKey.set(key, {
+      ...existing,
+      estimated_expiry_on: expiryDate ? expiryDate.toISOString().slice(0, 10) : null,
+      estimated_days_to_expiry: daysToExpiry,
+      metric_value: Number.isFinite(value) ? value : null
+    });
+  }
+
+  console.log('[Automation SSL] Diagnostics:', JSON.stringify(diagnostics, null, 2));
+  global.lastAutomationSslDiagnostics = diagnostics;
+
+  return Array.from(mappedByKey.values())
+    .sort((a, b) => {
+      const aDays = Number.isFinite(a.estimated_days_to_expiry) ? a.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
+      const bDays = Number.isFinite(b.estimated_days_to_expiry) ? b.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
+      if (aDays !== bDays) return aDays - bDays;
+      return (a.client || '').localeCompare(b.client || '');
+    });
+}
+
+async function processAutomationSslAlerts() {
+  const summary = {
+    scanned: 0,
+    matchedMilestones: 0,
+    created: 0,
+    duplicate: 0,
+    skipped: 0,
+    errors: 0
+  };
+
+  try {
+    if (!AUTOMATION_PROMETHEUS_URL) {
+      console.warn('[Automation SSL] Skipping alert generation: AUTOMATION_PROMETHEUS_URL is not configured');
+      return {
+        ...summary,
+        skipped: summary.skipped + 1,
+        reason: 'AUTOMATION_PROMETHEUS_URL is not configured'
+      };
+    }
+
+    const monitoredRows = await fetchAutomationSslMonitoredUrls();
+    summary.scanned = monitoredRows.length;
+    console.log(`[Automation SSL] Processing ${monitoredRows.length} monitored URLs for alert generation...`);
+
+    for (const row of monitoredRows) {
+      const daysLeft = row.estimated_days_to_expiry;
+      if (!Number.isInteger(daysLeft) || !AUTOMATION_SSL_ALERT_MILESTONES.includes(daysLeft)) {
+        summary.skipped += 1;
+        continue;
+      }
+      summary.matchedMilestones += 1;
+
+      const instance = (row.ssl_url || row.hostname || '').trim();
+      const alert = {
+        labels: {
+          alertname: 'AutomationSSLExpiry',
+          milestone_days: String(daysLeft),
+          client: row.client || 'Unknown',
+          environment: row.environment || 'Unknown',
+          application: row.application || 'Unknown',
+          instance,
+          responsible: row.responsible || '',
+          responsible_email: row.responsible_email || ''
+        },
+        annotations: {
+          summary: `SSL certificate expires in ${daysLeft} day(s)`,
+          description: `Prometheus milestone detected for ${instance || 'unknown endpoint'}`
+        },
+        startsAt: new Date().toISOString(),
+        generatorURL: AUTOMATION_PROMETHEUS_URL
+      };
+
+      try {
+        const result = await createAlertmanagerSslTicket(alert, daysLeft);
+        if (result.status === 'created') {
+          summary.created += 1;
+          console.log(`[Automation SSL] Created ticket for ${instance || row.client} at ${daysLeft} day milestone`);
+        } else if (result.status === 'duplicate') {
+          summary.duplicate += 1;
+        } else {
+          summary.skipped += 1;
+        }
+      } catch (err) {
+        summary.errors += 1;
+        console.error(`[Automation SSL] Ticket creation failed for ${instance || row.client}:`, err?.message || err);
+      }
+    }
+    return summary;
+  } catch (err) {
+    summary.errors += 1;
+    console.error('[Automation SSL] Alert processor failed:', err?.message || err);
+    return {
+      ...summary,
+      reason: err?.message || String(err)
+    };
+  }
 }
 
 async function createAlertmanagerSslTicket(alert, milestoneDays) {
@@ -2681,61 +2890,42 @@ app.get('/api/automation-ssl', authenticateToken, authorizeAdmin, async (req, re
 
 app.get('/api/automation-ssl/monitored-urls', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    if (!AUTOMATION_PROMETHEUS_URL) {
-      return res.status(400).json({
-        message: 'AUTOMATION_PROMETHEUS_URL is not configured'
-      });
-    }
-
-    const query = 'probe_ssl_earliest_cert_expiry';
-    const url = `${AUTOMATION_PROMETHEUS_URL.replace(/\/$/, '')}/api/v1/query?query=${encodeURIComponent(query)}`;
-    const response = await fetch(url, { method: 'GET' });
-    const payload = await response.json().catch(() => null);
-
-    if (!response.ok || payload?.status !== 'success') {
-      return res.status(502).json({
-        message: 'Failed to fetch SSL expiry metrics from Prometheus'
-      });
-    }
-
-    const rows = Array.isArray(payload?.data?.result) ? payload.data.result : [];
-    const today = toStartOfDay(new Date());
-
-    const mapped = rows
-      .map((row) => {
-        const metric = row?.metric || {};
-        const value = Number(Array.isArray(row?.value) ? row.value[1] : NaN);
-        const expiryDate = Number.isFinite(value) ? toStartOfDay(new Date(value * 1000)) : null;
-        const daysToExpiry = expiryDate
-          ? Math.floor((expiryDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))
-          : null;
-
-        return {
-          client: (metric.client || '').trim() || 'Unknown',
-          environment: (metric.environment || '').trim() || 'Unknown',
-          application: (metric.application || '').trim() || 'Unknown',
-          ssl_url: (metric.instance || metric.target || '').trim() || '',
-          responsible: (metric.responsible || '').trim() || null,
-          responsible_email: (metric.responsible_email || metric.owner_email || metric.email || '').trim().toLowerCase() || null,
-          hostname: (metric.hostname || '').trim() || null,
-          ip_address: (metric.ip_address || '').trim() || null,
-          version: (metric.version || '').trim() || null,
-          estimated_expiry_on: expiryDate ? expiryDate.toISOString().slice(0, 10) : null,
-          estimated_days_to_expiry: daysToExpiry,
-          metric_value: Number.isFinite(value) ? value : null
-        };
-      })
-      .sort((a, b) => {
-        const aDays = Number.isFinite(a.estimated_days_to_expiry) ? a.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
-        const bDays = Number.isFinite(b.estimated_days_to_expiry) ? b.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
-        if (aDays !== bDays) return aDays - bDays;
-        return (a.client || '').localeCompare(b.client || '');
-      });
-
-    return res.json(mapped);
+    const monitoredRows = await fetchAutomationSslMonitoredUrls();
+    return res.json(monitoredRows);
   } catch (err) {
+    if (err?.message === 'AUTOMATION_PROMETHEUS_URL is not configured') {
+      return res.status(400).json({ message: err.message });
+    }
+    if (err?.message === 'Failed to fetch SSL expiry metrics from Prometheus') {
+      return res.status(502).json({ message: err.message });
+    }
     console.error('Failed to fetch monitored automation SSL URLs:', err);
     return res.status(500).json({ message: 'Failed to fetch monitored automation SSL URLs' });
+  }
+});
+
+app.post('/api/automation-ssl/process-now', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await processAutomationSslAlerts();
+    return res.json({
+      message: 'Automation SSL processing completed',
+      ...result
+    });
+  } catch (err) {
+    console.error('Failed to process Automation SSL alerts:', err);
+    return res.status(500).json({ message: 'Failed to process Automation SSL alerts' });
+  }
+});
+
+app.get('/api/automation-ssl/diagnostics', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const diagnostics = global.lastAutomationSslDiagnostics || {
+      message: 'No diagnostics available yet. Run /api/automation-ssl/monitored-urls first.'
+    };
+    return res.json(diagnostics);
+  } catch (err) {
+    console.error('Failed to fetch diagnostics:', err);
+    return res.status(500).json({ message: 'Failed to fetch diagnostics' });
   }
 });
 

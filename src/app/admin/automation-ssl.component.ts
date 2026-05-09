@@ -48,6 +48,7 @@ import { MessageService } from '../services/message.service';
         <table>
           <thead>
             <tr>
+              <th>SNO</th>
               <th>Client</th>
               <th>Environment</th>
               <th>Application</th>
@@ -60,7 +61,8 @@ import { MessageService } from '../services/message.service';
             </tr>
           </thead>
           <tbody>
-            <tr *ngFor="let item of monitoredUrls">
+            <tr *ngFor="let item of monitoredUrls; let i = index">
+              <td>{{ i + 1 }}</td>
               <td>{{ item.client || '-' }}</td>
               <td>{{ item.environment || '-' }}</td>
               <td>{{ item.application || '-' }}</td>
@@ -82,7 +84,7 @@ import { MessageService } from '../services/message.service';
               </td>
             </tr>
             <tr *ngIf="monitoredUrls.length === 0">
-              <td colspan="9" class="empty">No monitored URL data found.</td>
+              <td colspan="10" class="empty">No monitored URL data found.</td>
             </tr>
           </tbody>
         </table>
@@ -92,6 +94,7 @@ import { MessageService } from '../services/message.service';
         <table>
           <thead>
             <tr>
+              <th>SNO</th>
               <th>Client</th>
               <th>Environment</th>
               <th>Application</th>
@@ -105,7 +108,8 @@ import { MessageService } from '../services/message.service';
             </tr>
           </thead>
           <tbody>
-            <tr *ngFor="let item of entries">
+            <tr *ngFor="let item of entries; let i = index">
+              <td>{{ i + 1 }}</td>
               <td>{{ item.client || '-' }}</td>
               <td>{{ item.environment || '-' }}</td>
               <td>{{ item.application || '-' }}</td>
@@ -130,7 +134,7 @@ import { MessageService } from '../services/message.service';
               <td>{{ item.created_at | date:'yyyy-MM-dd HH:mm' }}</td>
             </tr>
             <tr *ngIf="entries.length === 0">
-              <td colspan="10" class="empty">No automation SSL ticket records found.</td>
+              <td colspan="11" class="empty">No automation SSL ticket records found.</td>
             </tr>
           </tbody>
         </table>

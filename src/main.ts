@@ -10,7 +10,7 @@ import { authInterceptor } from './app/auth.interceptor';
 const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
 const redirectUri = isLocalhost
   ? `${window.location.protocol}//${window.location.host}/`
-  : 'http://localhost:3000/';
+  : 'https://influx.cloud.muraai.com/';
 
 const msal = new PublicClientApplication({
   auth: {

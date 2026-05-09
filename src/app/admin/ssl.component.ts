@@ -30,6 +30,7 @@ import { SslAsset, SslResponsiblePerson, SslService } from '../services/ssl.serv
         <table>
           <thead>
             <tr>
+              <th>SNO</th>
               <th>Client</th>
               <th>Environment</th>
               <th>Hostname</th>
@@ -43,7 +44,8 @@ import { SslAsset, SslResponsiblePerson, SslService } from '../services/ssl.serv
             </tr>
           </thead>
           <tbody>
-            <tr *ngFor="let item of assets">
+            <tr *ngFor="let item of assets; let i = index">
+              <td>{{ i + 1 }}</td>
               <td>{{ item.client }}</td>
               <td>{{ item.environment }}</td>
               <td>{{ item.hostname }}</td>
@@ -66,7 +68,7 @@ import { SslAsset, SslResponsiblePerson, SslService } from '../services/ssl.serv
               </td>
             </tr>
             <tr *ngIf="assets.length === 0">
-              <td colspan="10" class="empty">No SSL records found.</td>
+              <td colspan="11" class="empty">No SSL records found.</td>
             </tr>
           </tbody>
         </table>
