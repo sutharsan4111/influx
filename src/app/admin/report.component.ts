@@ -1223,6 +1223,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   backfillResult: { total: number; updated: number; failed: number } | null = null;
 
   groupMembers: GroupMember[] = [];
+  private rawAssignments: TicketAssignment[] = [];
   summaryRows: SummaryRow[] = [];
   detailRows: DetailRow[] = [];
   categoryData: CategoryData[] = [];
@@ -1349,6 +1350,16 @@ export class ReportComponent implements OnInit, AfterViewInit {
   onPeriodChange(): void {
     if (this.selectedPeriod === 'custom') return;
     this.applyPresetDateRange(this.selectedPeriod);
+    if (this.rawAssignments.length > 0 && this.groupMembers.length > 0) {
+      this.buildReport(this.rawAssignments);
+      setTimeout(() => {
+        this.drawPieChart();
+        this.drawBarChart();
+        this.drawResolutionCategoryChart();
+        this.drawMonthlyTrendChart();
+      }, 100);
+      return;
+    }
     this.applyDateRange();
   }
 
@@ -1390,6 +1401,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       }
 
       const assignments = await firstValueFrom(this.assignmentService.getReportAssignments());
+      this.rawAssignments = assignments;
       this.buildReport(assignments);
       this.saveReportToCache();
       setTimeout(() => {
