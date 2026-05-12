@@ -58,7 +58,6 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
       <div class="tab-right">
         <button class="btn btn-refresh" *ngIf="selectedTab !== 'overview'" (click)="refreshCurrentTab()" [disabled]="isRefreshing" title="Refresh Ticket">
           <i class="fas fa-sync-alt" [class.spinning]="isRefreshing"></i>
-          <span>Refresh Ticket</span>
         </button>
         <button *ngIf="selectedTickets.size > 0 && isAdmin"
                 class="btn btn-bulk-assign"
