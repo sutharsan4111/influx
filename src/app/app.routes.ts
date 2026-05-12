@@ -48,11 +48,6 @@ export const routes: Routes = [
           import('./admin/admin.component').then(m => m.AdminComponent)
       },
       {
-        path: 'admin/report',
-        loadComponent: () =>
-          import('./admin/report.component').then(m => m.ReportComponent)
-      },
-      {
         path: 'admin/user-roles',
         loadComponent: () =>
           import('./admin/user-roles.component').then(m => m.UserRolesComponent)

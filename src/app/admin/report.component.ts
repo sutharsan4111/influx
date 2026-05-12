@@ -1,4 +1,4 @@
-import { Component, OnInit, ViewChild, ElementRef, AfterViewInit } from '@angular/core';
+import { Component, OnInit, ViewChild, ElementRef, AfterViewInit, Input } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { firstValueFrom } from 'rxjs';
@@ -87,40 +87,6 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
   imports: [CommonModule, FormsModule],
   template: `
     <div class="report-page">
-      <div class="top-bar"></div>
-
-      <!-- ── Header ── -->
-      <div class="page-header">
-        <div class="header-left">
-          <h2>Performance Report</h2>
-        </div>
-        <div class="header-actions">
-          <div class="date-filters">
-            <label>
-              <span>Period</span>
-              <select [(ngModel)]="selectedPeriod" (ngModelChange)="onPeriodChange()">
-                <option value="custom">Custom</option>
-                <option value="monthly">Monthly</option>
-                <option value="quarterly">Quarterly</option>
-                <option value="halfyearly">Half-Yearly</option>
-                <option value="annual">Annual</option>
-              </select>
-            </label>
-            <label><span>From</span><input type="date" [(ngModel)]="startDate" (ngModelChange)="onDateInputChange()" /></label>
-            <label><span>To</span><input type="date" [(ngModel)]="endDate" (ngModelChange)="onDateInputChange()" /></label>
-          </div>
-          <div class="btn-row">
-            <button class="btn" (click)="applyDateRange()" [disabled]="loading">
-              Apply
-            </button>
-            <button class="btn btn-primary" (click)="downloadExcel()" [disabled]="loading || summaryRows.length === 0">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Export Excel
-            </button>
-          </div>
-        </div>
-      </div>
-
       <!-- ── Notices ── -->
       <div class="notice warn" *ngIf="!isAdmin">You do not have access to this report.</div>
       <div class="notice err"  *ngIf="error && isAdmin">{{ error }}</div>
@@ -152,7 +118,7 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
           </div>
           <div>
             <div class="metric-value">{{ slaCompliance }}%</div>
-            <div class="metric-label">SLA Compliance</div>
+            <div class="metric-label">Critical Compliance</div>
             <div class="metric-sub">Resolved within 24h</div>
           </div>
         </div>
@@ -228,21 +194,21 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
         </div>
       </div>
 
-      <!-- ── SLA & Quality (24h Target) ── -->
+      <!-- ── Critical & Quality (24h Target) ── -->
       <div class="section" *ngIf="!loading && slaByMember.length > 0">
-        <div class="sla-kicker"><span class="sla-kicker-dot"></span>SLA & QUALITY</div>
+        <div class="sla-kicker"><span class="sla-kicker-dot"></span>CRITICAL & QUALITY</div>
         <div class="sla-shell">
-          <h3 class="sla-main-title">SLA Compliance (24h Target)</h3>
+          <h3 class="sla-main-title">Critical Compliance (24h Target)</h3>
 
           <div class="sla-grid">
             <div class="sla-overall-card">
               <div class="sla-overall-value">{{ slaCompliance }}%</div>
-              <div class="sla-overall-label">Overall SLA Compliance</div>
+              <div class="sla-overall-label">Overall Critical Compliance</div>
               <div class="sla-overall-sub">{{ slaWithinTargetCount }} of {{ closedCount }} tickets within 24h</div>
             </div>
 
             <div class="sla-member-card">
-              <div class="sla-member-title">SLA % by Team Member</div>
+              <div class="sla-member-title">Critical % by Team Member</div>
               <div class="sla-axis">
                 <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
               </div>
@@ -442,7 +408,7 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
           </div>
           <span class="detail-count">{{ detailRows.length }} tickets</span>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap detail-table-wrap">
           <table class="report-table">
             <thead><tr>
               <th>Ticket #</th><th>Category</th><th>Primary Assignee</th>
@@ -478,12 +444,6 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
       background: #f5f8ff;
       color: #0f172a;
       padding-bottom: 40px;
-    }
-
-    /* ── Top gradient bar ── */
-    .top-bar {
-      height: 3px;
-      background: linear-gradient(to right, #06b6d4, #8b5cf6, #f43f5e);
     }
 
     /* ── Header ── */
@@ -765,7 +725,7 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
     .bar-key.assigned { background: rgba(37,99,235,.8); }
     .bar-key.total    { background: rgba(5,150,105,.45); }
 
-    /* ── SLA block ── */
+    /* ── Critical block ── */
     .sla-kicker {
       display: inline-flex;
       align-items: center;
@@ -930,6 +890,16 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
 
     /* ── Tables ── */
     .table-wrap { overflow-x: auto; border-radius: 10px; border: 1px solid #e2e8f0; background: #ffffff; }
+    .detail-table-wrap {
+      max-height: 1040px;
+      overflow-y: auto;
+    }
+    .detail-table-wrap .report-table thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #f8fafc;
+    }
     .report-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
     .report-table th {
       background: #f8fafc;
@@ -1147,7 +1117,7 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
     :host-context(body.dark-theme) .empty-state { color: #94a3b8; }
     :host-context(body.dark-theme) .bar-legend  { color: #94a3b8; }
 
-    /* SLA block */
+    /* Critical block */
     :host-context(body.dark-theme) .sla-shell {
       background: #1e293b;
       border-color: #334155;
@@ -1198,6 +1168,9 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
       background: #1e293b;
       border-color: #334155;
     }
+    :host-context(body.dark-theme) .detail-table-wrap .report-table thead th {
+      background: #0b1220;
+    }
     :host-context(body.dark-theme) .report-table th {
       background: #0b1220;
       color: #cbd5e1;
@@ -1237,6 +1210,8 @@ export class ReportComponent implements OnInit, AfterViewInit {
   @ViewChild('resolutionChart') resolutionChartRef!: ElementRef<HTMLCanvasElement>;
   @ViewChild('monthlyTrendChart') monthlyTrendChartRef!: ElementRef<HTMLCanvasElement>;
 
+  @Input() isEmbedded = false;
+
   groupEmail = 'cloudops@muraai.com';
   startDate = '';
   endDate = '';
@@ -1252,7 +1227,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   detailRows: DetailRow[] = [];
   categoryData: CategoryData[] = [];
 
-  // Resolution & SLA metrics
+  // Resolution & Critical metrics
   slaCompliance = 0;
   resolvedPct = 0;
   avgResolutionHours = 0;
@@ -1278,6 +1253,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   memberAvgResolutionMap: Record<string, number> = {};
 
   private readonly reportCacheKey = 'ITSMS_REPORT_CACHE';
+  private static readonly REPORT_CACHE_TTL_MS = 10 * 60 * 1000;
 
   private chartColors = [
     '#06b6d4', '#8b5cf6', '#f43f5e', '#f59e0b',
@@ -1331,11 +1307,11 @@ export class ReportComponent implements OnInit, AfterViewInit {
 
   get topPerformersText(): string {
     if (this.topSlaPerformers.length === 0) {
-      return 'No SLA data available in this date range.';
+      return 'No Critical data available in this date range.';
     }
     return this.topSlaPerformers
       .map(row => `${row.displayName || row.email} (${row.sla}%)`)
-      .join(', ') + ' consistently meet SLA targets';
+      .join(', ') + ' consistently meet Critical targets';
   }
 
   get actionRequiredText(): string {
@@ -1356,7 +1332,15 @@ export class ReportComponent implements OnInit, AfterViewInit {
     this.applyPresetDateRange('monthly');
 
     if (this.isAdmin) {
-      this.loadReport();
+      const loadedFromCache = this.loadReportFromCache(true);
+      if (loadedFromCache) {
+        // Keep UI instant and refresh in background when cache is stale.
+        queueMicrotask(() => {
+          this.loadReport(true, true);
+        });
+      } else {
+        this.loadReport();
+      }
     }
   }
 
@@ -1374,13 +1358,17 @@ export class ReportComponent implements OnInit, AfterViewInit {
 
   applyDateRange(): void {
     sessionStorage.removeItem(this.reportCacheKey);
-    this.loadReport();
+    this.loadReport(true);
   }
 
-  async loadReport(): Promise<void> {
+  async loadReport(forceRefresh = false, silent = false): Promise<void> {
     if (!this.isAdmin) return;
 
-    this.loading = true;
+    if (!forceRefresh && this.loadReportFromCache()) {
+      return;
+    }
+
+    this.loading = !silent;
     this.error = '';
 
     try {
@@ -1459,7 +1447,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       'Total Tickets': this.detailRows.length,
       'Closed Tickets': this.closedCount,
       'Resolved %': this.resolvedPct + '%',
-      'SLA Compliance (within 24h)': this.slaCompliance + '%',
+      'Critical Compliance (within 24h)': this.slaCompliance + '%',
       'Avg Resolution Time (h)': this.avgResolutionHours
     }]);
 
@@ -1552,7 +1540,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
         Email: row.email,
         'Closed Tickets': row.tickets,
         'Within 24h': row.withinTarget,
-        'SLA %': row.sla
+        'Critical %': row.sla
       }))
     );
 
@@ -1567,7 +1555,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
     XLSX.utils.book_append_sheet(workbook, qualitySheet, 'Resolution Distribution');
     XLSX.utils.book_append_sheet(workbook, reopenedSheet, 'Reopened by Owner');
     XLSX.utils.book_append_sheet(workbook, topRequesterSheet, 'Top Requesters');
-    XLSX.utils.book_append_sheet(workbook, slaByMemberSheet, 'SLA by Member');
+    XLSX.utils.book_append_sheet(workbook, slaByMemberSheet, 'Critical by Member');
 
     const filename = `cloudops-report-${this.startDate}-to-${this.endDate}.xlsx`;
     XLSX.writeFile(workbook, filename);
@@ -1669,7 +1657,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       }
     });
 
-    // Compute resolution & SLA metrics
+    // Compute resolution & Critical metrics
     const slaThreshold = 24;
     this.closedCount = allResolutionHours.length;
     this.slaWithinTargetCount = allResolutionHours.filter(h => h <= slaThreshold).length;
@@ -1709,8 +1697,16 @@ export class ReportComponent implements OnInit, AfterViewInit {
       .filter(row => row.ticketCount > 0)
       .sort((a, b) => a.avgHours - b.avgHours);
 
+    // Get fastest responders (lowest avg hours) - top 5
     this.fastestResponders = responseRows.slice(0, 5);
-    this.needsImprovementResponders = [...responseRows].reverse().slice(0, 5);
+    
+    // Get needs improvement (highest avg hours) - exclude those already in fastest responders
+    const fastestEmails = new Set(this.fastestResponders.map(r => r.email));
+    this.needsImprovementResponders = responseRows
+      .filter(r => !fastestEmails.has(r.email))
+      .reverse()
+      .slice(0, 5);
+    this.sanitizeResponderBuckets();
     this.memberAvgResolutionMap = Object.fromEntries(responseRows.map(row => [row.email, row.avgHours]));
 
     this.slaByMember = Array.from(closerResolutionMap.entries())
@@ -1728,8 +1724,13 @@ export class ReportComponent implements OnInit, AfterViewInit {
       })
       .sort((a, b) => b.sla - a.sla);
 
+    // Top performers: highest SLA (top 3 unique)
     this.topSlaPerformers = this.slaByMember.slice(0, 3);
+    
+    // Action required: lowest SLA (bottom 3 unique), excluding top performers
+    const topPerformerEmails = new Set(this.topSlaPerformers.map(p => p.email));
     this.slaActionRequired = [...this.slaByMember]
+      .filter(row => !topPerformerEmails.has(row.email))
       .reverse()
       .slice(0, 3)
       .sort((a, b) => a.sla - b.sla);
@@ -1884,13 +1885,13 @@ export class ReportComponent implements OnInit, AfterViewInit {
     ctx.fillStyle = this.isDark ? '#1e293b' : '#ffffff';
     ctx.fill();
 
-    ctx.fillStyle = this.isDark ? '#f1f5f9' : '#0f172a';
+    ctx.fillStyle = this.isDark ? '#e2e8f0' : '#0f172a';
     ctx.font = 'bold 22px Segoe UI, Arial, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(total.toString(), centerX, centerY - 8);
     ctx.font = '12px Segoe UI, Arial, sans-serif';
-    ctx.fillStyle = this.isDark ? '#94a3b8' : '#64748b';
+    ctx.fillStyle = this.isDark ? '#cbd5e1' : '#64748b';
     ctx.fillText('Total', centerX, centerY + 12);
   }
 
@@ -1942,7 +1943,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       ctx.fillText(label, pL - 6, y + barH / 2);
 
       // Count
-      ctx.fillStyle = this.isDark ? '#f1f5f9' : '#0f172a';
+      ctx.fillStyle = this.isDark ? '#e2e8f0' : '#0f172a';
       ctx.font = 'bold 12px Segoe UI, Arial, sans-serif';
       ctx.textAlign = 'left';
       ctx.fillText((row.assignedCount + row.closedCount).toString(), pL + totalW + 5, y + barH / 2);
@@ -1985,7 +1986,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       ctx.fillText(label, pL - 6, y + barH / 2);
 
       // Value label
-      ctx.fillStyle = this.isDark ? '#f1f5f9' : '#0f172a';
+      ctx.fillStyle = this.isDark ? '#e2e8f0' : '#0f172a';
       ctx.font = 'bold 11px Segoe UI, Arial, sans-serif';
       ctx.textAlign = 'left';
       ctx.fillText(row.avgHours + 'h', pL + barW + 5, y + barH / 2);
@@ -2045,7 +2046,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       ctx.arc(x, y, 3.5, 0, Math.PI * 2);
       ctx.fill();
 
-      ctx.fillStyle = this.isDark ? '#94a3b8' : '#64748b';
+      ctx.fillStyle = this.isDark ? '#cbd5e1' : '#64748b';
       ctx.font = '11px Segoe UI, Arial, sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(point.month, x, h - 12);
@@ -2064,6 +2065,14 @@ export class ReportComponent implements OnInit, AfterViewInit {
     return '#f43f5e';
   }
 
+  private sanitizeResponderBuckets(): void {
+    if (!this.fastestResponders.length || !this.needsImprovementResponders.length) return;
+
+    const fastestEmails = new Set(this.fastestResponders.map(row => row.email));
+    this.needsImprovementResponders = this.needsImprovementResponders
+      .filter(row => !fastestEmails.has(row.email));
+  }
+
   private normalizeCategory(category?: string): string {
     const trimmed = (category || '').trim();
     if (!trimmed) return 'Uncategorized';
@@ -2080,7 +2089,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
     return trimmed;
   }
 
-  private loadReportFromCache(): boolean {
+  private loadReportFromCache(allowStale = false): boolean {
     try {
       const raw = sessionStorage.getItem(this.reportCacheKey);
       if (!raw) return false;
@@ -2088,6 +2097,11 @@ export class ReportComponent implements OnInit, AfterViewInit {
       const cache = JSON.parse(raw);
       if (!cache || cache.groupEmail !== this.groupEmail) return false;
       if (cache.startDate !== this.startDate || cache.endDate !== this.endDate) return false;
+      if (!allowStale) {
+        if (!cache.timestamp || (Date.now() - cache.timestamp) > ReportComponent.REPORT_CACHE_TTL_MS) {
+          return false;
+        }
+      }
 
       this.summaryRows = cache.summaryRows || [];
       this.detailRows = cache.detailRows || [];
@@ -2105,6 +2119,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       this.monthlyTrendData = cache.monthlyTrendData || [];
       this.fastestResponders = cache.fastestResponders || [];
       this.needsImprovementResponders = cache.needsImprovementResponders || [];
+      this.sanitizeResponderBuckets();
       this.resolutionDistribution = cache.resolutionDistribution || [];
       this.reopenedByOwner = cache.reopenedByOwner || [];
       this.topRequesters = cache.topRequesters || [];
@@ -2132,6 +2147,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   private saveReportToCache(): void {
     try {
       const payload = {
+        timestamp: Date.now(),
         groupEmail: this.groupEmail,
         startDate: this.startDate,
         endDate: this.endDate,

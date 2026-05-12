@@ -367,7 +367,7 @@ export class RecycleBinComponent implements OnInit {
 
   priorityLabel(priority?: string): string {
     const value = (priority || '').toLowerCase();
-    if (value.includes('sla') || value.includes('critical') || value.includes('urgent')) return 'SLA';
+    if (value.includes('sla') || value.includes('critical') || value.includes('urgent')) return 'Critical';
     if (value.includes('high')) return 'High';
     if (value.includes('medium')) return 'Medium';
     if (value.includes('low')) return 'Low';

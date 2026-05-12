@@ -12,15 +12,23 @@ import { MessageService } from '../services/message.service';
 import { MsalService } from '../services/msal.service';
 import { IhubService } from '../services/ihub.service';
 import { SslService } from '../services/ssl.service';
+import { DashboardComponent } from '../dashboard/dashboard.component';
 
 @Component({
   selector: 'app-tickets',
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, DashboardComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="ticket-tabs">
       <div class="tab-left">
+        <div
+          class="tab"
+          [class.active]="selectedTab === 'overview'"
+          (click)="switchTab('overview')">
+          Overview
+        </div>
+
         <div
           class="tab"
           [class.active]="selectedTab === 'open'"
@@ -48,8 +56,9 @@ import { SslService } from '../services/ssl.service';
       </div>
 
       <div class="tab-right">
-        <button class="btn btn-refresh" (click)="refreshCurrentTab()" [disabled]="isRefreshing" title="Refresh">
+        <button class="btn btn-refresh" *ngIf="selectedTab !== 'overview'" (click)="refreshCurrentTab()" [disabled]="isRefreshing" title="Refresh Ticket">
           <i class="fas fa-sync-alt" [class.spinning]="isRefreshing"></i>
+          <span>Refresh Ticket</span>
         </button>
         <button *ngIf="selectedTickets.size > 0 && isAdmin"
                 class="btn btn-bulk-assign"
@@ -79,11 +88,14 @@ import { SslService } from '../services/ssl.service';
         </div>
       </div>
     </div>
-    <div class="loading" *ngIf="loadingService.loading$ | async">
+
+    <app-dashboard *ngIf="selectedTab === 'overview'" class="embedded-overview" [isEmbeddedMode]="true"></app-dashboard>
+
+    <div class="loading" *ngIf="(loadingService.loading$ | async) && selectedTab !== 'overview'">
   Loading tickets...
 </div>
 
-    <div class="table-wrap" *ngIf="filteredTickets.length > 0; else noTickets">
+    <div class="table-wrap" *ngIf="filteredTickets.length > 0 && selectedTab !== 'overview'; else noTickets">
       <table class="tickets-table">
         <thead>
           <tr>
@@ -190,7 +202,7 @@ import { SslService } from '../services/ssl.service';
     </div>
 
     <ng-template #noTickets>
-      <div class="no-tickets">
+      <div class="no-tickets" *ngIf="selectedTab !== 'overview'">
         <div *ngIf="searchTerm" class="empty-search">
           <i class="fas fa-search"></i>
           <p>No tickets match "{{ searchTerm }}"</p>
@@ -203,7 +215,7 @@ import { SslService } from '../services/ssl.service';
       </div>
     </ng-template>
 
-    <div class="pagination-controls" *ngIf="filteredTickets.length > 0 && !searchTerm">
+    <div class="pagination-controls" *ngIf="filteredTickets.length > 0 && !searchTerm && selectedTab !== 'overview'">
       <button (click)="prevPage()" 
               [disabled]="selectedTab === 'my' ? 
                 (myStatus === 'open' ? myTicketsOpenPage === 1 : myTicketsClosedPage === 1) : 
@@ -724,7 +736,7 @@ import { SslService } from '../services/ssl.service';
       white-space: nowrap;
     }
 
-    /* SLA Priority - Critical (needle far right) */
+    /* Critical Priority (needle far right) */
     .priority-indicator.priority-sla {
       color: #dc2626;
     }
@@ -1500,7 +1512,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   tickets: Ticket[] = [];
   filteredTickets: Ticket[] = [];
 
-  selectedTab: 'open' | 'closed' | 'my' = 'open';
+  selectedTab: 'open' | 'closed' | 'my' | 'overview' = 'overview';
   myStatus: 'open' | 'closed' = 'open';
   currentPage = 1;
   limit = 25;
@@ -1544,7 +1556,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   updatePriority = '';
 
   statusOptions = ['Open', 'In Progress', 'Resolved', 'Closed'];
-  priorityOptions = ['SLA', 'High', 'Medium', 'Low'];
+  priorityOptions = ['Critical', 'High', 'Medium', 'Low'];
 
   // ================= ASSIGNMENT STATE =================
   showAssignDialog = false;
@@ -1580,9 +1592,11 @@ export class TicketsComponent implements OnInit, OnDestroy {
     await this.initCurrentUser();
 
     const dashboardStatus = (this.route.snapshot.queryParamMap.get('status') || '').toLowerCase().trim();
+    const requestedTab = (this.route.snapshot.queryParamMap.get('tab') || '').toLowerCase().trim();
+    const requestedMyStatus = (this.route.snapshot.queryParamMap.get('myStatus') || '').toLowerCase().trim();
     
     // 🔥 Restore tab state from sessionStorage (persists across refresh/back navigation)
-    const savedTab = sessionStorage.getItem('ITSM_SELECTED_TAB') as 'open' | 'closed' | 'my' | null;
+    const savedSelectedTab = sessionStorage.getItem('ITSM_SELECTED_TAB') as 'open' | 'closed' | 'my' | 'overview' | null;
     const savedMyStatus = sessionStorage.getItem('ITSM_MY_STATUS') as 'open' | 'closed' | null;
 
     // If we came from dashboard card click, override saved tab and apply matching filter.
@@ -1590,17 +1604,35 @@ export class TicketsComponent implements OnInit, OnDestroy {
       this.applyDashboardNavigationFilter(dashboardStatus);
       sessionStorage.setItem('ITSM_SELECTED_TAB', this.selectedTab);
       sessionStorage.setItem('ITSM_MY_STATUS', this.myStatus);
-    } else {
-      if (savedTab && ['open', 'closed', 'my'].includes(savedTab)) {
-        this.selectedTab = savedTab;
-      } else {
-        // Set default tab based on user role
-        this.selectedTab = this.isAdmin ? 'open' : 'my';
+    } else if (requestedTab) {
+      const allowedTabs: Array<'open' | 'closed' | 'my' | 'overview'> = this.isAdmin
+        ? ['overview', 'open', 'closed', 'my']
+        : ['overview', 'my'];
+      const parsedTab = requestedTab as 'open' | 'closed' | 'my' | 'overview';
+      this.selectedTab = allowedTabs.includes(parsedTab) ? parsedTab : 'overview';
+
+      if (this.selectedTab === 'my') {
+        if (requestedMyStatus === 'closed' || requestedMyStatus === 'open') {
+          this.myStatus = requestedMyStatus;
+        } else if (savedMyStatus && ['open', 'closed'].includes(savedMyStatus)) {
+          this.myStatus = savedMyStatus;
+        }
       }
+
+      sessionStorage.setItem('ITSM_SELECTED_TAB', this.selectedTab);
+      sessionStorage.setItem('ITSM_MY_STATUS', this.myStatus);
+    } else {
+      const allowedTabs: Array<'open' | 'closed' | 'my' | 'overview'> = this.isAdmin
+        ? ['overview', 'open', 'closed', 'my']
+        : ['overview', 'my'];
+      this.selectedTab = (savedSelectedTab && allowedTabs.includes(savedSelectedTab)) ? savedSelectedTab : 'overview';
 
       if (savedMyStatus && ['open', 'closed'].includes(savedMyStatus)) {
         this.myStatus = savedMyStatus;
       }
+
+      sessionStorage.setItem('ITSM_SELECTED_TAB', this.selectedTab);
+      sessionStorage.setItem('ITSM_MY_STATUS', this.myStatus);
     }
     
     // Load assignments in background; do not block first paint.
@@ -1671,7 +1703,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     this.searchTerm$.next(value || '');
   }
 
-  switchTab(tab: 'open' | 'closed' | 'my'): void {
+  switchTab(tab: 'open' | 'closed' | 'my' | 'overview'): void {
     if (this.selectedTab === tab) return;
     this.dashboardQuickFilter = 'all';
     
@@ -2159,7 +2191,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       return;
     }
 
-    if (status === 'sla') {
+    if (status === 'sla' || status === 'critical') {
       this.selectedTab = 'my';
       this.myStatus = 'open';
       this.dashboardQuickFilter = 'sla';
@@ -2442,7 +2474,12 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
     // Admin can view all tickets
     if (this.isAdmin) {
-      this.router.navigate(['/tickets', ticketId]);
+      this.router.navigate(['/tickets', ticketId], {
+        queryParams: {
+          tab: this.selectedTab,
+          myStatus: this.myStatus
+        }
+      });
       return;
     }
 
@@ -2455,7 +2492,12 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     // Check if the ticket belongs to the user
     const ticket = this.filteredTickets.find(t => (t.id || t.ticketId) === ticketId);
     if (ticket && this.isMyTicket(ticket)) {
-      this.router.navigate(['/tickets', ticketId]);
+      this.router.navigate(['/tickets', ticketId], {
+        queryParams: {
+          tab: this.selectedTab,
+          myStatus: this.myStatus
+        }
+      });
     } else {
       this.messageService.error('You do not have permission to view this ticket');
     }
@@ -2484,7 +2526,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   priorityLabel(priority?: string): string {
     const value = (priority || '').trim().toLowerCase();
     if (!value) return '—';
-    if (value.includes('sla') || value.includes('urgent') || value.includes('critical')) return 'SLA';
+    if (value.includes('sla') || value.includes('urgent') || value.includes('critical')) return 'Critical';
     if (value.includes('high')) return 'High';
     if (value.includes('medium')) return 'Medium';
     if (value.includes('low')) return 'Low';

@@ -17,379 +17,980 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
   imports: [CommonModule, ReactiveFormsModule, RouterModule],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
-    <div class="wrap" *ngIf="!loading; else loadingTpl">
+    <div class="page-wrap" *ngIf="!loading; else loadingTpl">
 
-      <!-- HEADER -->
-      <div class="hdr">
-        <div class="left">
-          <button class="back" (click)="back()">← Back</button>
-          <span class="pill" [ngClass]="statusClass(ticket?.status)">
-            {{ ticket?.status || '—' }}
+      <!-- ── TOP ACTION BAR ── -->
+      <div class="top-bar">
+        <div class="breadcrumb">
+          <button class="bc-link" (click)="navigateTo('/dashboard')">
+            <i class="fas fa-home"></i> Dashboard
+          </button>
+          <i class="fas fa-chevron-right bc-sep"></i>
+          <button class="bc-link" (click)="back()">
+            <i class="fas fa-ticket-alt"></i> Tickets
+          </button>
+          <i class="fas fa-chevron-right bc-sep"></i>
+          <span class="bc-current">#{{ ticket?.ticketNumber || ticket?.id || '—' }}</span>
+        </div>
+        <div class="top-actions">
+          <button class="ta-btn primary" (click)="navigateTo('/create-ticket')">
+            <i class="fas fa-plus-circle"></i>
+            <span>New Ticket</span>
+          </button>
+          <button class="ta-btn" (click)="back()">
+            <i class="fas fa-list"></i>
+            <span>All Tickets</span>
+          </button>
+          <button class="ta-btn icon-only" (click)="reload()" title="Refresh">
+            <i class="fas fa-sync-alt"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- ── TICKET HEADER CARD ── -->
+      <div class="ticket-hdr-card">
+        <div class="thc-top">
+          <div class="thc-badges">
+            <span class="t-number"># {{ ticket?.ticketNumber || ticket?.id || '—' }}</span>
+            <span class="status-pill" [ngClass]="statusClass(ticket?.status)">{{ ticket?.status || '—' }}</span>
+            <span class="priority-pill" [ngClass]="priorityClass(ticket?.priority)">
+              <i class="fas fa-flag"></i> {{ priorityLabel(ticket?.priority) }}
+            </span>
+            <span class="channel-pill" *ngIf="ticket?.channel">
+              <i class="fas fa-satellite-dish"></i> {{ ticket?.channel }}
+            </span>
+          </div>
+        </div>
+        <h1 class="thc-subject">{{ ticket?.subject || 'No Subject' }}</h1>
+        <div class="thc-meta">
+          <span><i class="fas fa-user-circle"></i> {{ contactName() }}</span>
+          <span *ngIf="ticket?.email"><i class="fas fa-envelope"></i> {{ ticket?.email }}</span>
+          <span><i class="fas fa-calendar-plus"></i> {{ ticket?.createdTime | date:'MMM d, y, h:mm a' }}</span>
+          <span *ngIf="ticket?.dueDate" class="due-date">
+            <i class="fas fa-calendar-check"></i> Due {{ ticket?.dueDate | date:'MMM d, y' }}
           </span>
         </div>
-
-        <div class="actions">
-          <button class="btn" (click)="reload()">⟳</button>
-        </div>
       </div>
 
-      <div class="subject">
-        <h2>{{ ticket?.subject || 'No subject' }}</h2>
-        <div class="meta">
-          Ticket # {{ ticket?.ticketNumber || ticket?.id || '—' }}
-        </div>
-      </div>
+      <!-- ── BODY LAYOUT ── -->
+      <div class="body-layout">
 
-      <!-- BODY -->
-      <div class="body">
-        <main class="main">
+        <!-- ── MAIN COLUMN ── -->
+        <main class="main-col">
 
-          <!-- THREADS - Show for all tickets with conversations -->
-          <section class="msgs" *ngIf="threads.length > 0">
-
-            <article *ngFor="let t of threads" class="msg">
-              <div class="mh">
-                <div class="av">
-                  {{ (t.authorName || 'U').charAt(0).toUpperCase() }}
-                </div>
-                <div>
-                  <div class="who">{{ t.authorName }}</div>
-                  <div class="when">{{ t.createdTime | date:'MMM d, y, h:mm a' }}</div>
-                </div>
+          <!-- Conversation Thread -->
+          <div class="card conversation-card" *ngIf="threads.length > 0">
+            <div class="card-hdr">
+              <div class="card-hdr-left">
+                <i class="fas fa-comments"></i>
+                <span>Conversation</span>
+                <span class="count-badge">{{ threads.length }}</span>
               </div>
-
-              <div class="mb" [innerHTML]="renderContent(t.content)"></div>
-              <div class="attachments" *ngIf="t.attachments?.length">
-                <div class="attachment" *ngFor="let a of t.attachments">
-                  <span class="att-name">{{ a.fileName || a.name || a.id }}</span>
-                  <button type="button" class="att-link" (click)="openAttachment(a, 'preview')">Preview</button>
-                  <button type="button" class="att-link" (click)="openAttachment(a, 'download')">Download</button>
-                </div>
-              </div>
-            </article>
-
-          </section>
-
-          <!-- REPLY -->
-          <section class="reply">
-            <h4>Reply</h4>
-
-            <form [formGroup]="replyForm" (ngSubmit)="sendReply()">
-              <textarea
-                formControlName="body"
-                rows="4"
-                placeholder="Type your reply...">
-              </textarea>
-
-              <div class="reply-files">
-                <label class="file-btn">
-                  <input type="file" (change)="onReplyFilesSelected($event)" multiple />
-                  Add attachments
-                </label>
-                <div class="file-list" *ngIf="replyFiles.length">
-                  <div class="file-item" *ngFor="let file of replyFiles; let i = index">
-                    <span>{{ file.name }}</span>
-                    <button type="button" class="link" (click)="removeReplyFile(i)">Remove</button>
+            </div>
+            <div class="thread-list">
+              <div class="thread-item" *ngFor="let t of threads; let i = index">
+                <div class="thread-avatar">{{ (t.authorName || 'U').charAt(0).toUpperCase() }}</div>
+                <div class="thread-bubble">
+                  <div class="thread-meta">
+                    <span class="thread-author">{{ t.authorName }}</span>
+                    <span class="thread-time">{{ t.createdTime | date:'MMM d, y · h:mm a' }}</span>
+                  </div>
+                  <div class="thread-body" [innerHTML]="renderContent(t.content)"></div>
+                  <div class="att-list" *ngIf="t.attachments?.length">
+                    <div class="att-chip" *ngFor="let a of t.attachments">
+                      <i class="fas fa-paperclip"></i>
+                      <span class="att-name">{{ a.fileName || a.name || a.id }}</span>
+                      <button type="button" class="att-action" (click)="openAttachment(a, 'preview')">
+                        <i class="fas fa-eye"></i>
+                      </button>
+                      <button type="button" class="att-action" (click)="openAttachment(a, 'download')">
+                        <i class="fas fa-download"></i>
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
+            </div>
+          </div>
 
-              <div class="controls">
-                <label>
-                  <input type="radio" value="public" formControlName="visibility">
-                  Public reply
-                </label>
-
-                <label>
-                  <input type="radio" value="private" formControlName="visibility">
-                  Private note
-                </label>
+          <!-- Reply Form -->
+          <div class="card reply-card">
+            <div class="card-hdr">
+              <div class="card-hdr-left">
+                <i class="fas fa-reply"></i>
+                <span>Reply</span>
               </div>
-
-              <div class="btns">
-                <button type="submit"
-                        class="btn primary"
-                        [disabled]="replyForm.invalid || sending">
-                  {{ sending ? 'Sending...' : 'Send' }}
-                </button>
-              </div>
-            </form>
-          </section>
+            </div>
+            <div class="reply-body">
+              <form [formGroup]="replyForm" (ngSubmit)="sendReply()">
+                <div class="visibility-toggle">
+                  <label class="vis-opt" [class.active]="replyForm.value.visibility === 'public'">
+                    <input type="radio" value="public" formControlName="visibility">
+                    <i class="fas fa-globe"></i> Public Reply
+                  </label>
+                  <label class="vis-opt" [class.active]="replyForm.value.visibility === 'private'">
+                    <input type="radio" value="private" formControlName="visibility">
+                    <i class="fas fa-lock"></i> Private Note
+                  </label>
+                </div>
+                <textarea
+                  formControlName="body"
+                  rows="5"
+                  placeholder="Write your reply here...">
+                </textarea>
+                <div class="reply-footer">
+                  <div class="reply-attach-area">
+                    <label class="attach-label">
+                      <input type="file" (change)="onReplyFilesSelected($event)" multiple />
+                      <i class="fas fa-paperclip"></i> Attach Files
+                    </label>
+                    <div class="attached-files" *ngIf="replyFiles.length">
+                      <div class="attached-file" *ngFor="let file of replyFiles; let i = index">
+                        <i class="fas fa-file-alt"></i>
+                        <span>{{ file.name }}</span>
+                        <button type="button" class="rm-file" (click)="removeReplyFile(i)">
+                          <i class="fas fa-times"></i>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <button type="submit" class="send-btn" [disabled]="replyForm.invalid || sending">
+                    <i class="fas fa-paper-plane"></i>
+                    {{ sending ? 'Sending…' : 'Send Reply' }}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
 
         </main>
 
-        <!-- SIDE PANEL -->
-        <aside class="side">
-          <div class="panel">
-            <div class="row"><strong>Status</strong><span>{{ ticket?.status || '—' }}</span></div>
-            <div class="row" *ngIf="closedByText() as closedBy"><strong>Closed By</strong><span>{{ closedBy }}</span></div>
-            <div class="row"><strong>Priority</strong><span>{{ priorityLabel(ticket?.priority) }}</span></div>
-            <div class="row"><strong>Assigned To</strong><span>{{ assignedToText() }}</span></div>
-            <div class="row"><strong>Department</strong><span>{{ ticket?.departmentName || ticket?.departmentId || '—' }}</span></div>
-            <div class="row"><strong>Category</strong><span>{{ ticket?.category || '—' }}</span></div>
-            <div class="row"><strong>Sub-Category</strong><span>{{ ticket?.subCategory || '—' }}</span></div>
-          </div>
+        <!-- ── SIDE COLUMN ── -->
+        <aside class="side-col">
 
-          <div class="panel">
-            <div class="row"><strong>Contact</strong><span>{{ contactName() }}</span></div>
-            <div class="row"><strong>Email</strong><span>{{ ticket?.email || '—' }}</span></div>
-            <div class="row"><strong>Phone</strong><span>{{ ticket?.phone || ticket?.contact?.phone || '—' }}</span></div>
-          </div>
-
-          <div class="panel">
-            <div class="row"><strong>Created</strong><span>{{ ticket?.createdTime | date:'MMM d, y, h:mm a' }}</span></div>
-            <div class="row"><strong>Due</strong><span>{{ ticket?.dueDate | date:'MMM d, y, h:mm a' }}</span></div>
-            <div class="row"><strong>Channel</strong><span>{{ ticket?.channel || '—' }}</span></div>
-          </div>
-
-          <div class="panel" *ngIf="ticketAttachments.length">
-            <div class="row"><strong>Attachments</strong><span>{{ ticketAttachments.length }}</span></div>
-            <div class="attachments">
-              <div class="attachment" *ngFor="let a of ticketAttachments">
-                <span class="att-name">{{ a.fileName || a.name || a.id }}</span>
-                <button type="button" class="att-link" (click)="openAttachment(a, 'preview')">Preview</button>
-                <button type="button" class="att-link" (click)="openAttachment(a, 'download')">Download</button>
+          <!-- Ticket Details -->
+          <div class="card info-card">
+            <div class="card-hdr">
+              <div class="card-hdr-left"><i class="fas fa-info-circle"></i><span>Ticket Details</span></div>
+            </div>
+            <div class="info-body">
+              <div class="info-row">
+                <span class="info-label">Status</span>
+                <span class="status-pill sm" [ngClass]="statusClass(ticket?.status)">{{ ticket?.status || '—' }}</span>
+              </div>
+              <div class="info-row" *ngIf="closedByText() as closedBy">
+                <span class="info-label">Closed By</span>
+                <span class="info-value">{{ closedBy }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Priority</span>
+                <span class="priority-pill sm" [ngClass]="priorityClass(ticket?.priority)">{{ priorityLabel(ticket?.priority) }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Assigned To</span>
+                <span class="info-value assignee">
+                  <i class="fas fa-user-check"></i> {{ assignedToText() }}
+                </span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Department</span>
+                <span class="info-value">{{ ticket?.departmentName || ticket?.departmentId || '—' }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Category</span>
+                <span class="info-value">{{ ticket?.category || '—' }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Sub-Category</span>
+                <span class="info-value">{{ ticket?.subCategory || '—' }}</span>
               </div>
             </div>
           </div>
+
+          <!-- Contact Info -->
+          <div class="card info-card">
+            <div class="card-hdr">
+              <div class="card-hdr-left"><i class="fas fa-user"></i><span>Contact</span></div>
+            </div>
+            <div class="info-body">
+              <div class="info-row">
+                <span class="info-label">Name</span>
+                <span class="info-value">{{ contactName() }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Email</span>
+                <span class="info-value email-val">{{ ticket?.email || '—' }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Phone</span>
+                <span class="info-value">{{ ticket?.phone || ticket?.contact?.phone || '—' }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Timeline -->
+          <div class="card info-card">
+            <div class="card-hdr">
+              <div class="card-hdr-left"><i class="fas fa-calendar-alt"></i><span>Timeline</span></div>
+            </div>
+            <div class="info-body">
+              <div class="info-row">
+                <span class="info-label">Created</span>
+                <span class="info-value">{{ ticket?.createdTime | date:'MMM d, y, h:mm a' }}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Due Date</span>
+                <span class="info-value" [class.overdue]="ticket?.dueDate && isOverdue(ticket.dueDate)">
+                  {{ (ticket?.dueDate | date:'MMM d, y, h:mm a') || '—' }}
+                </span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Channel</span>
+                <span class="info-value">{{ ticket?.channel || '—' }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Attachments -->
+          <div class="card info-card" *ngIf="ticketAttachments.length">
+            <div class="card-hdr">
+              <div class="card-hdr-left">
+                <i class="fas fa-paperclip"></i>
+                <span>Attachments</span>
+                <span class="count-badge">{{ ticketAttachments.length }}</span>
+              </div>
+            </div>
+            <div class="info-body">
+              <div class="att-chip" *ngFor="let a of ticketAttachments">
+                <i class="fas fa-file-alt"></i>
+                <span class="att-name">{{ a.fileName || a.name || a.id }}</span>
+                <button type="button" class="att-action" (click)="openAttachment(a, 'preview')">
+                  <i class="fas fa-eye"></i>
+                </button>
+                <button type="button" class="att-action" (click)="openAttachment(a, 'download')">
+                  <i class="fas fa-download"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+
         </aside>
       </div>
     </div>
 
     <ng-template #loadingTpl>
-      <div class="loading">Loading ticket…</div>
+      <div class="loading-state">
+        <div class="ls-spinner"></div>
+        <p>Loading ticket…</p>
+      </div>
     </ng-template>
   `,
   styles: [`
-    :host { display:block;font-family:Arial,Helvetica,sans-serif;color:#222;font-size:13px }
-    .wrap { padding:8px }
-    .hdr { display:flex;justify-content:space-between;align-items:center;margin-bottom:6px }
-    .left { display:flex;align-items:center;gap:5px }
-    .back { background:none;border:none;color:#0b66d1;cursor:pointer;font-size:12px }
-    .pill { padding:3px 8px;border-radius:8px;font-size:11px;font-weight:600;color:#fff }
-    .pill.status-open { background:#0b66d1 }
-    .pill.status-inprogress { background:#f59e0b }
-    .pill.status-resolved { background:#059669 }
-    .pill.status-closed { background:#6b7280 }
-    .actions { display:flex;gap:4px }
-    .btn { padding:4px 10px;border-radius:4px;border:none;cursor:pointer;background:#eef1f5;font-size:12px }
-    .btn.primary { background:#0b66d1;color:#fff }
-    .body { display:flex;gap:10px }
-    .main { flex:1;min-width:0;overflow:hidden }
-    .side { width:220px;min-width:220px;flex-shrink:0 }
-    .subject { margin: 4px 0 8px }
-    .subject h2 { margin: 0 0 2px; font-size: 15px; font-weight: 600 }
-    .meta { color: #6b7280; font-size: 11px }
-    .desc { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px;margin-bottom:8px;overflow:hidden }
-    .desc h4 { margin:0 0 6px;font-size:12px;color:#374151 }
-    .desc-body { color:#1f2937;font-size:13px;line-height:1.6;word-break:break-word;overflow-wrap:anywhere;overflow-x:auto;max-width:100% }
-    :host ::ng-deep .desc-body img { max-width: 100%; height: auto; display: block; margin: 16px 0; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-    :host ::ng-deep .desc-body p { margin: 0 0 10px; }
-    :host ::ng-deep .desc-body p img { margin: 12px 0; }
-    :host ::ng-deep .desc-body p:last-child { margin-bottom: 0; }
-    :host ::ng-deep .desc-body a { color: #0b66d1; text-decoration: underline; transition: color 0.2s; }
-    :host ::ng-deep .desc-body a:hover { color: #1d4ed8; }
-    :host ::ng-deep .desc-body table { border-collapse: collapse; margin: 12px 0; max-width: 100%; }
-    :host ::ng-deep .desc-body table td, :host ::ng-deep .desc-body table th { padding: 8px; border: 1px solid #e5e7eb; white-space: nowrap; }
-    :host ::ng-deep .desc-body ol, :host ::ng-deep .desc-body ul { margin: 4px 0; padding-left: 24px; list-style-position: outside; }
-    :host ::ng-deep .desc-body ol { list-style-type: decimal; }
-    :host ::ng-deep .desc-body ul { list-style-type: disc; }
-    :host ::ng-deep .desc-body li { margin: 4px 0; }
+    /* ── Host & Layout ── */
+    :host {
+      display: block;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      color: #0f172a;
+      font-size: 13px;
+      background: #f8fafc;
+      min-height: 100%;
+    }
 
-    .panel { background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:10px }
-    .panel + .panel { margin-top: 8px }
-    .row { display:flex;flex-direction:column;gap:1px;margin-bottom:8px }
-    .row:last-child { margin-bottom:0 }
-    .row strong { color:#6b7280;font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:0.03em }
-    .row span { color:#111827;font-size:12px;word-break:break-word;overflow-wrap:anywhere }
-    .msg { background:#fbfdff;padding:8px;border-radius:6px;border:1px solid #e5e7eb;margin-bottom:8px }
-    .mh { display:flex;gap:6px;margin-bottom:6px;align-items:center }
-    .av { width:24px;height:24px;border-radius:50%;background:#e5edff;color:#0b66d1;
-          display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:10px;flex-shrink:0 }
-    .who { font-size:11px;font-weight:600 }
-    .when { font-size:9px;color:#6b7280 }
-    .mb {
+    .page-wrap {
+      padding: 0;
+      max-width: 100%;
+    }
+
+    /* ── Top Action Bar ── */
+    .top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .bc-link {
+      background: none;
+      border: none;
+      color: #3b82f6;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      padding: 3px 6px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .bc-link:hover { background: #eff6ff; color: #1d4ed8; }
+
+    .bc-sep {
+      color: #cbd5e1;
+      font-size: 10px;
+    }
+
+    .bc-current {
+      font-size: 12px;
+      font-weight: 600;
+      color: #475569;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .ta-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #374151;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.18s;
+      white-space: nowrap;
+    }
+
+    .ta-btn:hover {
+      border-color: #3b82f6;
+      color: #1d4ed8;
+      background: #eff6ff;
+    }
+
+    .ta-btn.primary {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #ffffff;
+    }
+
+    .ta-btn.primary:hover {
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+      color: #ffffff;
+    }
+
+    .ta-btn.icon-only {
+      padding: 7px 10px;
+    }
+
+    /* ── Ticket Header Card ── */
+    .ticket-hdr-card {
+      background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);
+      color: #ffffff;
+      padding: 16px 16px 14px;
+      margin-bottom: 0;
+    }
+
+    .thc-top { margin-bottom: 8px; }
+
+    .thc-badges {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .t-number {
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(255,255,255,0.18);
+      padding: 3px 8px;
+      border-radius: 4px;
+      letter-spacing: 0.5px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: capitalize;
+      letter-spacing: 0.02em;
+    }
+
+    .status-pill.status-open { background: #dbeafe; color: #1d4ed8; }
+    .status-pill.status-inprogress { background: #fef3c7; color: #b45309; }
+    .status-pill.status-resolved { background: #dcfce7; color: #15803d; }
+    .status-pill.status-closed { background: #f1f5f9; color: #475569; }
+
+    /* Ticket header card - white pills on blue bg */
+    .ticket-hdr-card .status-pill.status-open { background: rgba(219,234,254,0.9); color: #1e3a8a; }
+    .ticket-hdr-card .status-pill.status-inprogress { background: rgba(254,243,199,0.9); color: #92400e; }
+    .ticket-hdr-card .status-pill.status-resolved { background: rgba(220,252,231,0.9); color: #14532d; }
+    .ticket-hdr-card .status-pill.status-closed { background: rgba(241,245,249,0.85); color: #475569; }
+
+    .priority-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .ticket-hdr-card .priority-pill.priority-sla { background: rgba(254,226,226,0.9); color: #991b1b; }
+    .ticket-hdr-card .priority-pill.priority-high { background: rgba(255,237,213,0.9); color: #9a3412; }
+    .ticket-hdr-card .priority-pill.priority-medium { background: rgba(254,249,195,0.9); color: #854d0e; }
+    .ticket-hdr-card .priority-pill.priority-low { background: rgba(220,252,231,0.9); color: #14532d; }
+    .ticket-hdr-card .priority-pill.priority-unknown { background: rgba(241,245,249,0.85); color: #475569; }
+
+    .priority-pill.priority-sla { background: #fee2e2; color: #dc2626; }
+    .priority-pill.priority-high { background: #ffedd5; color: #ea580c; }
+    .priority-pill.priority-medium { background: #fef3c7; color: #d97706; }
+    .priority-pill.priority-low { background: #dcfce7; color: #16a34a; }
+    .priority-pill.priority-unknown { background: #f1f5f9; color: #64748b; }
+
+    .status-pill.sm, .priority-pill.sm {
+      font-size: 10.5px;
+      padding: 2px 8px;
+    }
+
+    .channel-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(255,255,255,0.18);
+      padding: 3px 8px;
+      border-radius: 20px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    .thc-subject {
+      font-size: 18px;
+      font-weight: 700;
+      margin: 8px 0 10px;
+      color: #ffffff;
+      line-height: 1.35;
+    }
+
+    .thc-meta {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 11.5px;
+      color: rgba(255,255,255,0.8);
+    }
+
+    .thc-meta i { margin-right: 3px; opacity: 0.8; }
+
+    .due-date { color: #fde68a; }
+
+    /* ── Body Layout ── */
+    .body-layout {
+      display: grid;
+      grid-template-columns: 1fr 248px;
+      gap: 12px;
+      padding: 12px;
+      align-items: start;
+    }
+
+    .main-col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .side-col {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+    }
+
+    .card-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid #f1f5f9;
+      background: #f8fafc;
+    }
+
+    .card-hdr-left {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #374151;
+    }
+
+    .card-hdr-left i { color: #3b82f6; font-size: 12px; }
+
+    .count-badge {
+      background: #dbeafe;
+      color: #1d4ed8;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 10px;
+    }
+
+    /* ── Conversation Thread ── */
+    .thread-list {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .thread-item {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+    }
+
+    .thread-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+
+    .thread-bubble {
+      flex: 1;
+      min-width: 0;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 0 10px 10px 10px;
+      padding: 10px 12px;
+    }
+
+    .thread-meta {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 6px;
+    }
+
+    .thread-author {
+      font-size: 12px;
+      font-weight: 700;
+      color: #1e293b;
+    }
+
+    .thread-time {
+      font-size: 10.5px;
+      color: #94a3b8;
+    }
+
+    .thread-body {
       word-break: break-word;
       overflow-wrap: anywhere;
-      line-height: 1.5;
+      line-height: 1.6;
       font-size: 13px;
       color: #1f2937;
-      padding: 4px 0;
     }
-    :host ::ng-deep .mb p { margin: 0 0 8px; }
-    :host ::ng-deep .mb p:last-child { margin-bottom: 0; }
-    :host ::ng-deep .mb a { color: #0b66d1; text-decoration: underline; }
-    :host ::ng-deep .mb img { max-width: 100%; height: auto; display: block; margin: 8px 0; }
-    :host ::ng-deep .mb table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 6px 0; }
-    :host ::ng-deep .mb td, :host ::ng-deep .mb th { border: 1px solid #e5e7eb; padding: 6px 8px; }
-    :host ::ng-deep .mb blockquote { border-left: 3px solid #d1d5db; margin: 8px 0; padding: 4px 10px; color: #6b7280; }
-    :host ::ng-deep .mb hr { border: none; border-top: 1px solid #e5e7eb; margin: 10px 0; }
-    :host ::ng-deep .mb ul, :host ::ng-deep .mb ol { margin: 4px 0; padding-left: 24px; list-style-position: outside; }
-    :host ::ng-deep .mb ol { list-style-type: decimal; }
-    :host ::ng-deep .mb ul { list-style-type: disc; }
-    :host ::ng-deep .mb li { margin: 4px 0; }
-    :host ::ng-deep .mb h1, :host ::ng-deep .mb h2, :host ::ng-deep .mb h3, :host ::ng-deep .mb h4, :host ::ng-deep .mb h5, :host ::ng-deep .mb h6 { margin: 8px 0 4px; }
-    .attachments { margin-top: 6px; display: grid; gap: 4px; }
-    .attachment {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      gap: 6px;
+
+    :host ::ng-deep .thread-body p { margin: 0 0 8px; }
+    :host ::ng-deep .thread-body p:last-child { margin-bottom: 0; }
+    :host ::ng-deep .thread-body a { color: #2563eb; text-decoration: underline; }
+    :host ::ng-deep .thread-body img { max-width: 100%; height: auto; display: block; margin: 8px 0; border-radius: 6px; }
+    :host ::ng-deep .thread-body table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 8px 0; }
+    :host ::ng-deep .thread-body td, :host ::ng-deep .thread-body th { border: 1px solid #e2e8f0; padding: 6px 8px; }
+    :host ::ng-deep .thread-body blockquote { border-left: 3px solid #cbd5e1; margin: 8px 0; padding: 4px 10px; color: #64748b; }
+    :host ::ng-deep .thread-body hr { border: none; border-top: 1px solid #e2e8f0; margin: 10px 0; }
+    :host ::ng-deep .thread-body ul, :host ::ng-deep .thread-body ol { margin: 4px 0; padding-left: 24px; list-style-position: outside; }
+    :host ::ng-deep .thread-body ol { list-style-type: decimal; }
+    :host ::ng-deep .thread-body ul { list-style-type: disc; }
+    :host ::ng-deep .thread-body li { margin: 4px 0; }
+    :host ::ng-deep .thread-body h1, :host ::ng-deep .thread-body h2, :host ::ng-deep .thread-body h3 { margin: 8px 0 4px; }
+
+    /* ── Attachment chips ── */
+    .att-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid #e2e8f0;
+    }
+
+    .att-chip {
+      display: flex;
       align-items: center;
-      font-size: 12px;
+      gap: 6px;
+      padding: 5px 8px;
+      background: #f1f5f9;
+      border-radius: 6px;
+      font-size: 11.5px;
     }
+
+    .att-chip i { color: #64748b; flex-shrink: 0; }
+
     .att-name {
-      color: #1f2937;
-      font-weight: 600;
+      flex: 1;
       min-width: 0;
       overflow-wrap: anywhere;
       white-space: normal;
+      color: #1e293b;
+      font-weight: 500;
     }
-    .att-link {
+
+    .att-action {
       background: none;
-      border: none;
-      color: #0b66d1;
+      border: 1px solid #e2e8f0;
+      color: #3b82f6;
+      cursor: pointer;
+      font-size: 11px;
+      padding: 3px 7px;
+      border-radius: 4px;
+      transition: all 0.15s;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+    }
+
+    .att-action:hover { background: #eff6ff; border-color: #3b82f6; }
+
+    /* ── Reply Card ── */
+    .reply-body { padding: 14px; }
+
+    .visibility-toggle {
+      display: flex;
+      gap: 0;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 10px;
+      width: fit-content;
+    }
+
+    .vis-opt {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
       cursor: pointer;
       font-size: 12px;
-      padding: 0;
-      text-decoration: underline;
+      font-weight: 500;
+      color: #64748b;
+      transition: all 0.15s;
+      border: none;
+      background: #f8fafc;
+      user-select: none;
+    }
+
+    .vis-opt input { display: none; }
+    .vis-opt:hover { color: #2563eb; background: #eff6ff; }
+    .vis-opt.active { color: #2563eb; background: #dbeafe; font-weight: 600; }
+    .vis-opt + .vis-opt { border-left: 1px solid #e2e8f0; }
+
+    textarea {
+      width: 100%;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      resize: vertical;
+      box-sizing: border-box;
+      font-family: inherit;
+      color: #1e293b;
+      transition: border-color 0.15s;
+    }
+
+    textarea:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,0.12);
+    }
+
+    .reply-footer {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+
+    .reply-attach-area { flex: 1; }
+
+    .attach-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border: 1px dashed #cbd5e1;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #3b82f6;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .attach-label input { display: none; }
+    .attach-label:hover { border-color: #3b82f6; background: #eff6ff; }
+
+    .attached-files {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 6px;
+    }
+
+    .attached-file {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      color: #374151;
+      background: #f1f5f9;
+      padding: 4px 8px;
+      border-radius: 5px;
+    }
+
+    .attached-file i { color: #3b82f6; }
+
+    .rm-file {
+      background: none;
+      border: none;
+      color: #ef4444;
+      cursor: pointer;
+      margin-left: auto;
+      padding: 0 2px;
+      font-size: 11px;
+    }
+
+    .send-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 20px;
+      background: #2563eb;
+      color: #ffffff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s;
       white-space: nowrap;
     }
-    .reply { margin-top: 8px }
-    .reply h4 { font-size:13px;margin:0 0 6px;font-weight:600 }
-    textarea { width:100%;border-radius:6px;border:1px solid #d1d5db;padding:8px;font-size:13px;resize:vertical }
-    .no-msg { background:#f3f5f7;border-radius:4px;padding:6px;text-align:center;color:#666;font-size:9px }
-    .reply-files { margin: 4px 0; }
-    .file-btn { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color:#0b66d1; cursor: pointer; }
-    .file-btn input { display: none; }
-    .file-list { margin-top: 3px; display: grid; gap: 3px; }
-    .file-item { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #475569; }
-    .link { background: none; border: none; color: #d32f2f; cursor: pointer; font-size: 12px; }
-    .controls { display:flex;gap:12px;margin:6px 0;font-size:12px }
-    .btns { margin-top:6px }
-    @media(max-width:900px){ .body{flex-direction:column}.side{width:100%;min-width:unset} }
+
+    .send-btn:hover:not(:disabled) { background: #1d4ed8; }
+    .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Info Cards (sidebar) ── */
+    .info-card .card-hdr { background: #ffffff; }
+    .info-card .card-hdr-left { font-size: 12px; }
+
+    .info-body {
+      padding: 10px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .info-row {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .info-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .info-value {
+      font-size: 12.5px;
+      color: #1e293b;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+
+    .info-value.assignee {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      color: #2563eb;
+    }
+
+    .info-value.email-val { color: #2563eb; }
+
+    .info-value.overdue { color: #dc2626; font-weight: 600; }
+
+    /* ── Loading State ── */
+    .loading-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 64px 24px;
+      gap: 16px;
+      color: #64748b;
+    }
+
+    .ls-spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid #e2e8f0;
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      .body-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 600px) {
+      .top-bar { flex-direction: column; align-items: flex-start; }
+      .ta-btn span { display: none; }
+      .thc-subject { font-size: 16px; }
+    }
 
     /* ════════════════════════════════════════════
        DARK THEME OVERRIDES
        ════════════════════════════════════════════ */
     :host-context(body.dark-theme) {
       color: #e2e8f0;
+      background: #0f172a;
     }
-    :host-context(body.dark-theme) :host { color: #e2e8f0; }
 
-    /* Header / status pills */
-    :host-context(body.dark-theme) .back { color: #60a5fa; }
-    :host-context(body.dark-theme) .pill.status-open       { background: #1d4ed8; color: #f0f9ff; }
-    :host-context(body.dark-theme) .pill.status-inprogress { background: #b45309; color: #fffbeb; }
-    :host-context(body.dark-theme) .pill.status-resolved   { background: #047857; color: #ecfdf5; }
-    :host-context(body.dark-theme) .pill.status-closed     { background: #475569; color: #f1f5f9; }
+    :host-context(body.dark-theme) .top-bar {
+      background: #1e293b;
+      border-bottom-color: #334155;
+    }
 
-    /* Subject + meta */
-    :host-context(body.dark-theme) .subject h2 { color: #f1f5f9; }
-    :host-context(body.dark-theme) .meta { color: #94a3b8; }
+    :host-context(body.dark-theme) .bc-link { color: #60a5fa; }
+    :host-context(body.dark-theme) .bc-link:hover { background: rgba(96,165,250,0.12); color: #93c5fd; }
+    :host-context(body.dark-theme) .bc-current { color: #94a3b8; }
+    :host-context(body.dark-theme) .bc-sep { color: #475569; }
 
-    /* Description card */
-    :host-context(body.dark-theme) .desc {
+    :host-context(body.dark-theme) .ta-btn {
+      background: #1e293b;
+      border-color: #334155;
+      color: #cbd5e1;
+    }
+    :host-context(body.dark-theme) .ta-btn:hover { border-color: #60a5fa; color: #60a5fa; background: rgba(96,165,250,0.1); }
+    :host-context(body.dark-theme) .ta-btn.primary { background: #2563eb; border-color: #3b82f6; color: #f0f9ff; }
+    :host-context(body.dark-theme) .ta-btn.primary:hover { background: #1d4ed8; }
+
+    :host-context(body.dark-theme) .ticket-hdr-card {
+      background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
+    }
+
+    :host-context(body.dark-theme) .body-layout { background: transparent; }
+
+    :host-context(body.dark-theme) .card {
       background: #1e293b;
       border-color: #334155;
     }
-    :host-context(body.dark-theme) .desc h4 { color: #cbd5e1; }
-    :host-context(body.dark-theme) .desc-body { color: #e2e8f0; }
-    :host-context(body.dark-theme) ::ng-deep .desc-body a { color: #60a5fa; }
-    :host-context(body.dark-theme) ::ng-deep .desc-body a:hover { color: #93c5fd; }
-    :host-context(body.dark-theme) ::ng-deep .desc-body img {
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
-    }
-    :host-context(body.dark-theme) ::ng-deep .desc-body table td,
-    :host-context(body.dark-theme) ::ng-deep .desc-body table th {
-      border-color: #334155;
-      color: #e2e8f0;
+
+    :host-context(body.dark-theme) .card-hdr {
+      background: #0f172a;
+      border-bottom-color: #334155;
     }
 
-    /* Side panels */
-    :host-context(body.dark-theme) .panel {
-      background: #1e293b;
+    :host-context(body.dark-theme) .card-hdr-left { color: #cbd5e1; }
+
+    :host-context(body.dark-theme) .thread-bubble {
+      background: #0f172a;
       border-color: #334155;
     }
-    :host-context(body.dark-theme) .row strong { color: #94a3b8; }
-    :host-context(body.dark-theme) .row span   { color: #f1f5f9; }
 
-    /* Conversation messages */
-    :host-context(body.dark-theme) .msg {
-      background: #0b1220;
-      border-color: #334155;
-    }
-    :host-context(body.dark-theme) .av {
-      background: #1e3a8a;
-      color: #93c5fd;
-    }
-    :host-context(body.dark-theme) .who { color: #f1f5f9; }
-    :host-context(body.dark-theme) .when { color: #94a3b8; }
-    :host-context(body.dark-theme) .mb { color: #e2e8f0; }
-    :host-context(body.dark-theme) ::ng-deep .mb a { color: #60a5fa; }
-    :host-context(body.dark-theme) ::ng-deep .mb td,
-    :host-context(body.dark-theme) ::ng-deep .mb th { border-color: #334155; }
-    :host-context(body.dark-theme) ::ng-deep .mb blockquote {
-      border-left-color: #475569;
-      color: #94a3b8;
-    }
-    :host-context(body.dark-theme) ::ng-deep .mb hr { border-top-color: #334155; }
-    :host-context(body.dark-theme) ::ng-deep .mb img {
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
-    }
+    :host-context(body.dark-theme) .thread-author { color: #f1f5f9; }
+    :host-context(body.dark-theme) .thread-body { color: #e2e8f0; }
+    :host-context(body.dark-theme) ::ng-deep .thread-body a { color: #60a5fa; }
+    :host-context(body.dark-theme) ::ng-deep .thread-body td, :host-context(body.dark-theme) ::ng-deep .thread-body th { border-color: #334155; }
+    :host-context(body.dark-theme) ::ng-deep .thread-body blockquote { border-left-color: #475569; color: #94a3b8; }
+    :host-context(body.dark-theme) ::ng-deep .thread-body img { box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
 
-    /* Attachments */
+    :host-context(body.dark-theme) .att-chip { background: #0f172a; }
     :host-context(body.dark-theme) .att-name { color: #e2e8f0; }
-    :host-context(body.dark-theme) .att-link { color: #60a5fa; }
-    :host-context(body.dark-theme) .att-link:hover { color: #93c5fd; }
+    :host-context(body.dark-theme) .att-action { border-color: #334155; color: #60a5fa; }
+    :host-context(body.dark-theme) .att-action:hover { background: rgba(96,165,250,0.1); border-color: #60a5fa; }
 
-    /* Empty messages */
-    :host-context(body.dark-theme) .no-msg {
-      background: #0b1220;
-      border: 1px solid #334155;
-      color: #94a3b8;
-    }
+    :host-context(body.dark-theme) .visibility-toggle { border-color: #334155; }
+    :host-context(body.dark-theme) .vis-opt { background: #0f172a; color: #94a3b8; }
+    :host-context(body.dark-theme) .vis-opt:hover { background: rgba(96,165,250,0.1); color: #60a5fa; }
+    :host-context(body.dark-theme) .vis-opt.active { background: rgba(37,99,235,0.25); color: #60a5fa; }
+    :host-context(body.dark-theme) .vis-opt + .vis-opt { border-left-color: #334155; }
 
-    /* Reply form */
-    :host-context(body.dark-theme) .reply h4 { color: #f1f5f9; }
-    :host-context(body.dark-theme) textarea {
-      background: #0b1220;
-      border-color: #334155;
-      color: #e2e8f0;
-    }
-    :host-context(body.dark-theme) textarea::placeholder { color: #64748b; }
-    :host-context(body.dark-theme) textarea:focus {
-      outline: none;
-      border-color: #60a5fa;
-      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.18);
-    }
-    :host-context(body.dark-theme) .file-btn { color: #60a5fa; }
-    :host-context(body.dark-theme) .file-item { color: #cbd5e1; }
-    :host-context(body.dark-theme) .link { color: #fca5a5; }
-    :host-context(body.dark-theme) .controls { color: #cbd5e1; }
-    :host-context(body.dark-theme) .controls input[type="checkbox"],
-    :host-context(body.dark-theme) .controls input[type="radio"] { accent-color: #60a5fa; }
+    :host-context(body.dark-theme) textarea { background: #0f172a; border-color: #334155; color: #e2e8f0; }
+    :host-context(body.dark-theme) textarea::placeholder { color: #475569; }
+    :host-context(body.dark-theme) textarea:focus { border-color: #60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,0.14); }
 
-    /* Buttons */
-    :host-context(body.dark-theme) .btn {
-      background: #1e293b;
-      color: #e2e8f0;
-      border: 1px solid #334155;
-    }
-    :host-context(body.dark-theme) .btn:hover:not(:disabled) {
-      background: #273449;
-      border-color: #475569;
-    }
-    :host-context(body.dark-theme) .btn.primary {
-      background: #2563eb;
-      border-color: #3b82f6;
-      color: #f0f9ff;
-    }
-    :host-context(body.dark-theme) .btn.primary:hover:not(:disabled) {
-      background: #1d4ed8;
-    }
+    :host-context(body.dark-theme) .attach-label { border-color: #334155; color: #60a5fa; }
+    :host-context(body.dark-theme) .attach-label:hover { background: rgba(96,165,250,0.1); border-color: #60a5fa; }
+    :host-context(body.dark-theme) .attached-file { background: #0f172a; color: #cbd5e1; }
 
-    /* Loading */
-    :host-context(body.dark-theme) .loading { color: #94a3b8; }
+    :host-context(body.dark-theme) .info-label { color: #64748b; }
+    :host-context(body.dark-theme) .info-value { color: #f1f5f9; }
+    :host-context(body.dark-theme) .info-value.assignee { color: #60a5fa; }
+    :host-context(body.dark-theme) .info-value.email-val { color: #60a5fa; }
+
+    :host-context(body.dark-theme) .status-pill.status-open { background: rgba(30,58,138,0.6); color: #93c5fd; }
+    :host-context(body.dark-theme) .status-pill.status-inprogress { background: rgba(120,53,15,0.5); color: #fde68a; }
+    :host-context(body.dark-theme) .status-pill.status-resolved { background: rgba(20,83,45,0.5); color: #86efac; }
+    :host-context(body.dark-theme) .status-pill.status-closed { background: rgba(51,65,85,0.6); color: #94a3b8; }
+
+    :host-context(body.dark-theme) .priority-pill.priority-sla { background: rgba(153,27,27,0.4); color: #fca5a5; }
+    :host-context(body.dark-theme) .priority-pill.priority-high { background: rgba(154,52,18,0.4); color: #fdba74; }
+    :host-context(body.dark-theme) .priority-pill.priority-medium { background: rgba(133,77,14,0.4); color: #fde68a; }
+    :host-context(body.dark-theme) .priority-pill.priority-low { background: rgba(20,83,45,0.4); color: #86efac; }
+    :host-context(body.dark-theme) .priority-pill.priority-unknown { background: rgba(51,65,85,0.5); color: #94a3b8; }
+
+    :host-context(body.dark-theme) .att-list { border-top-color: #334155; }
+    :host-context(body.dark-theme) .count-badge { background: rgba(37,99,235,0.3); color: #93c5fd; }
+
+    :host-context(body.dark-theme) .loading-state { color: #64748b; }
+    :host-context(body.dark-theme) .ls-spinner { border-color: #334155; border-top-color: #60a5fa; }
   `]
 })
 export class TicketDetailComponent implements OnInit, OnDestroy {
@@ -553,7 +1154,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
 
     const lower = value.toLowerCase();
     if (lower.includes('sla') || lower.includes('urgent') || lower.includes('critical')) {
-      return 'SLA';
+      return 'Critical';
     }
     if (lower.includes('high')) return 'High';
     if (lower.includes('medium')) return 'Medium';
@@ -896,7 +1497,33 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   }
 
   back(): void {
-    this.router.navigate(['/tickets']);
+    const tab = (this.route.snapshot.queryParamMap.get('tab') || '').toLowerCase().trim();
+    const myStatus = (this.route.snapshot.queryParamMap.get('myStatus') || '').toLowerCase().trim();
+
+    const queryParams: Record<string, string> = {};
+    if (tab) queryParams['tab'] = tab;
+    if (myStatus) queryParams['myStatus'] = myStatus;
+
+    this.router.navigate(['/tickets'], { queryParams });
+  }
+
+  navigateTo(path: string): void {
+    this.router.navigate([path]);
+  }
+
+  priorityClass(priority?: string): string {
+    const value = (priority || '').trim().toLowerCase();
+    if (!value) return 'priority-unknown';
+    if (value.includes('sla') || value.includes('urgent') || value.includes('critical')) return 'priority-sla';
+    if (value.includes('high')) return 'priority-high';
+    if (value.includes('medium')) return 'priority-medium';
+    if (value.includes('low')) return 'priority-low';
+    return 'priority-unknown';
+  }
+
+  isOverdue(dueDate?: string): boolean {
+    if (!dueDate) return false;
+    return new Date(dueDate) < new Date();
   }
 
   statusClass(status?: string): string {

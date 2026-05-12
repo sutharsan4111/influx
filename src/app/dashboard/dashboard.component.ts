@@ -1,30 +1,70 @@
-import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, Input, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { Subject, takeUntil } from 'rxjs';
 import { TicketService, Ticket } from '../services/ticket.service';
 import { LoadingService } from '../services/loading.service';
 import { MessageService } from '../services/message.service';
 import { MsalService } from '../services/msal.service';
+import { ReportComponent } from '../admin/report.component';
 
 @Component({
   selector: 'app-dashboard',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [CommonModule],
+  imports: [CommonModule, FormsModule, ReportComponent],
   template: `
+    <ng-container *ngIf="showReportOnDashboard; else overviewBlock">
+      <div class="welcome-banner">
+        <div class="welcome-content">
+          <div class="welcome-text">
+            <h1>{{ greeting }}, {{ userName }}!</h1>
+            <p>{{ currentDate }}</p>
+          </div>
+          <div class="welcome-stats">
+            <div class="date-filter-controls">
+              <div class="date-filters">
+                <label>
+                  <span>Data Filter</span>
+                  <select [(ngModel)]="selectedPeriod" (ngModelChange)="onPeriodChange()">
+                    <option value="custom">Custom</option>
+                    <option value="monthly">Monthly</option>
+                    <option value="quarterly">Quarterly</option>
+                    <option value="halfyearly">Half-Yearly</option>
+                    <option value="annual">Annual</option>
+                  </select>
+                </label>
+                <label><span>From</span><input type="date" [(ngModel)]="startDate" (ngModelChange)="onDateInputChange()" /></label>
+                <label><span>To</span><input type="date" [(ngModel)]="endDate" (ngModelChange)="onDateInputChange()" /></label>
+              </div>
+              <div class="btn-row">
+                <button class="btn" (click)="applyDateRange()" [disabled]="reportLoading">
+                  Apply
+                </button>
+                <button class="btn btn-primary" (click)="downloadExcel()" [disabled]="reportLoading">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  Export Excel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <app-admin-report *ngIf="isAdmin" [isEmbedded]="true" #reportComponent></app-admin-report>
+    </ng-container>
+
+    <ng-template #overviewBlock>
+
     <!-- Welcome Banner -->
-    <div class="welcome-banner">
+    <div class="welcome-banner" *ngIf="!isEmbeddedMode">
       <div class="welcome-content">
         <div class="welcome-text">
           <h1>{{ greeting }}, {{ userName }}!</h1>
           <p>{{ currentDate }}</p>
         </div>
         <div class="welcome-stats">
-          <span class="stat-pill">
-            <i class="fas fa-ticket-alt"></i>
-            {{ openedCount }} {{ isAdmin ? 'open tickets' : 'my open tickets' }}
-          </span>
           <span class="stat-pill urgent" *ngIf="slaAlertCount > 0">
             <i class="fas fa-exclamation-triangle"></i>
             {{ slaAlertCount }} need attention
@@ -33,8 +73,8 @@ import { MsalService } from '../services/msal.service';
       </div>
     </div>
 
-    <!-- Quick Actions -->  
-    <div class="quick-actions">
+    <!-- Quick Actions -->
+    <div class="quick-actions" *ngIf="!isEmbeddedMode">
       <button class="action-btn primary" (click)="navigateTo('/create-ticket')">
         <i class="fas fa-plus-circle"></i>
         <span>Create Ticket</span>
@@ -82,7 +122,7 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-exclamation-triangle"></i>
         </div>
         <div class="metric-content">
-          <h3>My SLA Open</h3>
+          <h3>My Critical Open</h3>
           <div class="metric-value" *ngIf="!countsLoading">{{ slaCount | number }}</div>
           <div class="skeleton-value" *ngIf="countsLoading"><span class="shimmer"></span></div>
           <div class="metric-subtext">Urgent/Critical assigned to me</div>
@@ -107,10 +147,10 @@ import { MsalService } from '../services/msal.service';
       <!-- Left Column -->
       <div class="dashboard-main">
         
-        <!-- SLA Alerts -->
+        <!-- Critical Alerts -->
         <div class="card sla-alerts" *ngIf="slaTickets.length > 0">
           <div class="card-header">
-            <h2><i class="fas fa-exclamation-triangle"></i> SLA Alerts</h2>
+            <h2><i class="fas fa-exclamation-triangle"></i> Critical Alerts</h2>
             <span class="alert-count">{{ slaTickets.length }}</span>
           </div>
           <div class="sla-list">
@@ -182,7 +222,7 @@ import { MsalService } from '../services/msal.service';
           </div>
           <div class="chart-bars">
             <div class="chart-row">
-              <span class="chart-label">Critical/SLA</span>
+              <span class="chart-label">Critical</span>
               <div class="chart-bar-wrap">
                 <div class="chart-bar critical" [style.width.%]="priorityStats.critical"></div>
               </div>
@@ -236,8 +276,57 @@ import { MsalService } from '../services/msal.service';
       </div>
     </div>
 
+    </ng-template>
+
   `,
   styles: [`
+    /* Page-level Tabs */
+    .page-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 2px solid #e2e8f0;
+      margin-bottom: 16px;
+      background: white;
+      border-radius: 10px 10px 0 0;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+
+    .page-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 11px 20px;
+      border: none;
+      background: none;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #64748b;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+      transition: all 0.2s;
+    }
+
+    .page-tab:hover { color: #3b82f6; background: #f8fafc; }
+    .page-tab.active { color: #3b82f6; border-bottom-color: #3b82f6; background: #eff6ff; }
+    .page-tab i { font-size: 0.75rem; }
+
+    .view-hidden {
+      height: 0;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    :host-context(.dark-theme) .page-tabs {
+      background: #1e293b;
+      border-bottom-color: #334155;
+    }
+    :host-context(.dark-theme) .page-tab { color: #94a3b8; }
+    :host-context(.dark-theme) .page-tab:hover { color: #60a5fa; background: #0f172a; }
+    :host-context(.dark-theme) .page-tab.active { color: #60a5fa; border-bottom-color: #3b82f6; background: rgba(37,99,235,0.15); }
+
     /* Welcome Banner */
     .welcome-banner {
       background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
@@ -270,6 +359,7 @@ import { MsalService } from '../services/msal.service';
     .welcome-stats {
       display: flex;
       gap: 8px;
+      align-items: flex-start;
     }
 
     .stat-pill {
@@ -290,6 +380,119 @@ import { MsalService } from '../services/msal.service';
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.7; }
+    }
+
+    /* Date Filter Controls */
+    .date-filter-controls {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.14);
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.16);
+    }
+
+    .date-filters {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .date-filters label {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      font-size: 0.7rem;
+    }
+
+    .date-filters label span {
+      font-weight: 600;
+      opacity: 0.95;
+    }
+
+    .date-filters input,
+    .date-filters select {
+      padding: 5px 10px;
+      border: 1px solid rgba(255,255,255,0.38);
+      border-radius: 10px;
+      background: rgba(255,255,255,0.18);
+      color: white;
+      font-size: 0.72rem;
+      font-family: inherit;
+      min-width: 160px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+    }
+
+    .date-filters select {
+      max-width: 220px;
+    }
+
+    /* Native select menus render on system background; keep option text dark. */
+    .date-filters select option {
+      color: #0f172a;
+      background: #ffffff;
+    }
+
+    .date-filters input::placeholder {
+      color: rgba(255,255,255,0.5);
+    }
+
+    .date-filters input:focus,
+    .date-filters select:focus {
+      outline: none;
+      border-color: rgba(255,255,255,0.8);
+      background: rgba(255,255,255,0.22);
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      align-self: flex-start;
+    }
+
+    .btn {
+      padding: 6px 12px;
+      border: 1px solid rgba(255,255,255,0.4);
+      border-radius: 10px;
+      background: rgba(255,255,255,0.14);
+      color: white;
+      font-size: 0.78rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.12);
+    }
+
+    .btn:hover:not(:disabled) {
+      background: rgba(255,255,255,0.2);
+      border-color: rgba(255,255,255,0.6);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: rgba(255,255,255,0.18);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: rgba(255,255,255,0.28);
+    }
+
+    .btn svg {
+      width: 14px;
+      height: 14px;
     }
 
     /* Quick Actions */
@@ -490,7 +693,7 @@ import { MsalService } from '../services/msal.service';
 
     .card-header h2 i { color: #3b82f6; }
 
-    /* SLA Alerts */
+    /* Critical Alerts */
     .sla-alerts {
       margin-bottom: 14px;
       border-left: 3px solid #ef4444;
@@ -804,6 +1007,9 @@ import { MsalService } from '../services/msal.service';
 })
 export class DashboardComponent implements OnInit, OnDestroy {
 
+  @Input() isEmbeddedMode = false;
+  @ViewChild('reportComponent') reportComponent?: ReportComponent;
+
   private get COUNT_CACHE_KEY(): string {
     const userEmail = sessionStorage.getItem('username') || 'guest';
     const userRole = sessionStorage.getItem('role') || 'user';
@@ -826,6 +1032,13 @@ export class DashboardComponent implements OnInit, OnDestroy {
   filteredTickets: Ticket[] = [];
   slaTickets: Ticket[] = [];
   selectedTab: 'open' | 'closed' = 'open';
+  showReportOnDashboard = false;
+
+  // Date filter properties
+  selectedPeriod: 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual' = 'custom';
+  startDate = '';
+  endDate = '';
+  reportLoading = false;
 
   openedCount = 0;
   closedCount = 0;
@@ -877,6 +1090,8 @@ export class DashboardComponent implements OnInit, OnDestroy {
   ) {}
 
   ngOnInit() {
+    this.showReportOnDashboard = this.router.url.startsWith('/dashboard');
+
     this.initUserInfo();
     this.setGreeting();
     this.setCurrentDate();
@@ -1163,7 +1378,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
   priorityLabel(priority?: string): string {
     const value = (priority || '').trim().toLowerCase();
     if (!value) return '—';
-    if (value.includes('sla') || value.includes('urgent') || value.includes('critical')) return 'SLA';
+    if (value.includes('sla') || value.includes('urgent') || value.includes('critical')) return 'Critical';
     if (value.includes('high')) return 'High';
     if (value.includes('medium')) return 'Medium';
     if (value.includes('low')) return 'Low';
@@ -1177,6 +1392,60 @@ export class DashboardComponent implements OnInit, OnDestroy {
     if (value === 'closed') return 'status-closed';
     if (value === 'resolved') return 'status-resolved';
     return 'status-open';
+  }
+
+  onPeriodChange() {
+    if (!this.reportComponent) return;
+    this.reportComponent.selectedPeriod = this.selectedPeriod;
+    this.reportComponent.onPeriodChange();
+    this.startDate = this.reportComponent.startDate;
+    this.endDate = this.reportComponent.endDate;
+  }
+
+  onDateInputChange() {
+    if (!this.reportComponent) return;
+    this.reportComponent.startDate = this.startDate;
+    this.reportComponent.endDate = this.endDate;
+    this.reportComponent.onDateInputChange();
+    this.startDate = this.reportComponent.startDate;
+    this.endDate = this.reportComponent.endDate;
+  }
+
+  applyDateRange() {
+    if (!this.reportComponent) return;
+    this.reportLoading = true;
+    this.reportComponent.startDate = this.startDate;
+    this.reportComponent.endDate = this.endDate;
+    this.reportComponent.selectedPeriod = this.selectedPeriod;
+    
+    // Clear the report cache before loading new data
+    sessionStorage.removeItem('ITSMS_REPORT_CACHE');
+    
+    // Call the report's applyDateRange which triggers loadReport
+    this.reportComponent.applyDateRange();
+    
+    // Watch the report component's loading state and clear our flag when done
+    const checkLoading = setInterval(() => {
+      if (!this.reportComponent?.loading) {
+        clearInterval(checkLoading);
+        this.reportLoading = false;
+        this.cdr.markForCheck();
+      }
+    }, 100);
+    
+    // Safety: clear after 60 seconds max
+    setTimeout(() => {
+      clearInterval(checkLoading);
+      this.reportLoading = false;
+      this.cdr.markForCheck();
+    }, 60000);
+    
+    this.startDate = this.reportComponent.startDate;
+    this.endDate = this.reportComponent.endDate;
+  }
+
+  downloadExcel() {
+    this.reportComponent?.downloadExcel();
   }
 }
 

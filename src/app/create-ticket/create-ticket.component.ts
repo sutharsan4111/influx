@@ -41,7 +41,7 @@ import { MsalService } from '../services/msal.service';
               <div class="form-group">
                 <label for="name">
                   <i class="fas fa-user-circle"></i>
-                  Contact Name
+                  Contact Name <span class="required-star">*</span>
                 </label>
                 <input
                   type="text"
@@ -57,7 +57,7 @@ import { MsalService } from '../services/msal.service';
               <div class="form-group">
                 <label for="email">
                   <i class="fas fa-envelope"></i>
-                  Email Address
+                  Email Address <span class="required-star">*</span>
                 </label>
                 <input
                   type="email"
@@ -83,7 +83,7 @@ import { MsalService } from '../services/msal.service';
             <div class="form-group full-width">
               <label for="subject">
                 <i class="fas fa-heading"></i>
-                Subject
+                Subject <span class="required-star">*</span>
               </label>
               <input
                 type="text"
@@ -97,9 +97,26 @@ import { MsalService } from '../services/msal.service';
 
             <div class="grid">
               <div class="form-group">
+                <label for="departmentId">
+                  <i class="fas fa-building"></i>
+                  Department <span class="required-star">*</span>
+                </label>
+                <select
+                  id="departmentId"
+                  name="departmentId"
+                  [(ngModel)]="formData.departmentId"
+                  required
+                >
+                  <option *ngFor="let dept of departments" [value]="dept.id">
+                    {{ dept.name }}
+                  </option>
+                </select>
+              </div>
+
+              <div class="form-group">
                 <label for="issueCategory">
                   <i class="fas fa-folder"></i>
-                  Issue Category
+                  Issue Category <span class="required-star">*</span>
                 </label>
                 <select
                   id="issueCategory"
@@ -116,7 +133,7 @@ import { MsalService } from '../services/msal.service';
               <div class="form-group">
                 <label for="priority">
                   <i class="fas fa-flag"></i>
-                  Priority Level
+                  Priority Level <span class="required-star">*</span>
                 </label>
                 <select
                   id="priority"
@@ -126,7 +143,7 @@ import { MsalService } from '../services/msal.service';
                   required
                 >
                   <option value="">Select priority</option>
-                  <option value="SLA">🔴 SLA (Critical)</option>
+                  <option value="Critical">🔴 Critical</option>
                   <option value="High">🟠 High</option>
                   <option value="Medium">🟡 Medium</option>
                   <option value="Low">🟢 Low</option>
@@ -134,17 +151,17 @@ import { MsalService } from '../services/msal.service';
 
                 <button type="button" class="sla-toggle" (click)="toggleSla()">
                   <i class="fas" [class.fa-eye]="!showSla" [class.fa-eye-slash]="showSla"></i>
-                  {{ showSla ? 'Hide SLA targets' : 'View SLA targets' }}
+                  {{ showSla ? 'Hide Critical targets' : 'View Critical targets' }}
                 </button>
 
                 <div class="sla-note" *ngIf="showSla">
                   <div class="sla-title">
                     <i class="fas fa-clock"></i>
-                    SLA Response Times
+                    Critical Response Times
                   </div>
                   <div class="sla-grid">
                     <div class="sla-item critical">
-                      <span class="sla-label">SLA</span>
+                      <span class="sla-label">Critical</span>
                       <span class="sla-value">Response: 15 mins | Resolution: 2 hours</span>
                     </div>
                     <div class="sla-item high">
@@ -161,23 +178,6 @@ import { MsalService } from '../services/msal.service';
                     </div>
                   </div>
                 </div>
-              </div>
-
-              <div class="form-group">
-                <label for="departmentId">
-                  <i class="fas fa-building"></i>
-                  Department
-                </label>
-                <select
-                  id="departmentId"
-                  name="departmentId"
-                  [(ngModel)]="formData.departmentId"
-                  required
-                >
-                  <option *ngFor="let dept of departments" [value]="dept.id">
-                    {{ dept.name }}
-                  </option>
-                </select>
               </div>
 
               <div class="form-group">
@@ -244,7 +244,7 @@ import { MsalService } from '../services/msal.service';
             <div class="form-group">
               <label for="description">
                 <i class="fas fa-file-alt"></i>
-                Detailed Description
+                Detailed Description <span class="required-star">*</span>
               </label>
               <textarea
                 id="description"
@@ -397,6 +397,12 @@ import { MsalService } from '../services/msal.service';
       grid-template-columns: repeat(2, minmax(0, 1fr)); 
     }
 
+    .required-star {
+      color: #ef4444;
+      font-weight: 700;
+      margin-left: 2px;
+    }
+
     .full-width {
       grid-column: 1 / -1;
     }
@@ -462,55 +468,72 @@ import { MsalService } from '../services/msal.service';
     /* Assignee Picker Styles - Compact */
     .assignee-picker {
       position: relative;
+      overflow: visible !important;
     }
 
     .assignee-picker input {
       width: 100%;
+      min-height: 42px;
+      padding-right: 42px;
+      border-radius: 10px;
+      border: 1px solid #cbd5e1;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+
+    .assignee-picker input:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+      background: #fff;
     }
 
     .selected-assignee {
       position: absolute;
       top: 50%;
-      left: 10px;
+      left: 12px;
       transform: translateY(-50%);
       display: flex;
       align-items: center;
-      gap: 6px;
-      max-width: calc(100% - 40px);
+      gap: 8px;
+      max-width: calc(100% - 48px);
+      pointer-events: none;
     }
 
     .assignee-badge {
-      background: linear-gradient(135deg, #3b82f6, #2563eb);
-      color: white;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-size: 0.7rem;
+      background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+      border: 1px solid #bfdbfe;
+      color: #1d4ed8;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 0.72rem;
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 200px;
+      max-width: 220px;
     }
 
     .clear-btn {
-      background: #ef4444;
-      color: white;
-      border: none;
-      border-radius: 4px;
-      width: 18px;
-      height: 18px;
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      color: #1d4ed8;
+      border-radius: 999px;
+      width: 22px;
+      height: 22px;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 10px;
-      transition: background 0.2s;
+      transition: all 0.2s;
+      pointer-events: auto;
     }
 
     .clear-btn:hover {
-      background: #dc2626;
+      background: #dbeafe;
+      border-color: #93c5fd;
     }
 
     .assignee-dropdown {
@@ -518,40 +541,40 @@ import { MsalService } from '../services/msal.service';
       top: 100%;
       left: 0;
       right: 0;
-      background: white;
-      border: 1px solid #e2e8f0;
-      border-radius: 6px;
-      margin-top: 2px;
-      max-height: 180px;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 12px;
+      margin-top: 6px;
+      max-height: 300px;
       overflow-y: auto;
-      z-index: 100;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      z-index: 9999;
+      box-shadow: 0 16px 30px rgba(15, 23, 42, 0.12);
     }
 
     .assignee-option {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
+      gap: 10px;
+      padding: 10px 12px;
       cursor: pointer;
-      transition: background 0.15s;
+      transition: background 0.15s, transform 0.15s;
     }
 
     .assignee-option:hover {
-      background: #f1f5f9;
+      background: #eff6ff;
     }
 
     .user-avatar {
-      width: 26px;
-      height: 26px;
+      width: 30px;
+      height: 30px;
       border-radius: 50%;
-      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
       color: white;
       display: flex;
       align-items: center;
       justify-content: center;
       font-weight: 600;
-      font-size: 11px;
+      font-size: 12px;
       flex-shrink: 0;
     }
 
@@ -564,28 +587,28 @@ import { MsalService } from '../services/msal.service';
     .user-name {
       font-weight: 600;
       color: #1e293b;
-      font-size: 0.75rem;
+      font-size: 0.8rem;
     }
 
     .user-email {
       color: #64748b;
-      font-size: 0.7rem;
+      font-size: 0.72rem;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
     .no-results {
-      padding: 10px;
+      padding: 12px;
       color: #64748b;
       text-align: center;
-      font-size: 0.75rem;
+      font-size: 0.78rem;
     }
 
     .loading-users {
-      padding: 8px 10px;
+      padding: 10px 12px;
       color: #3b82f6;
-      font-size: 0.75rem;
+      font-size: 0.78rem;
       display: flex;
       align-items: center;
       gap: 6px;
@@ -957,7 +980,7 @@ export class CreateTicketComponent implements OnInit {
     Laptops: 'Medium',
     'Laptops issue': 'Medium',
     Other: 'High',
-    'Production Issue': 'SLA',
+    'Production Issue': 'Critical',
     'Production Deployment': 'Medium'
   };
 
@@ -965,10 +988,10 @@ export class CreateTicketComponent implements OnInit {
 
   departments = [
     { id: '132475000009937630', name: 'ITSM' },
-    { id: '132475000009948173', name: 'Support' },
-    { id: '132475000009958716', name: 'Products' },
-    { id: '132475000009925079', name: 'HR' },
-    { id: '132475000000010772', name: 'Muraai' }
+    { id: '132475000009948173', name: 'Support - In Progress' },
+    { id: '132475000009958716', name: 'Products - In Progress' },
+    { id: '132475000009925079', name: 'HR - In Progress' },
+    { id: '132475000000010772', name: 'Muraai - In Progress' }
   ];
 
   constructor(

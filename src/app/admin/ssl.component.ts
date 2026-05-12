@@ -409,6 +409,184 @@ import { SslAsset, SslResponsiblePerson, SslService } from '../services/ssl.serv
         grid-template-columns: 1fr;
       }
     }
+
+    /* ════════════════════════════════════════════
+       DARK THEME OVERRIDES
+       ════════════════════════════════════════════ */
+    :host-context(.dark-theme) .ssl-page {
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+
+    :host-context(.dark-theme) .page-header-row h2 {
+      color: #f1f5f9;
+    }
+
+    :host-context(.dark-theme) .btn-check {
+      border-color: #1e40af;
+      color: #93c5fd;
+      background: rgba(59, 130, 246, 0.15);
+    }
+
+    :host-context(.dark-theme) .btn-check:hover:not(:disabled) {
+      background: rgba(59, 130, 246, 0.25);
+      color: #bfdbfe;
+    }
+
+    :host-context(.dark-theme) .btn-add {
+      background: #2563eb;
+      color: #eff6ff;
+    }
+
+    :host-context(.dark-theme) .btn-add:hover {
+      background: #1d4ed8;
+    }
+
+    :host-context(.dark-theme) .table-card {
+      background: #1e293b;
+      border-color: #334155;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+    }
+
+    :host-context(.dark-theme) th {
+      background: #0b1220;
+      color: #cbd5e1;
+      border-bottom-color: #334155;
+    }
+
+    :host-context(.dark-theme) td {
+      color: #e2e8f0;
+      border-bottom-color: #1f2937;
+    }
+
+    :host-context(.dark-theme) td a {
+      color: #93c5fd;
+    }
+
+    :host-context(.dark-theme) td a:hover {
+      color: #bfdbfe;
+    }
+
+    :host-context(.dark-theme) .empty {
+      color: #94a3b8;
+    }
+
+    :host-context(.dark-theme) .btn-edit {
+      border-color: #1e40af;
+      color: #93c5fd;
+      background: rgba(59, 130, 246, 0.15);
+    }
+
+    :host-context(.dark-theme) .btn-edit:hover {
+      background: rgba(59, 130, 246, 0.25);
+    }
+
+    :host-context(.dark-theme) .btn-delete {
+      border-color: #7f1d1d;
+      color: #fca5a5;
+      background: rgba(239, 68, 68, 0.15);
+    }
+
+    :host-context(.dark-theme) .btn-delete:hover {
+      background: rgba(239, 68, 68, 0.25);
+    }
+
+    :host-context(.dark-theme) .btn-close {
+      border-color: #854d0e;
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.15);
+    }
+
+    :host-context(.dark-theme) .btn-close:hover {
+      background: rgba(245, 158, 11, 0.25);
+    }
+
+    :host-context(.dark-theme) .modal-backdrop {
+      background: rgba(0, 0, 0, 0.7);
+    }
+
+    :host-context(.dark-theme) .modal-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+    }
+
+    :host-context(.dark-theme) .modal-card h3 {
+      color: #f1f5f9;
+    }
+
+    :host-context(.dark-theme) .grid label {
+      color: #cbd5e1;
+    }
+
+    :host-context(.dark-theme) input,
+    :host-context(.dark-theme) select {
+      background: #0b1220;
+      border-color: #334155;
+      color: #e2e8f0;
+    }
+
+    :host-context(.dark-theme) input::placeholder {
+      color: #64748b;
+    }
+
+    :host-context(.dark-theme) input:focus,
+    :host-context(.dark-theme) select:focus {
+      border-color: #3b82f6;
+      outline: none;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
+    }
+
+    :host-context(.dark-theme) .btn-secondary {
+      background: #334155;
+      color: #e2e8f0;
+    }
+
+    :host-context(.dark-theme) .btn-secondary:hover {
+      background: #475569;
+    }
+
+    :host-context(.dark-theme) .btn-primary {
+      background: #2563eb;
+      color: #eff6ff;
+    }
+
+    :host-context(.dark-theme) .btn-primary:hover {
+      background: #1d4ed8;
+    }
+
+    :host-context(.dark-theme) .badge {
+      margin-left: 8px;
+    }
+
+    :host-context(.dark-theme) .badge.safe {
+      background: rgba(16, 185, 129, 0.18);
+      color: #6ee7b7;
+    }
+
+    :host-context(.dark-theme) .badge.warn {
+      background: rgba(245, 158, 11, 0.18);
+      color: #fbbf24;
+    }
+
+    :host-context(.dark-theme) .badge.alert {
+      background: rgba(239, 68, 68, 0.18);
+      color: #fca5a5;
+    }
+
+    :host-context(.dark-theme) .badge.open {
+      background: rgba(96, 165, 250, 0.18);
+      color: #93c5fd;
+    }
+
+    :host-context(.dark-theme) .badge.closed {
+      background: rgba(16, 185, 129, 0.18);
+      color: #6ee7b7;
+    }
+
+    :host-context(.dark-theme) .badge.superseded {
+      background: rgba(167, 139, 250, 0.18);
+      color: #d8b4fe;
+    }
   `]
 })
 export class SslComponent implements OnInit {
