@@ -1539,10 +1539,13 @@ export class TicketsComponent implements OnInit, OnDestroy {
   searchTerm = '';
   private searchTerm$ = new Subject<string>();
   private searchSub?: Subscription;
+  private autoRefreshSub?: Subscription;
   private destroy$ = new Subject<void>();
   private searchCache = new Map<string, Ticket[]>(); // 🚀 Cache search results
   private isInitialLoad = true; // Track if first load or tab switch
   isRefreshing = false;
+  private isAutoRefreshing = false;
+  private readonly myTicketsAutoRefreshMs = 8_000;
   private dashboardQuickFilter: 'all' | 'sla' | 'assigned' = 'all';
 
   showCloseDialog = false;
@@ -1685,6 +1688,14 @@ export class TicketsComponent implements OnInit, OnDestroy {
         this.loadTickets();
       });
 
+    this.autoRefreshSub = interval(this.myTicketsAutoRefreshMs)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(() => {
+        this.autoRefreshMyTickets().catch(() => {
+          // Silent refresh only; ignore transient polling errors.
+        });
+      });
+
     // ✅ AUTO-REFRESH DISABLED - Data now cached with smart expiration
     // Initial page load shows loading indicator
     // Tab switches load fresh data silently (no loading indicator)
@@ -1692,10 +1703,38 @@ export class TicketsComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.searchSub?.unsubscribe();
+    this.autoRefreshSub?.unsubscribe();
     this.destroy$.next();
     this.destroy$.complete();
     // 🚀 Save current state to service-level cache before component is destroyed
     this.saveToServiceCache();
+  }
+
+  private async autoRefreshMyTickets(): Promise<void> {
+    if (this.selectedTab !== 'my') return;
+    if (this.searchTerm) return;
+    if (this.showAssignDialog || this.showBulkAssignDialog || this.showUpdateDialog || this.showCloseDialog) return;
+    if (this.isRefreshing || this.isAutoRefreshing) return;
+
+    this.isAutoRefreshing = true;
+    try {
+      await this.loadAssignmentsAsync();
+
+      this.ticketService.invalidateUserTicketCache(this.currentUserEmail, this.myStatus);
+      this.ticketService.invalidateTabCache([`my_${this.myStatus}`]);
+
+      if (this.myStatus === 'open') {
+        this.myTicketsOpenAll = [];
+        this.myTicketsOpenLastApiPage = 0;
+      } else {
+        this.myTicketsClosedAll = [];
+        this.myTicketsClosedLastApiPage = 0;
+      }
+
+      await this.loadTickets(false);
+    } finally {
+      this.isAutoRefreshing = false;
+    }
   }
 
   onSearchChange(value: string): void {
@@ -2488,9 +2527,10 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       return;
     }
 
-    // Check if the ticket belongs to the user
+    // "My Tickets" is already server-filtered for the current user.
+    // Avoid false denial caused by temporary assignment-map staleness.
     const ticket = this.filteredTickets.find(t => (t.id || t.ticketId) === ticketId);
-    if (ticket && this.isMyTicket(ticket)) {
+    if (ticket) {
       this.router.navigate(['/tickets', ticketId], {
         queryParams: {
           tab: this.selectedTab,
@@ -2553,7 +2593,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     if ((status.includes('closed') || status.includes('resolved')) && closedBy) {
       return closedBy;
     }
-    return ticket.assignedTo || 'Unassigned';
+    return ticket.assignedTo || ticket.assignee?.email || ticket.assignee?.firstName || 'Unassigned';
   }
 
   private async initCurrentUser(): Promise<void> {
@@ -2715,7 +2755,11 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   }
 
   loadAssignments(): void {
-    this.assignmentService.getAllAssignments()
+    const request$ = this.isAdmin
+      ? this.assignmentService.getAllAssignments()
+      : this.assignmentService.getAssignmentsByUser(this.currentUserEmail);
+
+    request$
       .pipe(takeUntil(this.destroy$))
       .subscribe({
       next: assignments => {
@@ -2729,7 +2773,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
   async loadAssignmentsAsync(): Promise<void> {
     try {
-      const assignments = await firstValueFrom(this.assignmentService.getAllAssignments());
+      const assignments = this.isAdmin
+        ? await firstValueFrom(this.assignmentService.getAllAssignments())
+        : await firstValueFrom(this.assignmentService.getAssignmentsByUser(this.currentUserEmail));
       this.assignmentsMap.clear();
       assignments.forEach(a => this.assignmentsMap.set(a.zoho_ticket_id, a));
       if (this.dashboardQuickFilter === 'assigned') {

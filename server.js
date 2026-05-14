@@ -260,6 +260,99 @@ function authenticateToken(req, res, next) {
     next();
   });
 }
+
+// ===================================
+// Azure Graph API - Send Email Function
+// ===================================
+async function sendEmailViaAzure(fromEmail, toEmail, subject, content, userInfo) {
+  try {
+    let clientId = process.env.CLIENT_ID || process.env.AZURE_CLIENT_ID;
+    let clientSecret = process.env.CLIENT_SECRET || process.env.AZURE_CLIENT_SECRET;
+    let tenantId = process.env.TENANT_ID || process.env.AZURE_TENANT_ID;
+
+    // Decode TENANT_ID if it's base64 encoded (contains only alphanumeric, +, /, =)
+    if (tenantId && /^[A-Za-z0-9+/=]+$/.test(tenantId) && !tenantId.includes('-')) {
+      try {
+        tenantId = Buffer.from(tenantId, 'base64').toString('utf-8');
+        console.log('[EMAIL] Decoded TENANT_ID from base64');
+      } catch (e) {
+        // Not base64 or decoding failed, use as-is
+      }
+    }
+
+    console.log(`[EMAIL] Attempting to send email from ${fromEmail} to ${toEmail}`);
+
+    if (!clientId || !clientSecret || !tenantId) {
+      console.warn('⚠️ Azure credentials not configured. Feedback logged only.');
+      return false;
+    }
+
+    // Get access token
+    const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+    console.log(`[EMAIL] Getting Azure token from: ${tokenUrl}`);
+    
+    const tokenResponse = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials'
+      })
+    });
+
+    if (!tokenResponse.ok) {
+      const tokenError = await tokenResponse.text();
+      console.error(`❌ Failed to get Azure token: ${tokenResponse.status}`);
+      console.error(`Token error response:`, tokenError);
+      return false;
+    }
+
+    const tokenData = await tokenResponse.json();
+    const accessToken = tokenData.access_token;
+    console.log(`[EMAIL] ✅ Got Azure token successfully`);
+
+    // Send email via Graph API
+    const mailBody = {
+      message: {
+        subject: subject,
+        body: {
+          contentType: "Text",
+          content: content
+        },
+        toRecipients: [{ emailAddress: { address: toEmail } }]
+      },
+      saveToSentItems: true
+    };
+
+    const graphUrl = `https://graph.microsoft.com/v1.0/users/${fromEmail}/sendMail`;
+    console.log(`[EMAIL] Sending via Graph API: ${graphUrl}`);
+    
+    const mailResponse = await fetch(graphUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(mailBody)
+    });
+
+    if (mailResponse.ok) {
+      console.log(`✅ Email sent via Azure Graph API to ${toEmail}`);
+      return true;
+    } else {
+      const mailError = await mailResponse.text();
+      console.error(`❌ Failed to send email: ${mailResponse.status}`);
+      console.error(`Mail error response:`, mailError);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Azure email error:', error?.message || error);
+    console.error('Stack trace:', error?.stack);
+    return false;
+  }
+}
 // ---------------------------
 // 🔐 ADMIN ROLE MIDDLEWARE
 // ---------------------------
@@ -1646,8 +1739,8 @@ app.get('/api/agents', authenticateToken, async (req, res) => {
 
 // Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
 const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
-const USER_TICKETS_CACHE_MS  = 5 * 60 * 1000;   // 5 min "fresh" window
-const USER_TICKETS_STALE_MS  = 30 * 60 * 1000;  // 30 min serve-stale-while-revalidate
+const USER_TICKETS_CACHE_MS  = 10 * 1000;       // 10 sec "fresh" window for near-real-time My Tickets
+const USER_TICKETS_STALE_MS  = 60 * 1000;       // 60 sec serve-stale-while-revalidate window
 const userTicketsRefreshInFlight = new Map();   // Dedupe concurrent refreshes
 
 function invalidateRuntimeCaches() {
@@ -4045,6 +4138,58 @@ app.delete('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, as
   } catch (err) {
     console.error('Failed to delete role assignment:', err?.message || err);
     return res.status(500).json({ error: 'Failed to delete role assignment' });
+  }
+});
+
+// Report / Suggestion email endpoint
+app.post('/api/feedback/report', authenticateToken, async (req, res) => {
+  try {
+    const content = (req.body?.content || '').toString().trim();
+    const includeName = Boolean(req.body?.includeName);
+    const userEmail = (req.user?.email || '').toString().trim();
+
+    if (!content) {
+      return res.status(400).json({ error: 'Content is required' });
+    }
+
+    const targetEmail = process.env.FEEDBACK_TARGET_EMAIL || 'sutharsan.t@muraai.com';
+    const fromEmail = process.env.FEEDBACK_FROM_EMAIL || 'no-reply@muraai.com';
+    const submitter = includeName && userEmail ? userEmail : 'Anonymous';
+    const role = (req.user?.role || 'user').toString();
+    const submittedAt = new Date().toISOString();
+
+    const mailContent = [
+      'New report/suggestion submitted from Influx web app.',
+      '',
+      `Submitted By: ${submitter}`,
+      `User Role: ${role}`,
+      `Submitted At: ${submittedAt}`,
+      `Application: Influx ITSM`,
+      '',
+      'Content:',
+      content
+    ].join('\n');
+
+    console.log(`[FEEDBACK] Report received from ${submitter}:\n${mailContent}\n`);
+
+    // Send via Azure Graph API
+    const emailSent = await sendEmailViaAzure(
+      fromEmail,
+      targetEmail,
+      'Influx App - Report/Suggestion',
+      mailContent,
+      { email: userEmail, role }
+    );
+
+    return res.json({ 
+      success: true, 
+      message: emailSent 
+        ? 'Feedback sent successfully' 
+        : 'Feedback received (email delivery skipped due to configuration)'
+    });
+  } catch (error) {
+    console.error('Feedback processing failed:', error?.message || error);
+    return res.status(500).json({ error: 'Failed to process feedback' });
   }
 });
 

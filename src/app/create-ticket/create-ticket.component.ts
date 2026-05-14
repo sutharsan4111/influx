@@ -988,10 +988,10 @@ export class CreateTicketComponent implements OnInit {
 
   departments = [
     { id: '132475000009937630', name: 'ITSM' },
-    { id: '132475000009948173', name: 'Support - In Progress' },
-    { id: '132475000009958716', name: 'Products - In Progress' },
-    { id: '132475000009925079', name: 'HR - In Progress' },
-    { id: '132475000000010772', name: 'Muraai - In Progress' }
+    { id: '132475000009948173', name: 'Support - Coming Soon... ' },
+    { id: '132475000009958716', name: 'Products - Coming Soon...' },
+    { id: '132475000009925079', name: 'HR - Coming Soon...' },
+    { id: '132475000000010772', name: 'Muraai - Coming Soon...' }
   ];
 
   constructor(

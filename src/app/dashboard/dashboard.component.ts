@@ -15,6 +15,19 @@ import { ReportComponent } from '../admin/report.component';
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [CommonModule, FormsModule, ReportComponent],
   template: `
+    <ng-container *ngIf="showComingSoonForNonCloudOps; else dashboardContent">
+      <div class="coming-soon-wrap">
+        <div class="coming-soon-card">
+          <h2>Coming Soon</h2>
+          <p>
+            Dashboard features for your team are under development.
+            Please check back soon.
+          </p>
+        </div>
+      </div>
+    </ng-container>
+
+    <ng-template #dashboardContent>
     <ng-container *ngIf="showReportOnDashboard; else overviewBlock">
       <div class="welcome-banner">
         <div class="welcome-content">
@@ -278,8 +291,42 @@ import { ReportComponent } from '../admin/report.component';
 
     </ng-template>
 
+    </ng-template>
+
   `,
   styles: [`
+    .coming-soon-wrap {
+      min-height: calc(100vh - 110px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .coming-soon-card {
+      width: min(560px, 100%);
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 14px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+      text-align: center;
+      padding: 28px 24px;
+    }
+
+    .coming-soon-card h2 {
+      margin: 0 0 8px 0;
+      font-size: 1.4rem;
+      color: #0f172a;
+      font-weight: 700;
+    }
+
+    .coming-soon-card p {
+      margin: 0;
+      color: #475569;
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+
     /* Page-level Tabs */
     .page-tabs {
       display: flex;
@@ -998,6 +1045,15 @@ import { ReportComponent } from '../admin/report.component';
       background: rgba(239, 68, 68, 0.15);
     }
 
+    :host-context(.dark-theme) .coming-soon-card {
+      background: #1e293b;
+      border-color: #334155;
+      box-shadow: 0 12px 28px rgba(2, 6, 23, 0.45);
+    }
+
+    :host-context(.dark-theme) .coming-soon-card h2 { color: #e2e8f0; }
+    :host-context(.dark-theme) .coming-soon-card p { color: #94a3b8; }
+
     :host-context(.dark-theme) .sla-item:hover { background: rgba(239, 68, 68, 0.1); }
     :host-context(.dark-theme) .sla-subject { color: #e2e8f0; }
     :host-context(.dark-theme) .card-header { border-color: #334155; }
@@ -1033,6 +1089,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
   slaTickets: Ticket[] = [];
   selectedTab: 'open' | 'closed' = 'open';
   showReportOnDashboard = false;
+  showComingSoonForNonCloudOps = false;
 
   // Date filter properties
   selectedPeriod: 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual' = 'custom';
@@ -1093,6 +1150,14 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.showReportOnDashboard = this.router.url.startsWith('/dashboard');
 
     this.initUserInfo();
+    this.showComingSoonForNonCloudOps = !this.isAdmin && !this.isEmbeddedMode;
+
+    if (this.showComingSoonForNonCloudOps) {
+      this.countsLoading = false;
+      this.cdr.markForCheck();
+      return;
+    }
+
     this.setGreeting();
     this.setCurrentDate();
 

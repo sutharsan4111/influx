@@ -1,0 +1,14 @@
+<div class="report-suggestion-modal">
+  <div class="modal-content">
+    <h3>Report an Issue / Suggestion</h3>
+    <textarea [(ngModel)]="reportContent" placeholder="Describe your issue or suggestion..." rows="5"></textarea>
+    <div class="checkbox-row">
+      <input type="checkbox" id="includeName" [(ngModel)]="includeName" />
+      <label for="includeName">Include my name with this report</label>
+    </div>
+    <div class="modal-actions">
+      <button (click)="submitReport()">Submit</button>
+      <button (click)="closeReportModal()">Cancel</button>
+    </div>
+  </div>
+</div>

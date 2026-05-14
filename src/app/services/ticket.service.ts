@@ -106,12 +106,14 @@ export class TicketService {
   // Cache with timestamp to prevent excessive reloading
   private ticketsCacheWithTime = new Map<string, { data: Observable<any>, timestamp: number }>();
   private cacheDurationMs = 5 * 60 * 1000; // 5 minutes cache - for full page navigation away and back
+  private myTicketsCacheDurationMs = 15 * 1000; // 15 seconds for near real-time personal bucket updates
   private countsCacheDurationMs = 20 * 1000; // 20 seconds for near-real-time dashboard counts
   private countsCacheTime = 0;
 
   // 🚀 GLOBAL TAB CACHE - persists across navigation (component destroy/recreate)
   private globalTabCache = new Map<string, TabCacheEntry>();
   private readonly TAB_CACHE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+  private readonly MY_TAB_CACHE_EXPIRY_MS = 15 * 1000; // 15 seconds for My Tickets tab
 
   constructor(private http: HttpClient, private assignmentService: AssignmentService) {}
 
@@ -147,10 +149,13 @@ export class TicketService {
     if (filterByEmail) params.push(`filterByEmail=${encodeURIComponent(filterByEmail)}`);
 
     const cacheKey = params.join('&');
+    const effectiveCacheDurationMs = filterByEmail
+      ? this.myTicketsCacheDurationMs
+      : this.cacheDurationMs;
 
     // Check if we have valid cached data (not expired)
     const cached = this.ticketsCacheWithTime.get(cacheKey);
-    if (cached && (Date.now() - cached.timestamp) < this.cacheDurationMs) {
+    if (cached && (Date.now() - cached.timestamp) < effectiveCacheDurationMs) {
       return cached.data;
     }
 
@@ -320,6 +325,20 @@ export class TicketService {
     this.countsCacheTime = 0;
   }
 
+  invalidateUserTicketCache(filterByEmail: string, status?: 'open' | 'closed'): void {
+    const normalizedEmail = (filterByEmail || '').trim().toLowerCase();
+    if (!normalizedEmail) return;
+
+    const encodedEmail = encodeURIComponent(normalizedEmail);
+    for (const key of Array.from(this.ticketsCacheWithTime.keys())) {
+      const matchesUser = key.includes(`filterByEmail=${encodedEmail}`);
+      const matchesStatus = !status || key.includes(`status=${status}`);
+      if (matchesUser && matchesStatus) {
+        this.ticketsCacheWithTime.delete(key);
+      }
+    }
+  }
+
   resolveClosedBy(ticket: any): string {
     const direct =
       (ticket?.closedBy || ticket?.closed_by || ticket?.closedByEmail || ticket?.closed_by_email || '').toString();
@@ -406,7 +425,8 @@ export class TicketService {
   getTabCache(key: string): TabCacheEntry | null {
     const cached = this.globalTabCache.get(key);
     if (!cached) return null;
-    if (Date.now() - cached.timestamp > this.TAB_CACHE_EXPIRY_MS) {
+    const ttl = key.startsWith('my_') ? this.MY_TAB_CACHE_EXPIRY_MS : this.TAB_CACHE_EXPIRY_MS;
+    if (Date.now() - cached.timestamp > ttl) {
       this.globalTabCache.delete(key);
       return null;
     }
