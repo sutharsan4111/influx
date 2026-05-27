@@ -18,6 +18,7 @@ const pool = require("./db");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const upload = multer({ storage: multer.memoryStorage() });
+const NODE_ID = process.env.HOSTNAME || 'local-node';
 
 // ===============================
 // Middleware
@@ -29,6 +30,7 @@ app.use(bodyParser.json());
 
 // 🚀 Production: Smart caching headers
 app.use((req, res, next) => {
+  res.set('X-ITSM-Node', NODE_ID);
   // Static assets: 1 year (immutable)
   if (req.url.match(/\.(js|css|woff|woff2|ttf|eot|svg)$/i)) {
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
@@ -488,14 +490,61 @@ const CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID;
 const ZOHO_BASE_URL = process.env.ZOHO_BASE_URL || 'https://desk.zoho.in/api/v1';
+const ENABLE_ZOHO_OUTBOUND = (process.env.ENABLE_ZOHO_OUTBOUND || 'true').toLowerCase() === 'true';
+const ZOHO_ALLOWED_EGRESS_IPS = new Set(
+  (process.env.ZOHO_ALLOWED_EGRESS_IPS || '')
+    .split(',')
+    .map(ip => ip.trim())
+    .filter(Boolean)
+);
 const ZOHO_DEPARTMENT_ID = process.env.ZOHO_DEPARTMENT_ID;
 const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
+const ENABLE_ALERT_JOBS = (process.env.ENABLE_ALERT_JOBS || 'true').toLowerCase() === 'true';
 const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const AUTOMATION_SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const AUTOMATION_PROMETHEUS_URL = (process.env.AUTOMATION_PROMETHEUS_URL || '').trim();
 const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
 const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
+
+let egressIpCache = { value: '', time: 0 };
+const EGRESS_IP_CACHE_MS = 10 * 60 * 1000;
+let egressIpLookupInFlight = null;
+
+async function getPublicEgressIp(force = false) {
+  const age = Date.now() - egressIpCache.time;
+  if (!force && egressIpCache.value && age < EGRESS_IP_CACHE_MS) {
+    return egressIpCache.value;
+  }
+
+  if (egressIpLookupInFlight) {
+    return egressIpLookupInFlight;
+  }
+
+  egressIpLookupInFlight = (async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      const response = await fetch('https://api.ipify.org', { signal: controller.signal });
+      clearTimeout(timer);
+      if (!response.ok) {
+        throw new Error(`ipify returned ${response.status}`);
+      }
+      const ip = (await response.text()).trim();
+      if (ip) {
+        egressIpCache = { value: ip, time: Date.now() };
+      }
+      return egressIpCache.value;
+    } catch (err) {
+      console.error('Failed to resolve public egress IP:', err?.message || err);
+      return egressIpCache.value;
+    } finally {
+      egressIpLookupInFlight = null;
+    }
+  })();
+
+  return egressIpLookupInFlight;
+}
 
 function priorityForIhubAndSslMilestone(milestoneDays) {
   if (milestoneDays === 3 || milestoneDays === 1) return 'SLA';
@@ -522,6 +571,7 @@ app.use(express.static(angularPath));
 // ZOHO TOKEN REFRESH
 // ------------------------
 async function refreshZohoToken() {
+  if (!ENABLE_ZOHO_OUTBOUND) return;
   try {
     const params = new URLSearchParams({
       refresh_token: REFRESH_TOKEN,
@@ -546,23 +596,81 @@ async function refreshZohoToken() {
 }
 
 // Refresh token on startup and every 55 minutes
-setInterval(refreshZohoToken, 55 * 60 * 1000);
-refreshZohoToken();
+if (ENABLE_ZOHO_OUTBOUND) {
+  setInterval(refreshZohoToken, 55 * 60 * 1000);
+  refreshZohoToken();
+} else {
+  console.log('[ZOHO OUTBOUND] Disabled (ENABLE_ZOHO_OUTBOUND=false)');
+}
 
-// IHUB expiry alert processing on startup + every 12 hours
-setTimeout(() => {
-  processIhubAlerts();
-  processSslAlerts();
-  processAutomationSslAlerts();
-}, 15 * 1000);
-setInterval(processIhubAlerts, 12 * 60 * 60 * 1000);
-setInterval(processSslAlerts, 12 * 60 * 60 * 1000);
-setInterval(processAutomationSslAlerts, 12 * 60 * 60 * 1000);
+// Log outbound egress identity at startup for API access-point tracing.
+setTimeout(async () => {
+  if (!ENABLE_ZOHO_OUTBOUND) {
+    console.log('[ZOHO EGRESS] Skipped (outbound disabled)');
+    return;
+  }
+  const ip = await getPublicEgressIp();
+  if (ZOHO_ALLOWED_EGRESS_IPS.size > 0) {
+    const allowed = Array.from(ZOHO_ALLOWED_EGRESS_IPS).join(', ');
+    console.log(`[ZOHO EGRESS] Current public IP=${ip || 'unknown'} | Allowed=${allowed}`);
+  } else {
+    console.log(`[ZOHO EGRESS] Current public IP=${ip || 'unknown'} | Allowlist=disabled`);
+  }
+}, 3000);
+
+// IHUB/SSL alert processors should run only on designated deployments.
+if (ENABLE_ALERT_JOBS) {
+  // Startup + every 12 hours
+  setTimeout(() => {
+    processIhubAlerts();
+    processSslAlerts();
+    processAutomationSslAlerts();
+  }, 15 * 1000);
+  setInterval(processIhubAlerts, 12 * 60 * 60 * 1000);
+  setInterval(processSslAlerts, 12 * 60 * 60 * 1000);
+  setInterval(processAutomationSslAlerts, 12 * 60 * 60 * 1000);
+} else {
+  console.log('[ALERT JOBS] Disabled (ENABLE_ALERT_JOBS=false)');
+}
 
 // ------------------------
 // ZOHO API HELPER
 // ------------------------
 async function zohoFetch(endpoint, options = {}) {
+  if (!ENABLE_ZOHO_OUTBOUND) {
+    return new Response(
+      JSON.stringify({
+        error: 'Zoho outbound is disabled for this deployment',
+        endpoint
+      }),
+      {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+  }
+
+  if (ZOHO_ALLOWED_EGRESS_IPS.size > 0) {
+    const egressIp = await getPublicEgressIp();
+    if (!egressIp || !ZOHO_ALLOWED_EGRESS_IPS.has(egressIp)) {
+      const allowed = Array.from(ZOHO_ALLOWED_EGRESS_IPS).join(', ');
+      console.error(
+        `[ZOHO BLOCKED] egress IP ${egressIp || 'unknown'} is not in allowlist: ${allowed}`
+      );
+      return new Response(
+        JSON.stringify({
+          error: 'Zoho API blocked by egress IP policy',
+          egressIp: egressIp || null,
+          allowedIps: Array.from(ZOHO_ALLOWED_EGRESS_IPS)
+        }),
+        {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      );
+    }
+  }
+
   if (!ZOHO_OAUTH_TOKEN) {
     await refreshZohoToken();
   }
@@ -1482,7 +1590,7 @@ async function processSslAlerts() {
 
 // 🚀 OPTIMIZED: Production-grade caching system
 const countsCache = new Map(); // Cache per user role
-const COUNTS_CACHE_MS = 5 * 60 * 1000;        // 5 min "fresh" window
+const COUNTS_CACHE_MS = 15 * 60 * 1000;       // 15 min "fresh" window
 const COUNTS_STALE_MS = 30 * 60 * 1000;       // 30 min serve-stale-while-revalidate window
 const countsRefreshInFlight = new Map();      // Dedupe concurrent background refreshes
 let agentsCache = null;
@@ -1524,16 +1632,16 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
     // 1) Fresh cache → instant response.
     if (cached && age < COUNTS_CACHE_MS) {
       console.log(`[CACHE HIT-FRESH] ${cacheKey} age=${age}ms`);
+      res.set('X-ITSM-Counts-Cache', `HIT-FRESH;node=${NODE_ID};ageMs=${age}`);
       res.set('ETag', cached.etag);
       if (req.get('if-none-match') === cached.etag) return res.status(304).end();
-      // Pre-warm user-tickets if their cache has gone cold meanwhile.
-      prewarmUserTickets(userEmail);
       return res.json(cached.data);
     }
 
     // 2) Stale cache → instant response + background refresh.
     if (cached && age < COUNTS_STALE_MS) {
       console.log(`[CACHE HIT-STALE] ${cacheKey} age=${age}ms (refreshing in background)`);
+      res.set('X-ITSM-Counts-Cache', `HIT-STALE;node=${NODE_ID};ageMs=${age}`);
       res.set('ETag', cached.etag);
       if (req.get('if-none-match') !== cached.etag) {
         res.json(cached.data);
@@ -1544,13 +1652,12 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
       refreshCountsCache(cacheKey, userEmail, isAdmin).catch(err =>
         console.error(`Background counts refresh failed for ${cacheKey}:`, err?.message || err)
       );
-      // Pre-warm user's "My Tickets" caches so the next page nav is instant.
-      prewarmUserTickets(userEmail);
       return;
     }
 
     // 3) Cold cache → must compute synchronously.
     console.log(`[CACHE MISS] ${cacheKey} - computing fresh counts`);
+    res.set('X-ITSM-Counts-Cache', `MISS;node=${NODE_ID}`);
     const countData = await refreshCountsCache(cacheKey, userEmail, isAdmin);
     const fresh = countsCache.get(cacheKey);
     res.set('ETag', fresh.etag);
@@ -1739,9 +1846,15 @@ app.get('/api/agents', authenticateToken, async (req, res) => {
 
 // Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
 const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
-const USER_TICKETS_CACHE_MS  = 10 * 1000;       // 10 sec "fresh" window for near-real-time My Tickets
-const USER_TICKETS_STALE_MS  = 60 * 1000;       // 60 sec serve-stale-while-revalidate window
+const USER_TICKETS_CACHE_MS  = 60 * 1000;       // 60 sec "fresh" window for My Tickets
+const USER_TICKETS_STALE_MS  = 10 * 60 * 1000;  // 10 min serve-stale-while-revalidate window
 const userTicketsRefreshInFlight = new Map();   // Dedupe concurrent refreshes
+
+// Shared cache for standard tickets endpoint (non filterByEmail requests).
+const standardTicketsCache = new Map();          // key: endpoint -> { payload, time }
+const STANDARD_TICKETS_CACHE_MS = 30 * 1000;    // 30 sec fresh window
+const STANDARD_TICKETS_STALE_MS = 5 * 60 * 1000; // 5 min stale-while-revalidate window
+const standardTicketsRefreshInFlight = new Map();
 
 function invalidateRuntimeCaches() {
   // Mark all counts entries as stale (so SWR refreshes them) instead of
@@ -1757,6 +1870,57 @@ function invalidateRuntimeCaches() {
   }
   // Per-user caches are already stale-marked above; they'll self-refresh on
   // the next request via SWR — no shared-admin pre-warm needed here.
+
+  // Standard ticket list cache should also be stale-marked.
+  for (const [key, entry] of standardTicketsCache.entries()) {
+    entry.time = 0;
+    standardTicketsCache.set(key, entry);
+  }
+}
+
+async function refreshStandardTicketsCache(cacheKey, endpoint, limit) {
+  const inflight = standardTicketsRefreshInFlight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const response = await zohoFetch(endpoint);
+    if (!response.ok) {
+      let errorData = {};
+      try {
+        errorData = await response.json();
+      } catch {
+        // ignore parse error
+      }
+      const details = errorData?.message || errorData?.error || 'Unknown error';
+      throw new Error(`Failed to fetch tickets from Zoho (${response.status}): ${details}`);
+    }
+
+    const data = await response.json();
+    const normalized = (data.data || []).map(t => ({
+      ...t,
+      email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
+      assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+    }));
+
+    const recycledIds = await getActiveRecycledTicketIds();
+    const filtered = normalized.filter(t => !recycledIds.has((t.id || '').toString()));
+
+    const payload = {
+      count: filtered.length || 0,
+      hasMore: (data.data || []).length === limit,
+      data: filtered
+    };
+
+    standardTicketsCache.set(cacheKey, {
+      payload,
+      time: Date.now()
+    });
+
+    return payload;
+  })().finally(() => standardTicketsRefreshInFlight.delete(cacheKey));
+
+  standardTicketsRefreshInFlight.set(cacheKey, promise);
+  return promise;
 }
 
 // ── Compute the full filtered ticket list for a user (cold path) ──
@@ -1920,39 +2084,49 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
       ? `${endpoint}&searchText=${encodeURIComponent(search)}`
       : endpoint;
 
-    let response = await zohoFetch(searchEndpoint);
-
-    // Zoho searchText rejects some values (e.g., emails). Fallback to base listing.
-    if (search && response.status === 422) {
-      response = await zohoFetch(baseEndpoint);
+    // Preserve the fallback behavior for invalid search values while caching by final endpoint.
+    let effectiveEndpoint = searchEndpoint;
+    if (search) {
+      const probe = await zohoFetch(searchEndpoint);
+      if (probe.status === 422) {
+        effectiveEndpoint = baseEndpoint;
+      }
     }
-    
-    // Check if Zoho API returned an error
-    if (!response.ok) {
-      console.error(`Zoho API error: ${response.status} ${response.statusText}`);
-      const errorData = await response.json().catch(() => ({}));
-      return res.status(response.status).json({ 
-        error: 'Failed to fetch tickets from Zoho',
-        details: errorData?.message || errorData?.error || 'Unknown error'
-      });
-    }
-    
-    const data = await response.json();
-    const normalized = (data.data || []).map(t => ({
-      ...t,
-      email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
-      assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
-    }));
 
-    const recycledIds = await getActiveRecycledTicketIds();
-    const filtered = normalized.filter(t => !recycledIds.has((t.id || '').toString()));
+    const cacheKey = effectiveEndpoint;
+    const cached = standardTicketsCache.get(cacheKey);
+    const age = cached ? Date.now() - cached.time : Infinity;
+
+    let payload;
+    if (cached && age < STANDARD_TICKETS_CACHE_MS) {
+      payload = cached.payload;
+      res.set('X-ITSM-Tickets-Cache', 'HIT');
+    } else if (cached && age < STANDARD_TICKETS_STALE_MS) {
+      payload = cached.payload;
+      res.set('X-ITSM-Tickets-Cache', 'STALE');
+      refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit).catch(err =>
+        console.error(`Background standard tickets refresh failed for ${cacheKey}:`, err?.message || err)
+      );
+    } else {
+      try {
+        payload = await refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit);
+        res.set('X-ITSM-Tickets-Cache', 'MISS');
+      } catch (refreshErr) {
+        const message = refreshErr?.message || 'Unknown error';
+        console.error('Standard tickets refresh error:', message);
+        return res.status(502).json({
+          error: 'Failed to fetch tickets from Zoho',
+          details: message
+        });
+      }
+    }
 
     res.json({
       page,
       limit,
-      count: filtered.length || 0,
-      hasMore: (data.data || []).length === limit,
-      data: filtered
+      count: payload.count,
+      hasMore: payload.hasMore,
+      data: payload.data
     });
   } catch (err) {
     console.error('Tickets endpoint error:', err.message);

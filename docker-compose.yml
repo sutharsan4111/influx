@@ -9,6 +9,8 @@ services:
       - .env
     environment:
       - NODE_ENV=production
+      - ENABLE_ALERT_JOBS=false
+      - ENABLE_ZOHO_OUTBOUND=false
     volumes:
       - .:/usr/src/app
       - /usr/src/app/node_modules

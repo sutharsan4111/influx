@@ -1129,11 +1129,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
   isRefreshing = false;
   countsLoading = true;
 
-  // Server-side counts cache TTL is 20s; only force a network refresh if our
+  // Server-side counts cache TTL is now longer; only refresh when local
   // local snapshot is older than this. Eliminates redundant Zoho scans on
   // every dashboard route revisit.
-  private static readonly LOCAL_COUNTS_TTL_MS = 25_000;
-  private static readonly LOCAL_TICKETS_TTL_MS = 25_000;
+  private static readonly LOCAL_COUNTS_TTL_MS = 2 * 60 * 1000;
+  private static readonly LOCAL_TICKETS_TTL_MS = 2 * 60 * 1000;
 
   private destroy$ = new Subject<void>();
 

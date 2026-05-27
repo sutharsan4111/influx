@@ -1545,7 +1545,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   private isInitialLoad = true; // Track if first load or tab switch
   isRefreshing = false;
   private isAutoRefreshing = false;
-  private readonly myTicketsAutoRefreshMs = 8_000;
+  private readonly myTicketsAutoRefreshMs = 60_000;
   private dashboardQuickFilter: 'all' | 'sla' | 'assigned' = 'all';
 
   showCloseDialog = false;
@@ -1712,6 +1712,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
 
   private async autoRefreshMyTickets(): Promise<void> {
     if (this.selectedTab !== 'my') return;
+    if (document.visibilityState !== 'visible') return;
+    if (!document.hasFocus()) return;
     if (this.searchTerm) return;
     if (this.showAssignDialog || this.showBulkAssignDialog || this.showUpdateDialog || this.showCloseDialog) return;
     if (this.isRefreshing || this.isAutoRefreshing) return;
@@ -1719,18 +1721,6 @@ export class TicketsComponent implements OnInit, OnDestroy {
     this.isAutoRefreshing = true;
     try {
       await this.loadAssignmentsAsync();
-
-      this.ticketService.invalidateUserTicketCache(this.currentUserEmail, this.myStatus);
-      this.ticketService.invalidateTabCache([`my_${this.myStatus}`]);
-
-      if (this.myStatus === 'open') {
-        this.myTicketsOpenAll = [];
-        this.myTicketsOpenLastApiPage = 0;
-      } else {
-        this.myTicketsClosedAll = [];
-        this.myTicketsClosedLastApiPage = 0;
-      }
-
       await this.loadTickets(false);
     } finally {
       this.isAutoRefreshing = false;

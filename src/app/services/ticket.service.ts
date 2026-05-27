@@ -106,14 +106,14 @@ export class TicketService {
   // Cache with timestamp to prevent excessive reloading
   private ticketsCacheWithTime = new Map<string, { data: Observable<any>, timestamp: number }>();
   private cacheDurationMs = 5 * 60 * 1000; // 5 minutes cache - for full page navigation away and back
-  private myTicketsCacheDurationMs = 15 * 1000; // 15 seconds for near real-time personal bucket updates
-  private countsCacheDurationMs = 20 * 1000; // 20 seconds for near-real-time dashboard counts
+  private myTicketsCacheDurationMs = 60 * 1000; // 60 seconds for personal bucket updates without API overuse
+  private countsCacheDurationMs = 2 * 60 * 1000; // 2 minutes for dashboard counts
   private countsCacheTime = 0;
 
   // 🚀 GLOBAL TAB CACHE - persists across navigation (component destroy/recreate)
   private globalTabCache = new Map<string, TabCacheEntry>();
   private readonly TAB_CACHE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
-  private readonly MY_TAB_CACHE_EXPIRY_MS = 15 * 1000; // 15 seconds for My Tickets tab
+  private readonly MY_TAB_CACHE_EXPIRY_MS = 60 * 1000; // 60 seconds for My Tickets tab
 
   constructor(private http: HttpClient, private assignmentService: AssignmentService) {}
 
