@@ -37,6 +37,13 @@ import { MsalService } from '../services/msal.service';
         </li>
         <li *ngIf="isAdmin()"
             class="menu-item"
+            routerLink="/monitoring"
+            [class.active]="isActive('/monitoring')">
+          <i class="fas fa-desktop"></i>
+          <span>Monitoring</span>
+        </li>
+        <li *ngIf="isAdmin()"
+            class="menu-item"
             routerLink="/infrastructure/ssl"
             [class.active]="isLicenceSection()">
           <i class="fas fa-network-wired"></i>

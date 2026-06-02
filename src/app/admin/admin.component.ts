@@ -26,7 +26,7 @@ import { Router, RouterLink } from '@angular/router';
   <!-- CREATE USER -->
   <div class="card">
     <div class="form-row">
-      <input [(ngModel)]="newEmail" placeholder="UserName \ Email" />
+      <input [(ngModel)]="newEmail" placeholder="Username / Email" />
       <div class="password-field">
         <input [(ngModel)]="newPassword" type="password" placeholder="Password" (input)="validatePassword()" />
         <div class="password-strength" *ngIf="newPassword">
@@ -56,7 +56,7 @@ import { Router, RouterLink } from '@angular/router';
     <table>
       <thead>
         <tr>
-          <th>UserName \ Email</th>
+          <th>Username / Email</th>
           <th>Role</th>
           <th style="width:150px;">Actions</th>
         </tr>

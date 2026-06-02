@@ -107,7 +107,7 @@ import { MsalService } from '../services/msal.service';
                   [(ngModel)]="formData.departmentId"
                   required
                 >
-                  <option *ngFor="let dept of departments" [value]="dept.id">
+                  <option *ngFor="let dept of departments" [value]="dept.id" [disabled]="dept.name !== 'ITSM'">
                     {{ dept.name }}
                   </option>
                 </select>
@@ -990,8 +990,7 @@ export class CreateTicketComponent implements OnInit {
     { id: '132475000009937630', name: 'ITSM' },
     { id: '132475000009948173', name: 'Support - Coming Soon... ' },
     { id: '132475000009958716', name: 'Products - Coming Soon...' },
-    { id: '132475000009925079', name: 'HR - Coming Soon...' },
-    { id: '132475000000010772', name: 'Muraai - Coming Soon...' }
+    { id: '132475000009925079', name: 'HR - Coming Soon...' }
   ];
 
   constructor(

@@ -208,6 +208,43 @@ async function runMigrations() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket ON reply_authors(zoho_ticket_id)`);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS monitoring_devices (
+        device_id VARCHAR(100) PRIMARY KEY,
+        hostname VARCHAR(200) NOT NULL,
+        user_name VARCHAR(200),
+        user_email VARCHAR(200),
+        ip_address VARCHAR(50),
+        os_name VARCHAR(200),
+        os_version VARCHAR(100),
+        os_build VARCHAR(50),
+        last_seen TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS monitoring_telemetry (
+        id SERIAL PRIMARY KEY,
+        device_id VARCHAR(100) NOT NULL REFERENCES monitoring_devices(device_id) ON DELETE CASCADE,
+        screen_on BOOLEAN NOT NULL DEFAULT TRUE,
+        screen_on_duration INTEGER NOT NULL DEFAULT 0,
+        active_apps JSONB NOT NULL DEFAULT '[]'::jsonb,
+        all_processes JSONB NOT NULL DEFAULT '[]'::jsonb,
+        cpu_percent NUMERIC(6,2) NOT NULL DEFAULT 0,
+        memory_percent NUMERIC(6,2) NOT NULL DEFAULT 0,
+        disk_percent NUMERIC(6,2) NOT NULL DEFAULT 0,
+        reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_monitoring_telemetry_device_time
+        ON monitoring_telemetry (device_id, reported_at DESC)
+    `);
+
     // 🚀 Production performance indexes (007). Idempotent.
     try {
       await pool.query(`
@@ -364,6 +401,198 @@ function authorizeAdmin(req, res, next) {
   }
   next();
 }
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function toNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeDeviceRow(row) {
+  return {
+    ...row,
+    active_apps: parseJsonArray(row.active_apps),
+    all_processes: parseJsonArray(row.all_processes),
+    cpu_percent: toNumber(row.cpu_percent),
+    memory_percent: toNumber(row.memory_percent),
+    disk_percent: toNumber(row.disk_percent)
+  };
+}
+
+function canUseMonitoringKey() {
+  return Boolean(process.env.MONITORING_API_KEY);
+}
+
+function validateMonitoringKey(req, res, next) {
+  if (!canUseMonitoringKey()) {
+    return next();
+  }
+
+  const key = String(req.headers['x-monitoring-key'] || '');
+  if (key !== process.env.MONITORING_API_KEY) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  next();
+}
+
+app.post('/api/monitoring/telemetry', validateMonitoringKey, async (req, res) => {
+  try {
+    const {
+      device_id,
+      hostname,
+      user_name,
+      user_email,
+      ip_address,
+      os_name,
+      os_version,
+      os_build,
+      screen_on,
+      screen_on_duration,
+      active_apps,
+      all_processes,
+      cpu_percent,
+      memory_percent,
+      disk_percent,
+      reported_at
+    } = req.body || {};
+
+    if (!device_id || !hostname) {
+      return res.status(400).json({ message: 'device_id and hostname are required' });
+    }
+
+    const normalizedActiveApps = parseJsonArray(active_apps);
+    const normalizedAllProcesses = parseJsonArray(all_processes);
+    const reportedAt = reported_at ? new Date(reported_at) : new Date();
+
+    await pool.query(`
+      INSERT INTO monitoring_devices (
+        device_id, hostname, user_name, user_email, ip_address, os_name, os_version, os_build, last_seen, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+      ON CONFLICT (device_id) DO UPDATE SET
+        hostname = EXCLUDED.hostname,
+        user_name = EXCLUDED.user_name,
+        user_email = EXCLUDED.user_email,
+        ip_address = EXCLUDED.ip_address,
+        os_name = EXCLUDED.os_name,
+        os_version = EXCLUDED.os_version,
+        os_build = EXCLUDED.os_build,
+        last_seen = EXCLUDED.last_seen,
+        updated_at = NOW()
+    `, [
+      device_id,
+      hostname,
+      user_name || null,
+      user_email || null,
+      ip_address || null,
+      os_name || null,
+      os_version || null,
+      os_build || null,
+      reportedAt
+    ]);
+
+    await pool.query(`
+      INSERT INTO monitoring_telemetry (
+        device_id, screen_on, screen_on_duration, active_apps, all_processes,
+        cpu_percent, memory_percent, disk_percent, reported_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    `, [
+      device_id,
+      Boolean(screen_on),
+      toNumber(screen_on_duration),
+      JSON.stringify(normalizedActiveApps),
+      JSON.stringify(normalizedAllProcesses),
+      toNumber(cpu_percent),
+      toNumber(memory_percent),
+      toNumber(disk_percent),
+      reportedAt
+    ]);
+
+    res.json({ status: 'ok' });
+  } catch (err) {
+    console.error('Monitoring telemetry error:', err);
+    res.status(500).json({ message: 'Failed to save telemetry' });
+  }
+});
+
+app.get('/api/monitoring/devices', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        d.device_id,
+        d.hostname,
+        d.user_name,
+        d.user_email,
+        d.ip_address,
+        d.os_name,
+        d.os_version,
+        d.os_build,
+        d.last_seen,
+        t.screen_on,
+        t.screen_on_duration,
+        t.active_apps,
+        t.all_processes,
+        t.cpu_percent,
+        t.memory_percent,
+        t.disk_percent,
+        t.reported_at
+      FROM monitoring_devices d
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM monitoring_telemetry t
+        WHERE t.device_id = d.device_id
+        ORDER BY t.reported_at DESC, t.id DESC
+        LIMIT 1
+      ) t ON true
+      ORDER BY d.last_seen DESC NULLS LAST, d.hostname ASC
+    `);
+
+    res.json(result.rows.map(normalizeDeviceRow));
+  } catch (err) {
+    console.error('Monitoring devices error:', err);
+    res.status(500).json({ message: 'Failed to fetch devices' });
+  }
+});
+
+app.get('/api/monitoring/devices/:deviceId/history', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        device_id,
+        screen_on,
+        screen_on_duration,
+        active_apps,
+        all_processes,
+        cpu_percent,
+        memory_percent,
+        disk_percent,
+        reported_at,
+        created_at
+      FROM monitoring_telemetry
+      WHERE device_id = $1
+      ORDER BY reported_at DESC, id DESC
+      LIMIT 100
+    `, [req.params.deviceId]);
+
+    res.json(result.rows.map(normalizeDeviceRow));
+  } catch (err) {
+    console.error('Monitoring history error:', err);
+    res.status(500).json({ message: 'Failed to fetch history' });
+  }
+});
 
 function getGraphToken(req) {
   return (req.headers["x-graph-token"] || "").toString();
