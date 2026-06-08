@@ -209,6 +209,50 @@ async function runMigrations() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket ON reply_authors(zoho_ticket_id)`);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_role_bindings (
+        id SERIAL PRIMARY KEY,
+        microsoft_email VARCHAR(255) NOT NULL UNIQUE,
+        roles TEXT[] NOT NULL DEFAULT ARRAY['user']::TEXT[],
+        assigned_by VARCHAR(255),
+        notes TEXT,
+        assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_role_bindings_email ON user_role_bindings(microsoft_email)`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS group_role_bindings (
+        id SERIAL PRIMARY KEY,
+        group_identifier VARCHAR(255) NOT NULL UNIQUE,
+        roles TEXT[] NOT NULL DEFAULT ARRAY['user']::TEXT[],
+        assigned_by VARCHAR(255),
+        notes TEXT,
+        assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_group_role_bindings_identifier ON group_role_bindings(group_identifier)`);
+
+    // Seed test account with all roles for profile role-switch validation.
+    await pool.query(
+      `INSERT INTO user_role_bindings (microsoft_email, roles, assigned_by, notes, assigned_at, updated_at)
+       VALUES ($1, $2::text[], $3, $4, NOW(), NOW())
+       ON CONFLICT (microsoft_email)
+       DO UPDATE SET
+         roles = EXCLUDED.roles,
+         assigned_by = EXCLUDED.assigned_by,
+         notes = EXCLUDED.notes,
+         updated_at = NOW()`,
+      [
+        'automation.cloudops@muraai.com',
+        ['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai'],
+        'system-seed',
+        'Seeded all roles for testing role switching'
+      ]
+    );
+
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS monitoring_devices (
         device_id VARCHAR(100) PRIMARY KEY,
         hostname VARCHAR(200) NOT NULL,
@@ -266,6 +310,15 @@ async function runMigrations() {
       `);
     } catch (e) {
       console.warn('⚠️ Performance index creation warning:', e?.message);
+    }
+
+    // Drop legacy CHECK constraints that restrict role values to old set.
+    // These constraints block saving cloudops/hr/product/muraai/support roles.
+    try {
+      await pool.query(`ALTER TABLE user_roles DROP CONSTRAINT IF EXISTS user_roles_role_check`);
+      await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+    } catch (e) {
+      console.warn('⚠️ Role constraint drop warning:', e?.message);
     }
 
     console.log("✅ Database migrations applied");
@@ -396,8 +449,18 @@ async function sendEmailViaAzure(fromEmail, toEmail, subject, content, userInfo)
 // 🔐 ADMIN ROLE MIDDLEWARE
 // ---------------------------
 function authorizeAdmin(req, res, next) {
-  if (req.user.role !== "admin") {
+  const role = req.user.role;
+  if (role !== "admin" && role !== "cloudops") {
     return res.status(403).json({ message: "Admin only access" });
+  }
+  next();
+}
+
+const ELEVATED_ROLES = new Set(['admin', 'cloudops', 'product', 'hr', 'support', 'muraai']);
+function authorizeElevated(req, res, next) {
+  const role = (req.user?.role || '').toLowerCase();
+  if (!ELEVATED_ROLES.has(role)) {
+    return res.status(403).json({ message: 'Elevated role required' });
   }
   next();
 }
@@ -664,16 +727,19 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
+    const normalizedRole = normalizeRole(user.role) || 'user';
+    const roles = normalizeRoleList([normalizedRole]);
+
     // 🔥 ACCESS TOKEN (1 hour)
     const accessToken = jwt.sign(
-      { email: user.email, role: user.role },
+      { email: user.email, role: normalizedRole, roles },
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 
     // 🔥 REFRESH TOKEN (7 days)
     const refreshToken = jwt.sign(
-      { email: user.email, role: user.role },
+      { email: user.email, role: normalizedRole, roles },
       process.env.JWT_REFRESH_SECRET,
       { expiresIn: "7d" }
     );
@@ -681,7 +747,8 @@ app.post("/api/login", async (req, res) => {
     res.json({
       accessToken,
       refreshToken,
-      role: user.role,
+      role: normalizedRole,
+      roles,
       email: user.email
     });
 
@@ -699,13 +766,44 @@ app.post("/api/refresh", (req, res) => {
     if (err) return res.sendStatus(403);
 
     const newAccessToken = jwt.sign(
-      { email: user.email, role: user.role },
+      { email: user.email, role: user.role, roles: normalizeRoleList(user.roles || [user.role]) },
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 
     res.json({ accessToken: newAccessToken });
   });
+});
+
+app.post('/api/auth/switch-role', authenticateToken, async (req, res) => {
+  try {
+    const requestedRole = normalizeRole(req.body?.role);
+    if (!requestedRole) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    const tokenRoles = normalizeRoleList(req.user?.roles || [req.user?.role]);
+    if (!tokenRoles.includes(requestedRole)) {
+      return res.status(403).json({ error: 'Role is not assigned to this user' });
+    }
+
+    const email = (req.user?.email || '').toLowerCase();
+    const accessToken = jwt.sign(
+      { email, role: requestedRole, roles: tokenRoles },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    const refreshToken = jwt.sign(
+      { email, role: requestedRole, roles: tokenRoles },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({ accessToken, refreshToken, role: requestedRole, roles: tokenRoles });
+  } catch (err) {
+    console.error('Role switch failed:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to switch role' });
+  }
 });
 
 
@@ -735,6 +833,143 @@ const AUTOMATION_SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const AUTOMATION_PROMETHEUS_URL = (process.env.AUTOMATION_PROMETHEUS_URL || '').trim();
 const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
 const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
+const ADMIN_GROUP_MAIL = (process.env.ADMIN_GROUP_MAIL || 'automation.cloudops@muraai.com').trim().toLowerCase();
+const ADMIN_GROUP_NAME = (process.env.ADMIN_GROUP_NAME || 'automation.cloudops').trim().toLowerCase();
+const CLOUDOPS_GROUP_MAIL = (process.env.CLOUDOPS_GROUP_MAIL || 'cloudops@muraai.com').trim().toLowerCase();
+const CLOUDOPS_GROUP_NAME = (process.env.CLOUDOPS_GROUP_NAME || 'cloudops').trim().toLowerCase();
+
+const DEFAULT_ADMIN_EMAIL_ALLOWLIST = [
+  'ravi.chadaram@muraai.com',
+  'senthil.n@muraai.com',
+  't.balaji@muraai.com',
+  'akash.yadav@muraai.com',
+  'automation.cloudops@muraai.com'
+];
+
+const ADMIN_EMAIL_ALLOWLIST = new Set(
+  (process.env.ADMIN_EMAIL_ALLOWLIST || DEFAULT_ADMIN_EMAIL_ALLOWLIST.join(','))
+    .split(',')
+    .map(v => (v || '').trim().toLowerCase())
+    .filter(Boolean)
+);
+
+function isAllowlistedAdminEmail(email) {
+  return ADMIN_EMAIL_ALLOWLIST.has((email || '').toString().trim().toLowerCase());
+}
+
+const SUPPORTED_ROLES = ['admin', 'cloudops', 'product', 'hr', 'support', 'muraai', 'user'];
+const DEPARTMENT_ROLE_KEYS = ['itsm', 'product', 'hr', 'support', 'muraai'];
+const ROLE_PRIORITY = ['admin', 'cloudops', 'support', 'product', 'hr', 'muraai', 'user'];
+
+const DEPARTMENT_IDS = {
+  itsm: (process.env.DEPT_ITSM_ID || '132475000009937630').trim(),
+  support: (process.env.DEPT_SUPPORT_ID || '132475000009948173').trim(),
+  product: (process.env.DEPT_PRODUCT_ID || '132475000009958716').trim(),
+  hr: (process.env.DEPT_HR_ID || '132475000009925079').trim(),
+  muraai: (process.env.DEPT_MURAAI_ID || '132475000000010772').trim()
+};
+
+function normalizeRole(role) {
+  const v = (role || '').toString().trim().toLowerCase();
+  if (v === 'itsm') return 'cloudops';
+  return SUPPORTED_ROLES.includes(v) ? v : null;
+}
+
+function parseRoleCsv(value) {
+  return [...new Set(
+    (value || '')
+      .split(',')
+      .map(v => normalizeRole(v))
+      .filter(Boolean)
+  )];
+}
+
+function parseRoleJson(value, fallback = {}) {
+  try {
+    const parsed = JSON.parse(value || '');
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+const DEFAULT_ROLE_GROUPS = {
+  admin: [ADMIN_GROUP_MAIL, ADMIN_GROUP_NAME],
+  cloudops: [CLOUDOPS_GROUP_MAIL, CLOUDOPS_GROUP_NAME, 'itsm@muraai.com', 'itsm'],
+  product: ['product@muraai.com', 'products@muraai.com', 'product', 'products'],
+  hr: ['hr@muraai.com', 'hr'],
+  support: ['support@muraai.com', 'support'],
+  muraai: ['muraai@muraai.com', 'muraai']
+};
+
+const ROLE_GROUP_MAP = (() => {
+  const fromEnv = parseRoleJson(process.env.ROLE_GROUP_MAP, {});
+  const merged = { ...DEFAULT_ROLE_GROUPS };
+  for (const [role, entries] of Object.entries(fromEnv || {})) {
+    const nr = normalizeRole(role);
+    if (!nr || !Array.isArray(entries)) continue;
+    merged[nr] = entries.map(v => (v || '').toString().trim().toLowerCase()).filter(Boolean);
+  }
+  return merged;
+})();
+
+function rolesFromGraphGroups(groups = []) {
+  const found = new Set();
+  for (const g of groups) {
+    const values = [g?.mail, g?.displayName, g?.mailNickname]
+      .map(v => (v || '').toString().trim().toLowerCase())
+      .filter(Boolean);
+    for (const role of Object.keys(ROLE_GROUP_MAP)) {
+      const matches = ROLE_GROUP_MAP[role] || [];
+      if (values.some(v => matches.includes(v))) {
+        found.add(role);
+      }
+    }
+  }
+  return [...found];
+}
+
+function normalizeRoleList(roles, fallbackRole = 'user') {
+  const arr = Array.isArray(roles) ? roles : [];
+  const normalized = arr.map(r => normalizeRole(r)).filter(Boolean);
+  if (!normalized.length) return fallbackRole ? [fallbackRole] : [];
+  return [...new Set(normalized)];
+}
+
+function pickDefaultRole(roles, preferredRole, fallbackRole = 'user') {
+  const allowed = new Set(normalizeRoleList(roles, fallbackRole));
+  const preferred = normalizeRole(preferredRole);
+  if (preferred && allowed.has(preferred)) return preferred;
+  for (const role of ROLE_PRIORITY) {
+    if (allowed.has(role)) return role;
+  }
+  return fallbackRole;
+}
+
+function extractTicketDepartmentId(ticket = {}) {
+  return (
+    ticket.departmentId ||
+    ticket.department?.id ||
+    ticket.department?.departmentId ||
+    ticket.departmentIdStr ||
+    ''
+  ).toString();
+}
+
+function getAllowedDepartmentIdsForRole(role) {
+  const r = normalizeRole(role) || 'user';
+  if (r === 'admin' || r === 'user') return [];
+  if (r === 'cloudops') {
+    return [DEPARTMENT_IDS.itsm];
+  }
+  return DEPARTMENT_IDS[r] ? [DEPARTMENT_IDS[r]] : [];
+}
+
+function isDepartmentAllowed(ticket, allowedDeptIds = []) {
+  if (!Array.isArray(allowedDeptIds) || allowedDeptIds.length === 0) return true;
+  const tid = extractTicketDepartmentId(ticket);
+  return !!tid && allowedDeptIds.includes(tid);
+}
 
 let egressIpCache = { value: '', time: 0 };
 const EGRESS_IP_CACHE_MS = 10 * 60 * 1000;
@@ -865,7 +1100,56 @@ if (ENABLE_ALERT_JOBS) {
 // ------------------------
 // ZOHO API HELPER
 // ------------------------
+
+// 🚀 Global rate limiter: max 1200 calls/hour (~20/min) to stay well under 85k/day
+const ZOHO_RATE_LIMIT_PER_HOUR = 1200;
+const zohoRateBucket = {
+  tokens: ZOHO_RATE_LIMIT_PER_HOUR,
+  lastRefill: Date.now(),
+  maxTokens: ZOHO_RATE_LIMIT_PER_HOUR,
+  refillRate: ZOHO_RATE_LIMIT_PER_HOUR / 3600000 // tokens per ms
+};
+
+function zohoRateLimitCheck() {
+  const now = Date.now();
+  const elapsed = now - zohoRateBucket.lastRefill;
+  zohoRateBucket.tokens = Math.min(
+    zohoRateBucket.maxTokens,
+    zohoRateBucket.tokens + elapsed * zohoRateBucket.refillRate
+  );
+  zohoRateBucket.lastRefill = now;
+
+  if (zohoRateBucket.tokens < 1) {
+    return false; // rate limited
+  }
+  zohoRateBucket.tokens -= 1;
+  return true;
+}
+
+// Track API usage for observability
+let zohoApiCallCount = 0;
+let zohoApiCallCountResetTime = Date.now();
+function trackZohoApiCall() {
+  const now = Date.now();
+  if (now - zohoApiCallCountResetTime > 3600000) {
+    console.log(`[ZOHO RATE] ${zohoApiCallCount} API calls in last hour`);
+    zohoApiCallCount = 0;
+    zohoApiCallCountResetTime = now;
+  }
+  zohoApiCallCount++;
+}
+
 async function zohoFetch(endpoint, options = {}) {
+  // Rate limit check — reject if budget exhausted
+  if (!zohoRateLimitCheck()) {
+    console.warn(`[ZOHO RATE LIMIT] Blocked call to ${endpoint} — hourly budget exhausted`);
+    return new Response(
+      JSON.stringify({ error: 'Zoho API rate limit reached. Try again later.', endpoint }),
+      { status: 429, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+  trackZohoApiCall();
+
   if (!ENABLE_ZOHO_OUTBOUND) {
     return new Response(
       JSON.stringify({
@@ -931,6 +1215,14 @@ async function zohoFetch(endpoint, options = {}) {
 async function lookupAgentIdByEmail(email) {
   if (!email) return '';
   const target = email.trim().toLowerCase();
+
+  // 🚀 Use cached agents list first to avoid unnecessary Zoho API calls
+  if (agentsCache && Array.isArray(agentsCache) && agentsCache.length > 0) {
+    const cached = agentsCache.find(a => (a.email || '').toLowerCase() === target);
+    if (cached?.id) return cached.id;
+  }
+
+  // Fallback: paginate Zoho agents API only if cache miss
   const limit = 100;
   let from = 0;
   let hasMore = true;
@@ -1022,8 +1314,13 @@ function parseMilestoneDays(alert) {
 
 function buildAlertFingerprint(alert, milestoneDays) {
   const labels = alert?.labels || {};
+  // Use a fixed alertname so that the scheduled Prometheus job and the
+  // Alertmanager webhook share the same fingerprint namespace for the same
+  // certificate+milestone combination. Without this, each path generates a
+  // different fingerprint (e.g. 'AutomationSSLExpiry' vs 'SSLCert_30Days')
+  // and both create tickets for the same cert — the primary duplicate vector.
   const raw = [
-    labels.alertname || 'SSL_ALERT',
+    'SSL_ALERT',
     labels.client || 'unknown-client',
     labels.instance || labels.target || labels.url || 'unknown-instance',
     labels.application || 'unknown-app',
@@ -1267,30 +1564,39 @@ async function createAlertmanagerSslTicket(alert, milestoneDays) {
 
   const fingerprint = buildAlertFingerprint(alert, milestoneDays);
 
-  // Check if an Open/Pending ticket already exists for this fingerprint.
-  // If the previous ticket was Closed, allow a new one to be created.
+  // Primary dedup: check by normalised fingerprint (alertname-agnostic).
+  // Secondary dedup: check by (instance, milestone_days, client) so that
+  // records created with old fingerprints (before the normalisation change)
+  // still prevent cross-path duplicates.
   const existing = await pool.query(
     `SELECT id, status FROM alertmanager_ssl_tickets 
-     WHERE alert_fingerprint = $1
+     WHERE (
+       alert_fingerprint = $1
+       OR (instance = $2 AND milestone_days = $3 AND client = $4)
+     )
+     AND status IN ('Open', 'Pending')
      ORDER BY id DESC LIMIT 1`,
-    [fingerprint]
+    [fingerprint, instance, milestoneDays, client]
   );
-  if (existing.rows.length > 0 && ['Open', 'Pending'].includes(existing.rows[0].status)) {
+  if (existing.rows.length > 0) {
     return { status: 'duplicate', reason: 'already processed' };
   }
 
-  // Remove old closed row so the unique constraint allows a fresh insert.
-  if (existing.rows.length > 0) {
-    await pool.query(
-      `DELETE FROM alertmanager_ssl_tickets WHERE alert_fingerprint = $1 AND status = 'Closed'`,
-      [fingerprint]
-    );
-  }
+  // Remove old closed rows that share the fingerprint so the UNIQUE
+  // constraint allows a fresh insert for a renewed certificate.
+  await pool.query(
+    `DELETE FROM alertmanager_ssl_tickets WHERE alert_fingerprint = $1 AND status = 'Closed'`,
+    [fingerprint]
+  );
 
+  // ON CONFLICT DO NOTHING guards against race conditions where two
+  // concurrent callers (scheduler + webhook) both pass the check above
+  // before either has committed its INSERT.
   const reservation = await pool.query(
     `INSERT INTO alertmanager_ssl_tickets
       (alert_fingerprint, alertname, milestone_days, client, environment, application, instance, responsible, responsible_email, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Pending')
+     ON CONFLICT (alert_fingerprint) DO NOTHING
      RETURNING id`,
     [
       fingerprint,
@@ -1819,8 +2125,8 @@ async function processSslAlerts() {
 
 // 🚀 OPTIMIZED: Production-grade caching system
 const countsCache = new Map(); // Cache per user role
-const COUNTS_CACHE_MS = 15 * 60 * 1000;       // 15 min "fresh" window
-const COUNTS_STALE_MS = 30 * 60 * 1000;       // 30 min serve-stale-while-revalidate window
+const COUNTS_CACHE_MS = 2 * 60 * 60 * 1000;   // 2 hour "fresh" window (reduced API consumption)
+const COUNTS_STALE_MS = 4 * 60 * 60 * 1000;   // 4 hour serve-stale-while-revalidate window
 const countsRefreshInFlight = new Map();      // Dedupe concurrent background refreshes
 let agentsCache = null;
 let agentsCacheTime = 0;
@@ -1850,10 +2156,17 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
   try {
     const userEmail = req.user?.email?.toLowerCase() || '';
     const userRole = (req.user?.role || 'user').toLowerCase();
-    const isAdmin = userRole === 'admin';
+    const isAdmin = userRole === 'admin' || userRole === 'cloudops';
+    let allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
+
+    // Allow admin to filter by specific department
+    const reqDeptId = (req.query.departmentId || '').toString().trim();
+    if (isAdmin && reqDeptId) {
+      allowedDeptIds = [reqDeptId];
+    }
 
     // Per-user cache key — assigned/SLA counts are personal even for admins.
-    const cacheKey = `counts_${isAdmin ? 'admin_' : 'user_'}${userEmail}`;
+    const cacheKey = `counts_${isAdmin ? 'admin_' : 'user_'}${userRole}_${userEmail}${reqDeptId ? '_dept_' + reqDeptId : ''}`;
     const cached = countsCache.get(cacheKey);
     const now = Date.now();
     const age = cached ? now - cached.time : Infinity;
@@ -1878,7 +2191,7 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
         res.status(304).end();
       }
       // Fire-and-forget refresh, deduped per cache key.
-      refreshCountsCache(cacheKey, userEmail, isAdmin).catch(err =>
+      refreshCountsCache(cacheKey, userEmail, isAdmin, allowedDeptIds).catch(err =>
         console.error(`Background counts refresh failed for ${cacheKey}:`, err?.message || err)
       );
       return;
@@ -1887,12 +2200,12 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
     // 3) Cold cache → must compute synchronously.
     console.log(`[CACHE MISS] ${cacheKey} - computing fresh counts`);
     res.set('X-ITSM-Counts-Cache', `MISS;node=${NODE_ID}`);
-    const countData = await refreshCountsCache(cacheKey, userEmail, isAdmin);
+    const countData = await refreshCountsCache(cacheKey, userEmail, isAdmin, allowedDeptIds);
     const fresh = countsCache.get(cacheKey);
     res.set('ETag', fresh.etag);
     if (req.get('if-none-match') === fresh.etag) return res.status(304).end();
     // Pre-warm user's "My Tickets" caches in background after responding.
-    prewarmUserTickets(userEmail);
+    prewarmUserTickets(userEmail, userRole);
     res.json(countData);
   } catch (err) {
     console.error('Counts error:', err);
@@ -1901,20 +2214,21 @@ app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
 });
 
 // Background-prefetch a user's My Tickets (open + closed) if not already fresh.
-function prewarmUserTickets(userEmail) {
+function prewarmUserTickets(userEmail, userRole = 'user') {
   if (!userEmail) return;
+  const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
   for (const status of ['open', 'closed']) {
-    const cacheKey = `${userEmail}_${status}`;
+    const cacheKey = `${userRole}_${userEmail}_${status}_all`;
     const cached = userTicketsCache.get(cacheKey);
     if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) continue;
-    refreshUserTicketsCache(cacheKey, userEmail, status).catch(err =>
+    refreshUserTicketsCache(cacheKey, userEmail, status, 'all', allowedDeptIds).catch(err =>
       console.error(`Pre-warm user-tickets failed for ${cacheKey}:`, err?.message || err)
     );
   }
 }
 
 // ---- Counts computation (extracted so it can run in background + at startup) ----
-async function computeCounts(userEmail, isAdmin) {
+async function computeCounts(userEmail, isAdmin, allowedDeptIds = []) {
   const recycledTicketIds = await getActiveRecycledTicketIds();
 
   let mySupabaseAssignedIds = new Set();
@@ -1932,11 +2246,13 @@ async function computeCounts(userEmail, isAdmin) {
 
   const PAGE_SIZE = 100;
   const PARALLEL_PAGES = 3;
+  const hasSingleDept = Array.isArray(allowedDeptIds) && allowedDeptIds.length === 1;
+  const deptQuery = hasSingleDept ? `&departmentId=${allowedDeptIds[0]}` : '';
   async function fetchPageWithRetry(status, from) {
     for (let attempt = 0; attempt < 2; attempt++) {
       let r;
       try {
-        r = await zohoFetch(`/tickets?limit=${PAGE_SIZE}&from=${from}&status=${status}&include=assignee`);
+        r = await zohoFetch(`/tickets?limit=${PAGE_SIZE}&from=${from}&status=${status}&include=assignee${deptQuery}`);
       } catch (e) {
         console.error(`Network error fetching ${status} at from=${from}:`, e?.message || e);
         return { tickets: [], more: false };
@@ -1970,7 +2286,13 @@ async function computeCounts(userEmail, isAdmin) {
       for (const { tickets, more } of results) {
         for (const t of tickets) {
           const ticketId = (t.id || '').toString();
-          if (ticketId && !recycledTicketIds.has(ticketId)) perTicket(t, ticketId);
+          if (
+            ticketId &&
+            !recycledTicketIds.has(ticketId) &&
+            isDepartmentAllowed(t, allowedDeptIds)
+          ) {
+            perTicket(t, ticketId);
+          }
         }
         if (more) anyMore = true;
       }
@@ -2016,13 +2338,13 @@ async function computeCounts(userEmail, isAdmin) {
 }
 
 // Dedupe concurrent refreshes for the same cache key.
-async function refreshCountsCache(cacheKey, userEmail, isAdmin) {
+async function refreshCountsCache(cacheKey, userEmail, isAdmin, allowedDeptIds = []) {
   const inflight = countsRefreshInFlight.get(cacheKey);
   if (inflight) return inflight;
 
   const promise = (async () => {
     const start = Date.now();
-    const countData = await computeCounts(userEmail, isAdmin);
+    const countData = await computeCounts(userEmail, isAdmin, allowedDeptIds);
     const etag = '"' + crypto.createHash('md5').update(JSON.stringify(countData)).digest('hex') + '"';
     countsCache.set(cacheKey, { data: countData, time: Date.now(), etag });
     console.log(`[COUNTS REFRESHED] ${cacheKey} in ${Date.now() - start}ms`);
@@ -2075,8 +2397,8 @@ app.get('/api/agents', authenticateToken, async (req, res) => {
 
 // Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
 const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
-const USER_TICKETS_CACHE_MS  = 60 * 1000;       // 60 sec "fresh" window for My Tickets
-const USER_TICKETS_STALE_MS  = 10 * 60 * 1000;  // 10 min serve-stale-while-revalidate window
+const USER_TICKETS_CACHE_MS  = 5 * 60 * 1000;   // 5 min "fresh" window for My Tickets (was 60s)
+const USER_TICKETS_STALE_MS  = 30 * 60 * 1000;  // 30 min serve-stale-while-revalidate window
 const userTicketsRefreshInFlight = new Map();   // Dedupe concurrent refreshes
 
 // Shared cache for standard tickets endpoint (non filterByEmail requests).
@@ -2107,7 +2429,7 @@ function invalidateRuntimeCaches() {
   }
 }
 
-async function refreshStandardTicketsCache(cacheKey, endpoint, limit) {
+async function refreshStandardTicketsCache(cacheKey, endpoint, limit, allowedDeptIds = []) {
   const inflight = standardTicketsRefreshInFlight.get(cacheKey);
   if (inflight) return inflight;
 
@@ -2132,7 +2454,10 @@ async function refreshStandardTicketsCache(cacheKey, endpoint, limit) {
     }));
 
     const recycledIds = await getActiveRecycledTicketIds();
-    const filtered = normalized.filter(t => !recycledIds.has((t.id || '').toString()));
+    const filtered = normalized.filter(t => {
+      if (recycledIds.has((t.id || '').toString())) return false;
+      return isDepartmentAllowed(t, allowedDeptIds);
+    });
 
     const payload = {
       count: filtered.length || 0,
@@ -2152,11 +2477,10 @@ async function refreshStandardTicketsCache(cacheKey, endpoint, limit) {
   return promise;
 }
 
-// ── Compute the full filtered ticket list for a user (cold path) ──
-async function computeUserTickets(userEmail, status) {
+// ── Compute the full filtered ticket list for a user ──
+// Uses Zoho contact search (fast path) + limited assignee scan + Supabase-assigned fetch.
+async function computeUserTickets(userEmail, status, filterType = 'all', allowedDeptIds = []) {
   const include = 'contacts,assignee';
-  const apiPageSize = 100;
-  const PARALLEL_BATCH = 5;
 
   const [recycledIds, supabaseResult] = await Promise.all([
     getActiveRecycledTicketIds(),
@@ -2167,70 +2491,143 @@ async function computeUserTickets(userEmail, status) {
   ]);
   const supabaseAssignedIds = new Set(supabaseResult.rows.map(r => r.zoho_ticket_id));
 
-  function filterMyTickets(tickets) {
-    const out = [];
-    for (const t of tickets) {
-      const ticketId = (t.id || '').toString();
-      if (!ticketId || recycledIds.has(ticketId)) continue;
-      const contactEmail  = (t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail || '').toLowerCase();
-      const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
-      if (contactEmail === userEmail || assigneeEmail === userEmail || supabaseAssignedIds.has(ticketId)) {
-        out.push({
-          ...t,
-          email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
-          assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
-        });
-      }
-    }
-    return out;
+  // status filter lists for Zoho API
+  let statusValues;
+  if (status === 'open') statusValues = ['Open', 'In Progress', 'On Hold', 'Escalated'];
+  else if (status === 'closed') statusValues = ['Closed', 'Resolved'];
+  else statusValues = [''];
+
+  const seenIds = new Set();
+  const allUserTickets = [];
+
+  function isStatusMatch(t) {
+    const s = (t.status || '').toLowerCase();
+    if (status === 'open') return !s.includes('closed') && !s.includes('resolved');
+    if (status === 'closed') return s.includes('closed') || s.includes('resolved');
+    return true;
   }
 
-  // Zoho has distinct status values — 'open' tab needs both Open AND In Progress,
-  // 'closed' tab needs both Closed AND Resolved to avoid missing tickets.
-  let statusParamList;
-  if (status === 'open') statusParamList = ['&status=Open', '&status=In%20Progress'];
-  else if (status === 'closed') statusParamList = ['&status=Closed', '&status=Resolved'];
-  else statusParamList = [''];
+  function addTicket(t) {
+    const tid = (t.id || '').toString();
+    if (!tid || recycledIds.has(tid) || seenIds.has(tid)) return;
+    if (!isDepartmentAllowed(t, allowedDeptIds)) return;
+    const contactEmail = (t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail || '').toLowerCase();
+    const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toLowerCase();
+    const isRequester = contactEmail === userEmail;
+    const isAssignee = assigneeEmail === userEmail || supabaseAssignedIds.has(tid);
+    // Apply filterType
+    if (filterType === 'assigned' && !isAssignee) return;
+    if (filterType === 'raised' && !isRequester) return;
+    if (!isRequester && !isAssignee) return;
+    seenIds.add(tid);
+    allUserTickets.push({
+      ...t,
+      email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
+      assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+    });
+  }
 
-  const allUserTickets = [];
-  const seenTicketIds = new Set();
+  // ── Path 1: Contact-based search (fast — gets tickets where user is the requester) ──
+  try {
+    const contactRes = await zohoFetch(`/contacts/search?email=${encodeURIComponent(userEmail)}&limit=5`)
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null);
+    const contacts = Array.isArray(contactRes?.data) ? contactRes.data : [];
 
-  for (const statusParam of statusParamList) {
-    let zohoFrom = 0;
+    // Some Zoho setups have duplicate contact records for one email.
+    // Scan all matched contacts so requester tickets aren't missed.
+    for (const contact of contacts) {
+      if (!contact?.id) continue;
+      let from = 0;
+      let more = true;
+      while (more) {
+        const res = await zohoFetch(
+          `/contacts/${contact.id}/tickets?from=${from}&limit=100&include=${include}`
+        ).then(r => r.ok ? r.json() : null).catch(() => null);
+        const tickets = res?.data || [];
+        tickets.filter(isStatusMatch).forEach(t => {
+          // Force-set email since these tickets come from the matched contact.
+          if (!t.email && !t.contact?.email && !t.contact?.emailAddress) {
+            t.email = (contact.email || userEmail).toLowerCase();
+          }
+          addTicket(t);
+        });
+        more = tickets.length === 100;
+        from += 100;
+        if (from > 2000) more = false;
+      }
+    }
+  } catch (e) {
+    console.error('[computeUserTickets] contact path error:', e?.message || e);
+  }
+
+  // ── Path 2: Fallback scan for requester/assignee tickets in global list ──
+  {
+    const BATCH = 5;
+    const PAGE = 100;
+    const MAX_OFFSET = 3000;
+    let from = 0;
     let keepScanning = true;
-
     while (keepScanning) {
       const batchPromises = [];
-      for (let i = 0; i < PARALLEL_BATCH; i++) {
-        const offset = zohoFrom + i * apiPageSize;
-        if (offset > 5000) break;
-        const ep = `/tickets?limit=${apiPageSize}&from=${offset}&include=${include}${statusParam}`;
+      for (let i = 0; i < BATCH; i++) {
+        const offset = from + i * PAGE;
+        if (offset > MAX_OFFSET) break;
         batchPromises.push(
-          zohoFetch(ep)
+          zohoFetch(`/tickets?limit=${PAGE}&from=${offset}&include=${include}`)
             .then(r => r.ok ? r.json() : { data: [] })
             .then(d => ({ data: d.data || [], offset }))
             .catch(() => ({ data: [], offset }))
         );
       }
-      if (batchPromises.length === 0) break;
-
+      if (!batchPromises.length) break;
       const batchResults = await Promise.all(batchPromises);
       batchResults.sort((a, b) => a.offset - b.offset);
-
-      let anyPageFull = false;
+      let anyFull = false;
       for (const r of batchResults) {
-        for (const t of filterMyTickets(r.data)) {
+        for (const t of r.data) {
           const tid = (t.id || '').toString();
-          if (tid && !seenTicketIds.has(tid)) {
-            seenTicketIds.add(tid);
-            allUserTickets.push(t);
+          const requesterEmail = (
+            t.email ||
+            t.contact?.email ||
+            t.contact?.emailAddress ||
+            t.contact?.secondaryEmail ||
+            t.requester?.email ||
+            t.customer?.email
+          || '').toLowerCase();
+          const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toLowerCase();
+          const isRequester = requesterEmail === userEmail;
+          const isAssignee = assigneeEmail === userEmail || supabaseAssignedIds.has(tid);
+          if ((isRequester || isAssignee) && isStatusMatch(t)) {
+            addTicket(t);
           }
         }
-        if (r.data.length === apiPageSize) anyPageFull = true;
+        if (r.data.length === PAGE) anyFull = true;
       }
-      if (!anyPageFull) break;
-      zohoFrom += PARALLEL_BATCH * apiPageSize;
-      if (zohoFrom > 5000) break;
+      if (!anyFull) break;
+      from += BATCH * PAGE;
+      if (from > MAX_OFFSET) break;
+      keepScanning = true;
+    }
+  }
+
+  // ── Path 3: Fetch any Supabase-assigned tickets not yet seen ──
+  const missingIds = [...supabaseAssignedIds].filter(id => !seenIds.has(id));
+  if (missingIds.length) {
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < missingIds.length; i += BATCH_SIZE) {
+      const batch = missingIds.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(
+        batch.map(tid =>
+          zohoFetch(`/tickets/${tid}?include=${include}`)
+            .then(r => r.ok ? r.json() : null)
+            .catch(() => null)
+        )
+      );
+      for (const r of results) {
+        const t = r.status === 'fulfilled' ? r.value : null;
+        if (t?.id && isStatusMatch(t)) addTicket(t);
+      }
     }
   }
 
@@ -2238,13 +2635,13 @@ async function computeUserTickets(userEmail, status) {
 }
 
 // ── Refresh user-tickets cache; deduped per cache key ──
-async function refreshUserTicketsCache(cacheKey, userEmail, status) {
+async function refreshUserTicketsCache(cacheKey, userEmail, status, filterType = 'all', allowedDeptIds = []) {
   const inflight = userTicketsRefreshInFlight.get(cacheKey);
   if (inflight) return inflight;
 
   const promise = (async () => {
     const start = Date.now();
-    const tickets = await computeUserTickets(userEmail, status);
+    const tickets = await computeUserTickets(userEmail, status, filterType, allowedDeptIds);
     userTicketsCache.set(cacheKey, { tickets, time: Date.now() });
     console.log(`[USER-TICKETS REFRESHED] ${cacheKey} → ${tickets.length} rows in ${Date.now() - start}ms`);
     return tickets;
@@ -2261,30 +2658,34 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
     const status = req.query.status;
     const search = req.query.search;
     const filterByEmail = req.query.filterByEmail; // Server-side user filter
+    const userRole = (req.user?.role || 'user').toLowerCase();
+    const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
     const from = (page - 1) * limit;
     const include = 'contacts,assignee';
 
     if (filterByEmail) {
       const userEmail = filterByEmail.toLowerCase();
-      const cacheKey = `${userEmail}_${status || 'all'}`;
+      const filterType = req.query.filterType || 'all'; // 'all' | 'assigned' | 'raised'
+      const forceRefresh = req.query.refresh === 'true';
+      const cacheKey = `${userRole}_${userEmail}_${status || 'all'}_${filterType}`;
       const startIdx = (page - 1) * limit;
       const cached = userTicketsCache.get(cacheKey);
       const age = cached ? Date.now() - cached.time : Infinity;
 
       let allUserTickets;
 
-      if (cached && age < USER_TICKETS_CACHE_MS) {
+      if (!forceRefresh && cached && age < USER_TICKETS_CACHE_MS) {
         // Fresh — instant
         allUserTickets = cached.tickets;
       } else if (cached && age < USER_TICKETS_STALE_MS) {
         // Stale — serve cached + refresh in background
         allUserTickets = cached.tickets;
-        refreshUserTicketsCache(cacheKey, userEmail, status).catch(err =>
+        refreshUserTicketsCache(cacheKey, userEmail, status, filterType, allowedDeptIds).catch(err =>
           console.error(`Background user-tickets refresh failed for ${cacheKey}:`, err?.message || err)
         );
       } else {
         // Cold — must compute synchronously
-        allUserTickets = await refreshUserTicketsCache(cacheKey, userEmail, status);
+        allUserTickets = await refreshUserTicketsCache(cacheKey, userEmail, status, filterType, allowedDeptIds);
       }
 
       const pageData = allUserTickets.slice(startIdx, startIdx + limit);
@@ -2308,6 +2709,16 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
       endpoint += `&status=Closed`;
     }
 
+    // Department filter by role scope + optional admin filter
+    const deptFilter = req.query.departmentId;
+    if (userRole === 'admin' && deptFilter) {
+      endpoint += `&departmentId=${deptFilter}`;
+    } else if (allowedDeptIds.length === 1) {
+      endpoint += `&departmentId=${allowedDeptIds[0]}`;
+    } else if (deptFilter) {
+      // non-admin roles cannot override their scoped department access
+    }
+
     const baseEndpoint = endpoint;
     const searchEndpoint = search
       ? `${endpoint}&searchText=${encodeURIComponent(search)}`
@@ -2322,7 +2733,7 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
       }
     }
 
-    const cacheKey = effectiveEndpoint;
+    const cacheKey = `${userRole}|${effectiveEndpoint}`;
     const cached = standardTicketsCache.get(cacheKey);
     const age = cached ? Date.now() - cached.time : Infinity;
 
@@ -2333,12 +2744,12 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
     } else if (cached && age < STANDARD_TICKETS_STALE_MS) {
       payload = cached.payload;
       res.set('X-ITSM-Tickets-Cache', 'STALE');
-      refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit).catch(err =>
+      refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit, allowedDeptIds).catch(err =>
         console.error(`Background standard tickets refresh failed for ${cacheKey}:`, err?.message || err)
       );
     } else {
       try {
-        payload = await refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit);
+        payload = await refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit, allowedDeptIds);
         res.set('X-ITSM-Tickets-Cache', 'MISS');
       } catch (refreshErr) {
         const message = refreshErr?.message || 'Unknown error';
@@ -2536,6 +2947,32 @@ app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
       data = null;
     }
 
+    // If Zoho rejects status with 422, try common alternate spellings/casing
+    if (!response.ok && response.status === 422 && payload.status) {
+      const alternates = {
+        'in progress': ['In-Progress', 'InProgress', 'in progress', 'In progress'],
+        'open': ['Open'],
+        'closed': ['Closed', 'Resolved'],
+        'resolved': ['Resolved', 'Closed'],
+        'on hold': ['On Hold', 'On-Hold']
+      };
+      const key = (payload.status || '').toLowerCase();
+      const variants = alternates[key] || [];
+      for (const v of variants) {
+        if (v === payload.status) continue;
+        const retry = await zohoFetch(`/tickets/${req.params.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ ...payload, status: v })
+        });
+        if (retry.ok) {
+          const retryData = await retry.json().catch(() => null);
+          invalidateRuntimeCaches();
+          return res.json(retryData || { status: 'ok' });
+        }
+      }
+      return res.status(response.status).json(data || { error: 'Failed to update ticket' });
+    }
+
     if (!response.ok) {
       return res.status(response.status).json(data || { error: 'Failed to update ticket' });
     }
@@ -2549,6 +2986,60 @@ app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Zoho ticket statuses (dynamic, cached 10 min) ──
+let _zohoStatusesCache = null;
+let _zohoStatusesCacheTime = 0;
+const ZOHO_STATUSES_CACHE_MS = 10 * 60 * 1000;
+app.get('/api/zoho/statuses', authenticateToken, async (req, res) => {
+  if (_zohoStatusesCache && Date.now() - _zohoStatusesCacheTime < ZOHO_STATUSES_CACHE_MS) {
+    return res.json(_zohoStatusesCache);
+  }
+  try {
+    const r = await zohoFetch('/fields?module=tickets');
+    if (r.ok) {
+      const body = await r.json();
+      const fields = body?.fields || body?.data || [];
+      const statusField = fields.find(f =>
+        (f.fieldName || f.apiName || '').toLowerCase() === 'status' ||
+        (f.displayLabel || f.label || '').toLowerCase() === 'status'
+      );
+      if (statusField?.allowedValues?.length) {
+        const statuses = statusField.allowedValues.map(v => v.displayValue || v.value || v).filter(Boolean);
+        _zohoStatusesCache = statuses;
+        _zohoStatusesCacheTime = Date.now();
+        return res.json(statuses);
+      }
+    }
+  } catch {}
+  // Fallback defaults
+  const defaults = ['Open', 'In Progress', 'On Hold', 'Escalated', 'Closed'];
+  _zohoStatusesCache = defaults;
+  _zohoStatusesCacheTime = Date.now();
+  return res.json(defaults);
+});
+
+// ── Zoho Departments endpoint (cached 10 min) ──
+let _zohoDepartmentsCache = null;
+let _zohoDepartmentsCacheTime = 0;
+app.get('/api/zoho/departments', authenticateToken, async (req, res) => {
+  if (_zohoDepartmentsCache && Date.now() - _zohoDepartmentsCacheTime < 600000) {
+    return res.json(_zohoDepartmentsCache);
+  }
+  try {
+    const r = await zohoFetch('/departments');
+    if (r.ok) {
+      const body = await r.json();
+      const depts = (body?.data || []).map(d => ({ id: d.id, name: d.name }));
+      _zohoDepartmentsCache = depts;
+      _zohoDepartmentsCacheTime = Date.now();
+      return res.json(depts);
+    }
+  } catch {}
+  _zohoDepartmentsCache = [];
+  _zohoDepartmentsCacheTime = Date.now();
+  return res.json([]);
+});
+
 app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) => {
   try {
     const response = await zohoFetch(`/tickets/${req.params.id}/conversations`);
@@ -2560,11 +3051,18 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       return res.json(data);
     }
 
-    // Always fetch full conversation details for every conversation
-    // Zoho uses /threads/{id} for email threads and /comments/{id} for comments.
-    // Throttle to CONV_ENRICH_BATCH parallel requests to avoid Zoho 429s and
-    // long ticket-detail load times when a ticket has many conversations.
-    const CONV_ENRICH_BATCH = 6;
+    // ── Start private-note visibility check in parallel with enrichment ──
+    // so we don't add sequential latency.
+    const requestingEmail = (req.user?.email || '').toLowerCase();
+    const privateNoteCheckPromise = Promise.allSettled([
+      zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`).then(r => r.ok ? r.json() : {}),
+      pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [req.params.id])
+    ]);
+
+    // 🚀 OPTIMIZED: Only enrich the last 5 conversations to reduce API calls
+    // Older conversations are returned as-is (they already have basic data from the list endpoint)
+    const CONV_ENRICH_LIMIT = 5;
+    const CONV_ENRICH_BATCH = 5;
     const enrichOne = async (conv) => {
       try {
         const convType = (conv.type || '').toLowerCase();
@@ -2594,12 +3092,19 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       return conv;
     };
 
-    const resultData = [];
-    for (let i = 0; i < data.data.length; i += CONV_ENRICH_BATCH) {
-      const slice = data.data.slice(i, i + CONV_ENRICH_BATCH);
+    // Only enrich the most recent conversations; older ones pass through unchanged
+    const allConvs = data.data || [];
+    const recentConvs = allConvs.slice(-CONV_ENRICH_LIMIT);
+    const olderConvs = allConvs.slice(0, Math.max(0, allConvs.length - CONV_ENRICH_LIMIT));
+
+    const enrichedRecent = [];
+    for (let i = 0; i < recentConvs.length; i += CONV_ENRICH_BATCH) {
+      const slice = recentConvs.slice(i, i + CONV_ENRICH_BATCH);
       const enrichedSlice = await Promise.all(slice.map(enrichOne));
-      resultData.push(...enrichedSlice);
+      enrichedRecent.push(...enrichedSlice);
     }
+
+    const resultData = [...olderConvs, ...enrichedRecent];
 
     // Look up actual sender names for replies made through our app
     const convIds = resultData.map(c => (c.id || '').toString()).filter(Boolean);
@@ -2641,7 +3146,26 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
         '';
     });
 
-    res.json({ ...data, data: resultData });
+    // ── Resolve private-note visibility (promise was started at top, alongside enrichment) ──
+    let canSeePrivate = false;
+    try {
+      const [ticketFetch, assignmentFetch] = await privateNoteCheckPromise;
+      const ticketData = ticketFetch.status === 'fulfilled' ? (ticketFetch.value || {}) : {};
+      const requesterEmail = (ticketData.email || ticketData.contact?.email || '').toLowerCase();
+      const zohoAssigneeEmail = (ticketData.assignee?.email || ticketData.assignee?.emailId || '').toLowerCase();
+      const supabaseUsers = assignmentFetch.status === 'fulfilled'
+        ? (assignmentFetch.value?.rows?.[0]?.assigned_users || []).map(e => e.toLowerCase())
+        : [];
+      const allowed = new Set([requesterEmail, zohoAssigneeEmail, ...supabaseUsers].filter(Boolean));
+      canSeePrivate = allowed.has(requestingEmail);
+    } catch {
+      canSeePrivate = false;
+    }
+    const visibleData = canSeePrivate
+      ? resultData
+      : resultData.filter(conv => conv.isPublic !== false);
+
+    res.json({ ...data, data: visibleData });
   } catch {
     res.status(500).json({ error: 'Failed to fetch ticket conversations' });
   }
@@ -2787,15 +3311,20 @@ app.post("/api/msal-login", async (req, res) => {
 
     const normalize = (v) => (v || '').toString().trim().toLowerCase();
     const normalizedEmail = normalize(email);
-
-    // Step 1: Check Microsoft Graph for cloudops@muraai.com group membership
-    let isInAdminGroup = false;
+    const requestedRole = normalize(req.body?.selectedRole || '');
+    const rolesSet = new Set();
     let roleSource = 'default';
-    
+
+    if (isAllowlistedAdminEmail(normalizedEmail)) {
+      rolesSet.add('admin');
+      roleSource = 'admin-email-allowlist';
+    }
+
+    const graphGroups = [];
     try {
       let url = 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=mail,displayName,mailNickname';
-      
-      while (url && !isInAdminGroup) {
+
+      while (url) {
         const graphResponse = await fetch(url, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -2807,65 +3336,119 @@ app.post("/api/msal-login", async (req, res) => {
 
         const data = await graphResponse.json();
         const groups = Array.isArray(data?.value) ? data.value : [];
-
-        isInAdminGroup = groups.some((g) => {
-          const mail = normalize(g.mail);
-          const displayName = normalize(g.displayName);
-          const nickname = normalize(g.mailNickname);
-          return mail === 'cloudops@muraai.com' || displayName === 'cloudops' || nickname === 'cloudops';
-        });
-
+        graphGroups.push(...groups);
         url = data['@odata.nextLink'] || '';
-      }
-      
-      if (isInAdminGroup) {
-        roleSource = 'graph-cloudops-group';
       }
     } catch (graphErr) {
       console.warn(`[MSAL LOGIN] Graph API error for ${normalizedEmail}:`, graphErr?.message || graphErr);
     }
 
-    // Step 2: Check user_roles table for explicit role assignment (can override Graph membership)
-    let dbRole = null;
+    for (const roleFromGroup of rolesFromGraphGroups(graphGroups)) {
+      rolesSet.add(roleFromGroup);
+    }
+    if (graphGroups.length > 0 && roleSource === 'default') {
+      roleSource = 'graph-groups';
+    }
+
+    try {
+      const identifiers = [...new Set(
+        graphGroups.flatMap(g => [g?.mail, g?.displayName, g?.mailNickname])
+          .map(v => normalize(v))
+          .filter(Boolean)
+      )];
+
+      if (identifiers.length > 0) {
+        const groupBindings = await pool.query(
+          `SELECT group_identifier, roles
+           FROM group_role_bindings
+           WHERE LOWER(group_identifier) = ANY($1)`,
+          [identifiers]
+        );
+        for (const row of groupBindings.rows || []) {
+          for (const role of normalizeRoleList(row.roles || [])) {
+            rolesSet.add(role);
+          }
+        }
+        if ((groupBindings.rows || []).length > 0) {
+          roleSource = 'group_role_bindings-db';
+        }
+      }
+    } catch (groupErr) {
+      console.warn(`[MSAL LOGIN] group role bindings check failed for ${normalizedEmail}:`, groupErr?.message || groupErr);
+    }
+
+    // Legacy single-role override table (kept for backward compatibility)
     try {
       const roleResult = await pool.query(
         `SELECT role FROM user_roles WHERE LOWER(microsoft_email) = $1 LIMIT 1`,
         [normalizedEmail]
       );
       if (roleResult.rows.length > 0) {
-        dbRole = (roleResult.rows[0]?.role || '').toString().toLowerCase();
-        roleSource = 'user_roles-db';
-        console.log(`[MSAL LOGIN] Found explicit DB role for ${normalizedEmail}: ${dbRole}`);
+        const legacyRole = normalizeRole(roleResult.rows[0]?.role);
+        if (legacyRole) {
+          rolesSet.add(legacyRole);
+          roleSource = 'user_roles-db';
+        }
       }
     } catch (dbErr) {
       console.warn(`[MSAL LOGIN] DB role check failed for ${normalizedEmail}:`, dbErr?.message || dbErr);
     }
 
-    // Step 3: Determine final role
-    let role = 'user'; // default
-    if (dbRole) {
-      // DB role takes priority (explicit admin assignment)
-      role = dbRole;
-    } else if (isInAdminGroup) {
-      // Graph group membership (cloudops@muraai.com)
-      role = 'admin';
+    // Multi-role bindings table
+    try {
+      const bindingResult = await pool.query(
+        `SELECT roles FROM user_role_bindings WHERE LOWER(microsoft_email) = $1 LIMIT 1`,
+        [normalizedEmail]
+      );
+      if (bindingResult.rows.length > 0) {
+        const dbRoles = normalizeRoleList(bindingResult.rows[0]?.roles || []);
+        for (const r of dbRoles) rolesSet.add(r);
+        roleSource = 'user_role_bindings-db';
+      }
+    } catch (dbErr) {
+      console.warn(`[MSAL LOGIN] role bindings check failed for ${normalizedEmail}:`, dbErr?.message || dbErr);
     }
-    
-    console.log(`[MSAL LOGIN] ${normalizedEmail} resolved role=${role} via ${roleSource}`);
+
+    const roles = normalizeRoleList([...rolesSet], null);
+    if (!roles.length) {
+      return res.status(403).json({ message: 'No application role is assigned for this account' });
+    }
+
+    // Check if user is a member of cloudops group
+    const cloudopsGroupIdentifiers = ROLE_GROUP_MAP['cloudops'] || [];
+    const isCloudOpsMember = graphGroups.some(g => {
+      const values = [g?.mail, g?.displayName, g?.mailNickname]
+        .map(v => (v || '').toString().trim().toLowerCase())
+        .filter(Boolean);
+      return values.some(v => cloudopsGroupIdentifiers.includes(v));
+    });
+
+    // If user is NOT in cloudops group, force role to 'user' regardless of DB assignment
+    let effectiveRoles = roles;
+    let effectiveRole;
+    if (!isCloudOpsMember && !isAllowlistedAdminEmail(normalizedEmail)) {
+      effectiveRoles = ['user'];
+      effectiveRole = 'user';
+      console.log(`[MSAL LOGIN] ${normalizedEmail} NOT in cloudops group - forcing role=user`);
+    } else {
+      effectiveRole = pickDefaultRole(roles, requestedRole, null);
+    }
+
+    console.log(`[MSAL LOGIN] ${normalizedEmail} resolved role=${effectiveRole} roles=[${effectiveRoles.join(',')}] isCloudOps=${isCloudOpsMember} via ${roleSource}`);
 
     const newAccessToken = jwt.sign(
-      { email: normalizedEmail, role },
+      { email: normalizedEmail, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember },
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 
     const refreshToken = jwt.sign(
-      { email: normalizedEmail, role },
+      { email: normalizedEmail, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember },
       process.env.JWT_REFRESH_SECRET,
       { expiresIn: "7d" }
     );
 
-    res.json({ accessToken: newAccessToken, refreshToken, role });
+    res.json({ accessToken: newAccessToken, refreshToken, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember });
 
   } catch (err) {
     console.error('MSAL login error:', err?.message);
@@ -2883,14 +3466,22 @@ app.post('/api/tickets/:id/reply', upload.array('attachments'),  authenticateTok
     const isPublicStr = req.body?.isPublic === 'true' ? 'true' : 'false';
     const isPublicBool = req.body?.isPublic === 'true';
 
-    const attempts = [
-      { type: 'form', path: `/tickets/${req.params.id}/reply`, includeContentType: true },
+    // Zoho Desk: public replies → /sendReply (JSON preferred), private notes → /comments
+    // Try JSON first (Zoho Desk v1 documented approach), fall back to form-data.
+    const attempts = isPublicBool ? [
+      { type: 'json', path: `/tickets/${req.params.id}/sendReply`, includeContentType: true },
+      { type: 'json', path: `/tickets/${req.params.id}/sendReply`, includeContentType: false },
+      { type: 'json', path: `/tickets/${req.params.id}/reply`, includeContentType: false },
+      { type: 'json', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+      { type: 'json', path: `/tickets/${req.params.id}/comments`, includeContentType: false },
       { type: 'form', path: `/tickets/${req.params.id}/sendReply`, includeContentType: true },
       { type: 'form', path: `/tickets/${req.params.id}/sendReply`, includeContentType: false },
+      { type: 'form', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+    ] : [
       { type: 'json', path: `/tickets/${req.params.id}/comments`, includeContentType: false },
-      { type: 'json', path: `/tickets/${req.params.id}/comment`, includeContentType: false },
-      { type: 'json', path: `/tickets/${req.params.id}/conversations`, includeContentType: false },
-      { type: 'json', path: `/tickets/${req.params.id}/threads`, includeContentType: false }
+      { type: 'json', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+      { type: 'form', path: `/tickets/${req.params.id}/comments`, includeContentType: false },
+      { type: 'form', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
     ];
 
     const errors = [];
@@ -3093,14 +3684,15 @@ app.patch("/api/users/:id", authenticateToken, authorizeAdmin, async (req, res) 
   try {
     const { role } = req.body;
 
-    const allowedRoles = ["admin", "support", "user"];
-    if (!allowedRoles.includes(role)) {
-      return res.status(400).json({ message: "Invalid role" });
+    const allowedRoles = SUPPORTED_ROLES.filter(r => r !== 'user');
+    const normalizedRole = normalizeRole(role);
+    if (!normalizedRole || !allowedRoles.includes(normalizedRole)) {
+      return res.status(400).json({ message: "Invalid role", allowed: allowedRoles });
     }
 
     await pool.query(
       "UPDATE users SET role = $1 WHERE id = $2",
-      [role, req.params.id]
+      [normalizedRole, req.params.id]
     );
 
     res.json({ message: "Role updated" });
@@ -4174,7 +4766,7 @@ app.get("/api/assignable-users", authenticateToken, async (req, res) => {
 });
 
 // Admin: resolve group members by group email (cloudops@muraai.com)
-app.get("/api/admin/group-members", authenticateToken, authorizeAdmin, async (req, res) => {
+app.get("/api/admin/group-members", authenticateToken, authorizeElevated, async (req, res) => {
   try {
     const groupEmail = (req.query.groupEmail || '').toString().trim().toLowerCase();
     if (!groupEmail) {
@@ -4253,15 +4845,227 @@ app.get("/api/admin/group-members", authenticateToken, authorizeAdmin, async (re
   }
 });
 
-// Admin: assignments report (for cloudops group members)
-app.get("/api/admin/assignments-report", authenticateToken, authorizeAdmin, async (req, res) => {
+app.get('/api/admin/group-roles', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM ticket_assignments ORDER BY assigned_at DESC"
+      `SELECT id, group_identifier, roles, assigned_by, assigned_at, updated_at, notes
+       FROM group_role_bindings
+       ORDER BY updated_at DESC`
     );
+    return res.json({ groups: result.rows, count: result.rows.length });
+  } catch (err) {
+    console.error('Failed to fetch group roles:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to fetch group roles' });
+  }
+});
+
+app.post('/api/admin/group-roles', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const groupIdentifier = (req.body?.groupIdentifier || '').toString().trim().toLowerCase();
+    const roles = normalizeRoleList(req.body?.roles || []);
+    const notes = (req.body?.notes || '').toString().trim() || null;
+    const adminEmail = (req.user?.email || '').toLowerCase();
+
+    if (!groupIdentifier) {
+      return res.status(400).json({ error: 'groupIdentifier is required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO group_role_bindings (group_identifier, roles, assigned_by, notes, assigned_at, updated_at)
+       VALUES ($1, $2::text[], $3, $4, NOW(), NOW())
+       ON CONFLICT (group_identifier)
+       DO UPDATE SET
+         roles = EXCLUDED.roles,
+         assigned_by = EXCLUDED.assigned_by,
+         notes = EXCLUDED.notes,
+         updated_at = NOW()
+       RETURNING id, group_identifier, roles, assigned_by, assigned_at, updated_at, notes`,
+      [groupIdentifier, roles, adminEmail, notes]
+    );
+
+    return res.json({ success: true, group: result.rows[0] });
+  } catch (err) {
+    console.error('Failed to upsert group roles:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to upsert group roles' });
+  }
+});
+
+app.delete('/api/admin/group-roles/:groupIdentifier', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const groupIdentifier = (req.params.groupIdentifier || '').toString().trim().toLowerCase();
+    const result = await pool.query(
+      `DELETE FROM group_role_bindings WHERE LOWER(group_identifier) = $1 RETURNING group_identifier, roles`,
+      [groupIdentifier]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Group role assignment not found' });
+    }
+    return res.json({ success: true, group: result.rows[0] });
+  } catch (err) {
+    console.error('Failed to delete group roles:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to delete group roles' });
+  }
+});
+
+// Admin: assignments report (for cloudops group members)
+app.get("/api/admin/assignments-report", authenticateToken, authorizeElevated, async (req, res) => {
+  try {
+    const userRole = (req.user?.role || '').toLowerCase();
+    const requestedDeptId = (req.query.departmentId || '').toString().trim();
+    const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole); // [] for admin means "all"
+
+    let query, params;
+    if (userRole === 'admin') {
+      if (requestedDeptId) {
+        query = 'SELECT * FROM ticket_assignments WHERE zoho_department_id = $1 ORDER BY assigned_at DESC';
+        params = [requestedDeptId];
+      } else {
+        query = 'SELECT * FROM ticket_assignments ORDER BY assigned_at DESC';
+        params = [];
+      }
+    } else if (allowedDeptIds.length > 0) {
+      query = 'SELECT * FROM ticket_assignments WHERE zoho_department_id = ANY($1) ORDER BY assigned_at DESC';
+      params = [allowedDeptIds];
+    } else {
+      query = 'SELECT * FROM ticket_assignments ORDER BY assigned_at DESC';
+      params = [];
+    }
+
+    const result = await pool.query(query, params);
     res.json({ assignments: result.rows });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch assignments report" });
+  }
+});
+
+// Admin/elevated: live Zoho ticket report source (assignment-shaped payload)
+app.get('/api/admin/tickets-report', authenticateToken, authorizeElevated, async (req, res) => {
+  try {
+    const userRole = (req.user?.role || '').toLowerCase();
+    const requestedDeptId = (req.query.departmentId || '').toString().trim();
+    const isAdmin = userRole === 'admin';
+
+    let allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
+    if (isAdmin && requestedDeptId) {
+      allowedDeptIds = [requestedDeptId];
+    }
+
+    const hasSingleDept = Array.isArray(allowedDeptIds) && allowedDeptIds.length === 1;
+    const deptQuery = hasSingleDept ? `&departmentId=${encodeURIComponent(allowedDeptIds[0])}` : '';
+    const include = 'contacts,assignee';
+    const pageSize = 100;
+    const maxFrom = 10000;
+    const statuses = ['Open', 'In Progress', 'On Hold', 'Escalated', 'Closed', 'Resolved'];
+
+    const recycledTicketIds = await getActiveRecycledTicketIds();
+    const seen = new Set();
+    const normalizedRows = [];
+
+    const toCategory = (ticket) => {
+      const direct = [
+        ticket?.category,
+        ticket?.ticketCategory,
+        ticket?.issueCategory,
+        ticket?.subCategory,
+        ticket?.subcategory
+      ];
+      for (const candidate of direct) {
+        if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+      }
+      return extractCategoryFromZohoTicket(ticket) || 'Uncategorized';
+    };
+
+    for (const status of statuses) {
+      for (let from = 0; from <= maxFrom; from += pageSize) {
+        const endpoint = `/tickets?limit=${pageSize}&from=${from}&status=${encodeURIComponent(status)}&include=${include}${deptQuery}`;
+        let response;
+        try {
+          response = await zohoFetch(endpoint);
+        } catch (err) {
+          console.error(`[tickets-report] fetch failed for status=${status}, from=${from}:`, err?.message || err);
+          break;
+        }
+
+        if (!response.ok) {
+          // Treat status-specific failures as partial and continue with others.
+          console.warn(`[tickets-report] Zoho returned ${response.status} for status=${status}, from=${from}`);
+          break;
+        }
+
+        let data;
+        try {
+          data = await response.json();
+        } catch {
+          break;
+        }
+
+        const tickets = Array.isArray(data?.data) ? data.data : [];
+        for (const t of tickets) {
+          const tid = (t?.id || '').toString();
+          if (!tid || seen.has(tid) || recycledTicketIds.has(tid)) continue;
+          if (!isDepartmentAllowed(t, allowedDeptIds)) continue;
+
+          seen.add(tid);
+
+          const assigneeEmail = (
+            t?.assignee?.email ||
+            t?.assignee?.emailId ||
+            t?.assignedTo ||
+            ''
+          ).toString().trim().toLowerCase();
+
+          const assignedUsers = assigneeEmail ? [assigneeEmail] : [];
+          const createdTime = (
+            t?.createdTime ||
+            t?.createdAt ||
+            t?.created_at ||
+            t?.createdDate ||
+            ''
+          ).toString();
+
+          const ticketStatus = (t?.status || '').toString();
+          const lowerStatus = ticketStatus.toLowerCase();
+          const modifiedTime = (
+            t?.modifiedTime ||
+            t?.updatedTime ||
+            t?.updated_at ||
+            ''
+          ).toString();
+
+          const closedAt = (lowerStatus.includes('closed') || lowerStatus.includes('resolved'))
+            ? (t?.closedTime || modifiedTime || '')
+            : '';
+
+          normalizedRows.push({
+            zoho_ticket_id: tid,
+            zoho_ticket_number: (t?.ticketNumber || t?.ticket_number || '').toString(),
+            assigned_users: assignedUsers,
+            primary_assignee: assigneeEmail,
+            assigned_by: (
+              t?.email ||
+              t?.contact?.email ||
+              t?.contact?.emailAddress ||
+              t?.requester?.email ||
+              ''
+            ).toString().trim().toLowerCase(),
+            assigned_at: createdTime,
+            closed_at: closedAt,
+            closed_by: assigneeEmail,
+            zoho_department_id: extractTicketDepartmentId(t),
+            category: toCategory(t),
+            status: ticketStatus
+          });
+        }
+
+        const more = data?.info?.moreRecords ?? (tickets.length >= pageSize);
+        if (!more) break;
+      }
+    }
+
+    res.json({ assignments: normalizedRows });
+  } catch (err) {
+    console.error('Tickets report error:', err?.message || err);
+    res.status(500).json({ message: 'Failed to fetch tickets report' });
   }
 });
 
@@ -4356,23 +5160,62 @@ app.post("/api/admin/backfill-categories", authenticateToken, authorizeAdmin, as
 // GET /api/admin/user-roles - List all stored user roles from database
 app.get('/api/admin/user-roles', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT 
-         id,
-         microsoft_email,
-         role,
-         assigned_by,
-         assigned_at,
-         updated_at,
-         notes
-       FROM user_roles
-       ORDER BY updated_at DESC`
+    const [bindingsRes, legacyRes] = await Promise.all([
+      pool.query(
+        `SELECT
+           id,
+           microsoft_email,
+           roles,
+           assigned_by,
+           assigned_at,
+           updated_at,
+           notes
+         FROM user_role_bindings
+         ORDER BY updated_at DESC`
+      ),
+      pool.query(
+        `SELECT microsoft_email, role, assigned_by, assigned_at, updated_at, notes
+         FROM user_roles`
+      )
+    ]);
+
+    const merged = new Map();
+    for (const row of legacyRes.rows || []) {
+      const email = (row.microsoft_email || '').toLowerCase();
+      if (!email) continue;
+      merged.set(email, {
+        id: null,
+        microsoft_email: email,
+        roles: normalizeRoleList([row.role], null),
+        role: normalizeRole(row.role) || null,
+        assigned_by: row.assigned_by || null,
+        assigned_at: row.assigned_at || null,
+        updated_at: row.updated_at || null,
+        notes: row.notes || null
+      });
+    }
+
+    for (const row of bindingsRes.rows || []) {
+      const email = (row.microsoft_email || '').toLowerCase();
+      if (!email) continue;
+      const roles = normalizeRoleList(row.roles || [], null);
+      merged.set(email, {
+        id: row.id,
+        microsoft_email: email,
+        roles,
+        role: pickDefaultRole(roles, null, null),
+        assigned_by: row.assigned_by || null,
+        assigned_at: row.assigned_at || null,
+        updated_at: row.updated_at || null,
+        notes: row.notes || null
+      });
+    }
+
+    const users = [...merged.values()].sort((a, b) =>
+      new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime()
     );
 
-    return res.json({ 
-      users: result.rows,
-      count: result.rows.length
-    });
+    return res.json({ users, count: users.length });
   } catch (err) {
     console.error('Failed to fetch user roles:', err?.message || err);
     return res.status(500).json({ error: 'Failed to fetch user roles' });
@@ -4382,7 +5225,7 @@ app.get('/api/admin/user-roles', authenticateToken, authorizeAdmin, async (req, 
 // POST /api/admin/users/:email/role - Assign/update role for a user
 app.post('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { role: newRole, notes } = req.body;
+    const { role: newRole, roles: incomingRoles, notes } = req.body;
     const userEmail = (req.params.email || '').toString().toLowerCase().trim();
     const adminEmail = (req.user?.email || '').toLowerCase();
 
@@ -4390,31 +5233,68 @@ app.post('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, asyn
       return res.status(400).json({ error: 'User email is required' });
     }
 
-    const allowedRoles = ['admin', 'support', 'user'];
-    if (!newRole || !allowedRoles.includes(newRole)) {
-      return res.status(400).json({ error: `Invalid role. Must be one of: ${allowedRoles.join(', ')}` });
+    const resolvedRoles = Array.isArray(incomingRoles)
+      ? normalizeRoleList(incomingRoles, null)
+      : normalizeRoleList([newRole], null);
+
+    const invalidInputRoles = Array.isArray(incomingRoles)
+      ? incomingRoles.filter(r => !normalizeRole(r))
+      : (newRole && !normalizeRole(newRole) ? [newRole] : []);
+
+    if (invalidInputRoles.length > 0) {
+      return res.status(400).json({
+        error: `Invalid roles: ${invalidInputRoles.join(', ')}`,
+        allowed: SUPPORTED_ROLES
+      });
     }
 
-    // Upsert into user_roles table
-    const result = await pool.query(
-      `INSERT INTO user_roles (microsoft_email, role, assigned_by, notes, assigned_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW())
-       ON CONFLICT (microsoft_email)
-       DO UPDATE SET
-         role = EXCLUDED.role,
-         assigned_by = EXCLUDED.assigned_by,
-         notes = EXCLUDED.notes,
-         updated_at = NOW()
-       RETURNING id, microsoft_email, role, assigned_by, assigned_at, updated_at, notes`,
-      [userEmail, newRole, adminEmail, notes || null]
-    );
+    const primaryRole = pickDefaultRole(resolvedRoles, null, null);
 
-    console.log(`[ADMIN] Role assigned: ${userEmail} → ${newRole} by ${adminEmail}`);
+    if (!resolvedRoles.length || !primaryRole) {
+      return res.status(400).json({
+        error: 'At least one valid application role is required',
+        allowed: SUPPORTED_ROLES.filter(role => role !== 'user')
+      });
+    }
+
+    const [bindingResult, legacyResult] = await Promise.all([
+      pool.query(
+        `INSERT INTO user_role_bindings (microsoft_email, roles, assigned_by, notes, assigned_at, updated_at)
+         VALUES ($1, $2::text[], $3, $4, NOW(), NOW())
+         ON CONFLICT (microsoft_email)
+         DO UPDATE SET
+           roles = EXCLUDED.roles,
+           assigned_by = EXCLUDED.assigned_by,
+           notes = EXCLUDED.notes,
+           updated_at = NOW()
+         RETURNING id, microsoft_email, roles, assigned_by, assigned_at, updated_at, notes`,
+        [userEmail, resolvedRoles, adminEmail, notes || null]
+      ),
+      // Keep legacy table in sync for backward compatibility.
+      pool.query(
+        `INSERT INTO user_roles (microsoft_email, role, assigned_by, notes, assigned_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())
+         ON CONFLICT (microsoft_email)
+         DO UPDATE SET
+           role = EXCLUDED.role,
+           assigned_by = EXCLUDED.assigned_by,
+           notes = EXCLUDED.notes,
+           updated_at = NOW()
+         RETURNING microsoft_email, role`,
+        [userEmail, primaryRole, adminEmail, notes || null]
+      )
+    ]);
+
+    console.log(`[ADMIN] Roles assigned: ${userEmail} → [${resolvedRoles.join(',')}] by ${adminEmail}`);
 
     return res.json({
       success: true,
-      message: `Role updated for ${userEmail}`,
-      user: result.rows[0]
+      message: `Roles updated for ${userEmail}`,
+      user: {
+        ...bindingResult.rows[0],
+        role: legacyResult.rows[0]?.role || primaryRole,
+        roles: normalizeRoleList(bindingResult.rows[0]?.roles || resolvedRoles)
+      }
     });
   } catch (err) {
     console.error('Failed to assign role:', err?.message || err);
@@ -4467,15 +5347,32 @@ app.get('/api/admin/users', authenticateToken, authorizeAdmin, async (req, res) 
     let storedRoles = new Map();
 
     if (userEmails.length > 0) {
-      const roleResult = await pool.query(
-        `SELECT microsoft_email, role, assigned_by, assigned_at, updated_at
-         FROM user_roles
-         WHERE LOWER(microsoft_email) = ANY($1)`,
-        [userEmails]
-      );
-      
-      roleResult.rows.forEach(row => {
-        storedRoles.set((row.microsoft_email || '').toLowerCase(), row);
+      const [bindingRes, legacyRes] = await Promise.all([
+        pool.query(
+          `SELECT microsoft_email, roles, assigned_by, assigned_at, updated_at
+           FROM user_role_bindings
+           WHERE LOWER(microsoft_email) = ANY($1)`,
+          [userEmails]
+        ),
+        pool.query(
+          `SELECT microsoft_email, role, assigned_by, assigned_at, updated_at
+           FROM user_roles
+           WHERE LOWER(microsoft_email) = ANY($1)`,
+          [userEmails]
+        )
+      ]);
+
+      legacyRes.rows.forEach(row => {
+        storedRoles.set((row.microsoft_email || '').toLowerCase(), {
+          ...row,
+          roles: normalizeRoleList([row.role], null)
+        });
+      });
+      bindingRes.rows.forEach(row => {
+        storedRoles.set((row.microsoft_email || '').toLowerCase(), {
+          ...row,
+          roles: normalizeRoleList(row.roles || [], null)
+        });
       });
     }
 
@@ -4487,7 +5384,8 @@ app.get('/api/admin/users', authenticateToken, authorizeAdmin, async (req, res) 
         email: u.mail || u.userPrincipalName,
         displayName: u.displayName,
         userPrincipalName: u.userPrincipalName,
-        currentRole: storedRole?.role || 'user', // default to 'user' if not in DB
+        currentRole: pickDefaultRole(storedRole?.roles || [storedRole?.role], null, null),
+        roles: normalizeRoleList(storedRole?.roles || [storedRole?.role], null),
         assignedBy: storedRole?.assigned_by || null,
         assignedAt: storedRole?.assigned_at || null,
         updatedAt: storedRole?.updated_at || null
@@ -4520,14 +5418,22 @@ app.delete('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, as
       return res.status(400).json({ error: 'User email is required' });
     }
 
-    const result = await pool.query(
-      `DELETE FROM user_roles
-       WHERE LOWER(microsoft_email) = $1
-       RETURNING microsoft_email, role`,
-      [userEmail]
-    );
+    const [bindingDelete, legacyDelete] = await Promise.all([
+      pool.query(
+        `DELETE FROM user_role_bindings
+         WHERE LOWER(microsoft_email) = $1
+         RETURNING microsoft_email, roles`,
+        [userEmail]
+      ),
+      pool.query(
+        `DELETE FROM user_roles
+         WHERE LOWER(microsoft_email) = $1
+         RETURNING microsoft_email, role`,
+        [userEmail]
+      )
+    ]);
 
-    if (result.rowCount === 0) {
+    if (bindingDelete.rowCount === 0 && legacyDelete.rowCount === 0) {
       return res.status(404).json({ error: 'No role assignment found for this user' });
     }
 
@@ -4536,7 +5442,7 @@ app.delete('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, as
     return res.json({
       success: true,
       message: `Role assignment removed for ${userEmail}. User will revert to Graph group-based role.`,
-      user: result.rows[0]
+      user: bindingDelete.rows[0] || legacyDelete.rows[0]
     });
   } catch (err) {
     console.error('Failed to delete role assignment:', err?.message || err);

@@ -513,7 +513,7 @@ export class IhubComponent implements OnInit {
 
   async ngOnInit(): Promise<void> {
     const role = (sessionStorage.getItem('role') || '').toLowerCase();
-    if (role !== 'admin') {
+    if (role !== 'admin' && role !== 'cloudops' && role !== 'itsm') {
       this.router.navigate(['/dashboard']);
       return;
     }

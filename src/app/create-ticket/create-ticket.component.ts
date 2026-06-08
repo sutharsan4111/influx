@@ -107,8 +107,8 @@ import { MsalService } from '../services/msal.service';
                   [(ngModel)]="formData.departmentId"
                   required
                 >
-                  <option *ngFor="let dept of departments" [value]="dept.id" [disabled]="dept.name !== 'ITSM'">
-                    {{ dept.name }}
+                  <option *ngFor="let dept of departments" [value]="dept.id" [disabled]="dept.disabled">
+                    {{ dept.name }}{{ dept.disabled ? ' (Coming Soon)' : '' }}
                   </option>
                 </select>
               </div>
@@ -299,8 +299,8 @@ import { MsalService } from '../services/msal.service';
             class="submit-btn"
             [disabled]="!ticketForm.valid || isSubmitting"
           >
-            <i class="fas fa-paper-plane"></i>
-            Create Ticket
+            <i class="fas" [class.fa-paper-plane]="!isSubmitting" [class.fa-spinner]="isSubmitting" [class.fa-spin]="isSubmitting"></i>
+            {{ isSubmitting ? 'Creating Ticket...' : 'Create Ticket' }}
           </button>
         </div>
 
@@ -309,6 +309,11 @@ import { MsalService } from '../services/msal.service';
   `,
   styles: [`
     :host { display: block; }
+
+    option:disabled {
+      color: #9ca3af;
+      font-style: italic;
+    }
     
     .create-page { 
       max-width: 900px; 
@@ -987,10 +992,11 @@ export class CreateTicketComponent implements OnInit {
   private priorityTouched = false;
 
   departments = [
-    { id: '132475000009937630', name: 'ITSM' },
-    { id: '132475000009948173', name: 'Support - Coming Soon... ' },
-    { id: '132475000009958716', name: 'Products - Coming Soon...' },
-    { id: '132475000009925079', name: 'HR - Coming Soon...' }
+    { id: '132475000009937630', name: 'ITSM', disabled: false },
+    { id: '132475000009948173', name: 'Support', disabled: true },
+    { id: '132475000009958716', name: 'Products', disabled: true },
+    { id: '132475000009925079', name: 'HR', disabled: true },
+    { id: '132475000000010772', name: 'Muraai', disabled: true }
   ];
 
   constructor(
@@ -1158,14 +1164,11 @@ export class CreateTicketComponent implements OnInit {
           status: 'Open'
         };
 
-    this.loadingService.show();
-
     this.ticketService.createTicket(ticket).subscribe({
       next: (response: any) => {
         this.isSubmitting = false;
         if (response?.errorCode || response?.message?.includes('error')) {
           this.messageService.error(response?.message || 'Failed to create ticket');
-          this.loadingService.hide();
           return;
         }
 
@@ -1214,7 +1217,6 @@ export class CreateTicketComponent implements OnInit {
         this.ticketService.clearAllCache();
         this.ticketService.invalidateTabCache();
 
-        this.loadingService.hide();
         this.router.navigate(['/tickets']);
       },
       error: (error: any) => {
@@ -1226,7 +1228,6 @@ export class CreateTicketComponent implements OnInit {
         this.messageService.error(
           (error?.error?.message || error?.message || 'Failed to create ticket') + details
         );
-        this.loadingService.hide();
       }
     });
   }

@@ -10,7 +10,8 @@ services:
     environment:
       - NODE_ENV=production
       - ENABLE_ALERT_JOBS=false
-      - ENABLE_ZOHO_OUTBOUND=false
+      - ENABLE_ZOHO_OUTBOUND=true
+      - ADMIN_EMAIL_ALLOWLIST=ravi.chadaram@muraai.com,senthil.n@muraai.com,t.balaji@muraai.com,akash.yadav@muraai.com,automation.cloudops@muraai.com
     volumes:
       - .:/usr/src/app
       - /usr/src/app/node_modules

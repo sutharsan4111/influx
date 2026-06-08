@@ -1,7 +1,7 @@
 import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
-import { ReactiveFormsModule, FormBuilder, Validators } from '@angular/forms';
+import { ReactiveFormsModule, FormsModule, FormBuilder, Validators } from '@angular/forms';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { forkJoin, Subject, takeUntil, of } from 'rxjs';
 import { catchError, map } from 'rxjs/operators';
@@ -14,7 +14,7 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
 @Component({
   selector: 'app-ticket-detail',
   standalone: true,
-  imports: [CommonModule, ReactiveFormsModule, RouterModule],
+  imports: [CommonModule, ReactiveFormsModule, RouterModule, FormsModule],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="page-wrap" *ngIf="!loading; else loadingTpl">
@@ -33,17 +33,69 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
           <span class="bc-current">#{{ ticket?.ticketNumber || ticket?.id || '—' }}</span>
         </div>
         <div class="top-actions">
-          <button class="ta-btn primary" (click)="navigateTo('/create-ticket')">
-            <i class="fas fa-plus-circle"></i>
-            <span>New Ticket</span>
-          </button>
-          <button class="ta-btn" (click)="back()">
-            <i class="fas fa-list"></i>
-            <span>All Tickets</span>
-          </button>
+          <ng-container *ngIf="userRole === 'admin' || userRole === 'cloudops' || userRole === 'itsm'">
+            <button class="ta-btn ta-assign-btn" (click)="openAssignDialog()" [disabled]="actionLoading">
+              <i class="fas fa-user-plus"></i> Assign
+            </button>
+          </ng-container>
+          <div class="status-select-wrap">
+            <div class="status-select-inner" [class.is-loading]="actionLoading">
+              <span class="status-dot" [ngClass]="statusClass(ticket?.status)"></span>
+              <select class="status-select" [(ngModel)]="selectedStatus" (ngModelChange)="onStatusChange($event)" [disabled]="actionLoading">
+                <option *ngFor="let s of availableStatuses" [value]="s">{{ s }}</option>
+              </select>
+              <i class="fas fa-spinner fa-spin" *ngIf="actionLoading"></i>
+              <i class="fas fa-chevron-down" *ngIf="!actionLoading"></i>
+            </div>
+          </div>
           <button class="ta-btn icon-only" (click)="reload()" title="Refresh">
             <i class="fas fa-sync-alt"></i>
           </button>
+        </div>
+      </div>
+
+      <!-- Assign Dialog -->
+      <div class="assign-overlay" *ngIf="showAssignDialog" (click)="closeAssignDialog()">
+        <div class="assign-dialog" (click)="$event.stopPropagation()">
+          <div class="assign-dialog-hdr">
+            <span>Assign Ticket</span>
+            <small class="assign-ticket-ref">Ticket #{{ ticket?.ticketNumber || ticket?.id }}</small>
+            <button class="close-dlg" (click)="closeAssignDialog()"><i class="fas fa-times"></i></button>
+          </div>
+          <div class="assign-dialog-search">
+            <input type="text" placeholder="Search users..."
+                   [(ngModel)]="userSearchTerm"
+                   (input)="filterAssignUsers()" />
+          </div>
+          <div class="assign-selected-chips" *ngIf="selectedAssignees.length > 0">
+            <span class="assign-chip" *ngFor="let email of selectedAssignees">
+              {{ getAssignUserDisplayName(email) }}
+              <button class="chip-remove" (click)="removeAssignee(email)">×</button>
+            </span>
+          </div>
+          <div class="assign-users-list">
+            <div class="assign-user-item"
+                 *ngFor="let user of filteredAssignUsers"
+                 [class.selected]="isAssigneeSelected(user.email)"
+                 (click)="toggleAssignee(user.email)">
+              <input type="checkbox"
+                     [checked]="isAssigneeSelected(user.email)"
+                     (click)="$event.stopPropagation()" />
+              <div class="assign-user-info">
+                <span class="assign-user-name">{{ user.displayName || user.email }}</span>
+                <span class="assign-user-email">{{ user.email }}</span>
+              </div>
+            </div>
+            <div class="assign-no-users" *ngIf="filteredAssignUsers.length === 0 && !loadingAssignUsers">No users found</div>
+            <div class="assign-loading" *ngIf="loadingAssignUsers">Loading users…</div>
+          </div>
+          <div class="assign-dialog-footer">
+            <button class="act-btn close-btn" (click)="closeAssignDialog()">Cancel</button>
+            <button class="act-btn assign-btn" (click)="confirmAssign()"
+                    [disabled]="actionLoading || selectedAssignees.length === 0">
+              <i class="fas fa-check"></i> {{ supabaseAssignment ? 'Reassign' : 'Assign' }}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -88,11 +140,12 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
               </div>
             </div>
             <div class="thread-list">
-              <div class="thread-item" *ngFor="let t of threads; let i = index">
+              <div class="thread-item" *ngFor="let t of threads; let i = index" [class.private-thread]="t.isPublic === false">
                 <div class="thread-avatar">{{ (t.authorName || 'U').charAt(0).toUpperCase() }}</div>
                 <div class="thread-bubble">
                   <div class="thread-meta">
                     <span class="thread-author">{{ t.authorName }}</span>
+                    <span class="private-badge" *ngIf="t.isPublic === false"><i class="fas fa-lock"></i> Private Note</span>
                     <span class="thread-time">{{ t.createdTime | date:'MMM d, y · h:mm a' }}</span>
                   </div>
                   <div class="thread-body" [innerHTML]="renderContent(t.content)"></div>
@@ -392,7 +445,160 @@ import { AssignmentService, TicketAssignment } from './services/assignment.servi
       padding: 7px 10px;
     }
 
-    /* ── Ticket Header Card ── */
+    .ta-btn.ta-assign-btn {
+      background: #7c3aed;
+      border-color: #7c3aed;
+      color: #fff;
+    }
+    .ta-btn.ta-assign-btn:hover:not(:disabled) {
+      background: #6d28d9;
+      border-color: #6d28d9;
+    }
+    .ta-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .act-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 18px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s;
+    }
+    .act-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .assign-btn { background: #7c3aed; color: #fff; }
+    .assign-btn:hover:not(:disabled) { background: #6d28d9; }
+
+    /* ── Status Select ── */
+    .status-select-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-select-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .status-select-inner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 8px;
+      background: #fff;
+      cursor: pointer;
+      transition: border-color 0.18s;
+      min-width: 150px;
+    }
+    .status-select-inner:hover { border-color: #3b82f6; }
+    .status-select-inner.is-loading { opacity: 0.65; }
+    .status-dot {
+      width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+    }
+    .status-dot.status-open { background: #3b82f6; }
+    .status-dot.status-inprogress { background: #d97706; }
+    .status-dot.status-resolved, .status-dot.status-closed { background: #64748b; }
+    .status-select {
+      flex: 1;
+      border: none;
+      background: transparent;
+      font-size: 13px;
+      font-weight: 600;
+      color: #1e293b;
+      cursor: pointer;
+      outline: none;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+    .status-select-inner i { color: #94a3b8; font-size: 11px; }
+
+    /* ── Private Note Badge ── */
+    .private-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #fef3c7;
+      color: #92400e;
+      border: 1px solid #fde68a;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .private-thread .thread-bubble {
+      background: #fffbeb !important;
+      border-left: 3px solid #f59e0b !important;
+    }
+
+    /* ── Assign Dialog ── */
+    .assign-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+      display: flex; align-items: center; justify-content: center; z-index: 9999;
+    }
+    .assign-dialog {
+      background: #fff; border-radius: 14px; width: 460px; max-width: 95vw;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.22); overflow: hidden;
+      display: flex; flex-direction: column; max-height: 90vh;
+    }
+    .assign-dialog-hdr {
+      display: flex; align-items: center; gap: 8px;
+      padding: 14px 18px; background: #f8fafc; border-bottom: 1px solid #e2e8f0;
+      font-weight: 600; color: #1e293b;
+    }
+    .assign-ticket-ref {
+      font-size: 11px; color: #94a3b8; font-weight: 400; margin-left: auto; margin-right: 8px;
+    }
+    .close-dlg {
+      background: none; border: none; cursor: pointer; color: #64748b; font-size: 15px;
+    }
+    .assign-dialog-search {
+      padding: 10px 14px 4px;
+    }
+    .assign-dialog-search input {
+      width: 100%; padding: 7px 12px; border: 1px solid #e2e8f0; border-radius: 8px;
+      font-size: 13px; color: #1e293b; outline: none; box-sizing: border-box;
+    }
+    .assign-dialog-search input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.12); }
+    .assign-selected-chips {
+      display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 14px 2px;
+    }
+    .assign-chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe;
+      padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 500;
+    }
+    .chip-remove {
+      background: none; border: none; cursor: pointer; color: #3b82f6; font-size: 14px;
+      padding: 0; line-height: 1; margin-left: 2px;
+    }
+    .assign-users-list {
+      overflow-y: auto; max-height: 300px; padding: 4px 8px;
+    }
+    .assign-user-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 10px; border-radius: 8px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .assign-user-item:hover { background: #f0f9ff; }
+    .assign-user-item.selected { background: #eff6ff; }
+    .assign-user-info { display: flex; flex-direction: column; }
+    .assign-user-name { font-size: 13px; color: #1e293b; font-weight: 500; }
+    .assign-user-email { font-size: 11px; color: #94a3b8; }
+    .assign-no-users { padding: 16px; text-align: center; color: #94a3b8; font-size: 13px; }
+    .assign-loading { padding: 16px; text-align: center; color: #94a3b8; font-size: 13px; }
+    .assign-dialog-footer {
+      display: flex; gap: 10px; justify-content: flex-end;
+      padding: 12px 18px; border-top: 1px solid #e2e8f0;
+    }
     .ticket-hdr-card {
       background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);
       color: #ffffff;
@@ -1002,14 +1208,26 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   supabaseAssignment: TicketAssignment | null = null;
   loading = true;
   sending = false;
+  actionLoading = false;
+  selectedStatus = 'Open';
+  availableStatuses: string[] = ['Open', 'In Progress', 'Closed'];
+  showAssignDialog = false;
+  assignEmails = '';
+  // User-picker state for assign dialog
+  selectedAssignees: string[] = [];
+  allAssignUsers: { email: string; displayName: string }[] = [];
+  filteredAssignUsers: { email: string; displayName: string }[] = [];
+  userSearchTerm = '';
+  loadingAssignUsers = false;
   replyFiles: File[] = [];
   currentUserEmail = '';
   currentUserName = '';
-  userRole: 'admin' | 'user' = 'user';
+  userRole: 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user' = 'user';
+  private readonly elevatedRoles = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
   private inlineObjectUrls: string[] = [];
 
   get isAdmin(): boolean {
-    return this.userRole === 'admin';
+    return this.elevatedRoles.has(this.userRole);
   }
 
   get zohoTicketUrl(): string | null {
@@ -1042,6 +1260,8 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     this.initCurrentUser();
+    this.loadAssignableUsers();
+    this.loadZohoStatuses();
     
     // 🚀 FIXED: Subscribe to route params to handle ticket navigation
     // This will emit whenever the route parameter changes
@@ -1097,6 +1317,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
       next: (results: any) => {
         // All responses arrive at the same time
         this.ticket = this.normalizeTicket(results.ticket);
+        this.selectedStatus = this.normalizeStatusForDropdown(this.ticket?.status);
         this.supabaseAssignment = results.assignment;
         
         // Check permissions AFTER loading both Zoho and Supabase data
@@ -1122,6 +1343,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
             || 'Unknown',
           content: t.content || t.description || t.summary || '',
           createdTime: t.createdTime,
+          isPublic: t.isPublic,
           attachments: this.normalizeAttachments(t)
         }));
 
@@ -1222,12 +1444,17 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
         this.replyForm.reset({ body: '', visibility: 'public' });
         this.replyFiles = [];
         this.sending = false;
+        this.messageService.success('Reply sent successfully');
         // 🚀 Use parallel loading instead of sequential
         this.loadTicketAndRelated();
         this.cdr.markForCheck();
       },
-      error: () => {
+      error: (err: any) => {
         this.sending = false;
+        const apiError = err?.error;
+        const detail = apiError?.message || apiError?.error || err?.message || 'Failed to send reply';
+        this.messageService.error(detail);
+        this.cdr.markForCheck();
       }
     });
   }
@@ -1485,10 +1712,174 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     this.replyFiles.splice(index, 1);
   }
 
+  normalizeStatusForDropdown(status?: string): string {
+    const s = (status || '').toLowerCase();
+    if (s.includes('progress')) return 'In Progress';
+    if (s.includes('closed') || s.includes('resolved')) return 'Closed';
+    return 'Open';
+  }
+
+  private clearTicketCache(): void {
+    try { sessionStorage.removeItem(this.ticketCachePrefix + this.ticketId); } catch {}
+  }
+
+  isStatus(check: string): boolean {
+    const s = (this.ticket?.status || '').toLowerCase();
+    return s.includes(check);
+  }
+
+  onStatusChange(status: string): void {
+    if (!status || !this.ticket) return;
+    const prev = this.selectedStatus;
+    const prevTicketStatus = this.ticket.status; // save for error revert
+    this.actionLoading = true;
+    this.cdr.markForCheck();
+
+    let obs$: any;
+    if (status === 'Closed') {
+      obs$ = this.ticketService.closeTicket(this.ticketId, this.currentUserEmail);
+    } else if (status === 'In Progress') {
+      obs$ = this.ticketService.inProgressTicket(this.ticketId);
+    } else {
+      obs$ = this.ticketService.openTicket(this.ticketId);
+    }
+
+    obs$.subscribe({
+      next: () => {
+        this.actionLoading = false;
+        // Optimistic local update so UI reflects the change immediately
+        if (this.ticket) {
+          this.ticket = { ...this.ticket, status };
+        }
+        this.cdr.markForCheck();
+        this.clearTicketCache();
+        this.messageService.success(`Status updated to ${status}`);
+        // Delay reload to allow Zoho to propagate the status change
+        setTimeout(() => {
+          this.loadTicketAndRelated(false);
+        }, 1500);
+      },
+      error: (err: any) => {
+        this.actionLoading = false;
+        this.selectedStatus = prev; // revert dropdown
+        if (this.ticket) this.ticket = { ...this.ticket, status: prevTicketStatus }; // revert ticket.status
+        const msg = err?.error?.error || err?.error?.message || 'Failed to update status';
+        this.messageService.error(msg);
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
   closeTicket(): void {
-    if (!confirm('Close ticket?')) return;
-    this.ticketService.closeTicket(this.ticketId, this.currentUserEmail).subscribe(() => {
-      this.loadTicket();
+    this.onStatusChange('Closed');
+  }
+
+  openTicket(): void {
+    this.onStatusChange('Open');
+  }
+
+  markInProgress(): void {
+    this.onStatusChange('In Progress');
+  }
+
+  loadAssignableUsers(): void {
+    this.loadingAssignUsers = true;
+    this.msalService.getOrganizationUsers().then((users: { email: string; displayName: string }[]) => {
+      this.allAssignUsers = users;
+      this.filteredAssignUsers = [...users];
+      this.loadingAssignUsers = false;
+      this.cdr.markForCheck();
+    }).catch(() => {
+      this.loadingAssignUsers = false;
+      this.cdr.markForCheck();
+    });
+  }
+
+  loadZohoStatuses(): void {
+    this.ticketService.getZohoStatuses().subscribe({
+      next: (statuses) => {
+        if (statuses?.length) this.availableStatuses = statuses;
+        this.cdr.markForCheck();
+      },
+      error: () => {} // keep defaults
+    });
+  }
+
+  filterAssignUsers(): void {
+    const term = (this.userSearchTerm || '').toLowerCase();
+    this.filteredAssignUsers = this.allAssignUsers.filter(u =>
+      u.email.toLowerCase().includes(term) ||
+      (u.displayName || '').toLowerCase().includes(term)
+    );
+    this.cdr.markForCheck();
+  }
+
+  isAssigneeSelected(email: string): boolean {
+    return this.selectedAssignees.includes(email);
+  }
+
+  toggleAssignee(email: string): void {
+    const idx = this.selectedAssignees.indexOf(email);
+    if (idx >= 0) {
+      this.selectedAssignees.splice(idx, 1);
+    } else {
+      this.selectedAssignees.push(email);
+    }
+    this.cdr.markForCheck();
+  }
+
+  removeAssignee(email: string): void {
+    this.selectedAssignees = this.selectedAssignees.filter(e => e !== email);
+    this.cdr.markForCheck();
+  }
+
+  getAssignUserDisplayName(email: string): string {
+    const user = this.allAssignUsers.find(u => u.email === email);
+    return user?.displayName || email;
+  }
+
+  openAssignDialog(): void {
+    this.selectedAssignees = [...(this.supabaseAssignment?.assigned_users || [])];
+    this.userSearchTerm = '';
+    this.filteredAssignUsers = [...this.allAssignUsers];
+    this.showAssignDialog = true;
+    this.cdr.markForCheck();
+  }
+
+  closeAssignDialog(): void {
+    this.showAssignDialog = false;
+    this.cdr.markForCheck();
+  }
+
+  confirmAssign(): void {
+    if (!this.selectedAssignees.length) return;
+    this.actionLoading = true;
+
+    const call$ = this.supabaseAssignment
+      ? this.assignmentService.reassignTicket({
+          zoho_ticket_id: this.ticketId,
+          new_assigned_users: this.selectedAssignees,
+          reassigned_by: this.currentUserEmail
+        })
+      : this.assignmentService.assignTicket({
+          zoho_ticket_id: this.ticketId,
+          assigned_users: this.selectedAssignees,
+          assigned_by: this.currentUserEmail
+        });
+
+    call$.subscribe({
+      next: () => {
+        this.actionLoading = false;
+        this.showAssignDialog = false;
+        this.loadTicket();
+        this.messageService.success('Ticket assigned successfully');
+        this.cdr.markForCheck();
+      },
+      error: () => {
+        this.actionLoading = false;
+        this.messageService.error('Failed to assign ticket');
+        this.cdr.markForCheck();
+      }
     });
   }
 
@@ -1644,8 +2035,10 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     }
     
     // Load user role from sessionStorage
-    const storedRole = sessionStorage.getItem('role');
-    this.userRole = (storedRole === 'admin' ? 'admin' : 'user') as 'admin' | 'user';
+    const storedRole = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    this.userRole = (this.elevatedRoles.has(storedRole)
+      ? storedRole
+      : 'user') as 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user';
   }
 
   private canViewTicket(ticket: any): boolean {

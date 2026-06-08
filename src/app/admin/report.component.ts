@@ -1211,6 +1211,8 @@ export class ReportComponent implements OnInit, AfterViewInit {
   @ViewChild('monthlyTrendChart') monthlyTrendChartRef!: ElementRef<HTMLCanvasElement>;
 
   @Input() isEmbedded = false;
+  @Input() departmentFilter = '';
+  @Input() overrideGroupEmail = '';
 
   groupEmail = 'cloudops@muraai.com';
   startDate = '';
@@ -1253,8 +1255,10 @@ export class ReportComponent implements OnInit, AfterViewInit {
   activeSortMetric: SortMetric = 'total';
   memberAvgResolutionMap: Record<string, number> = {};
 
-  private readonly reportCacheKey = 'ITSMS_REPORT_CACHE';
-  private static readonly REPORT_CACHE_TTL_MS = 10 * 60 * 1000;
+  private get reportCacheKey(): string {
+    return this.departmentFilter ? `ITSMS_REPORT_CACHE_${this.departmentFilter}` : 'ITSMS_REPORT_CACHE';
+  }
+  private static readonly REPORT_CACHE_TTL_MS = 30 * 60 * 1000;
 
   private chartColors = [
     '#06b6d4', '#8b5cf6', '#f43f5e', '#f59e0b',
@@ -1262,7 +1266,9 @@ export class ReportComponent implements OnInit, AfterViewInit {
   ];
 
   get isAdmin(): boolean {
-    return (sessionStorage.getItem('role') || '') === 'admin';
+    const role = (sessionStorage.getItem('role') || '').toLowerCase();
+    const elevated = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
+    return elevated.has(role);
   }
 
   get topAssignee(): SummaryRow | null {
@@ -1340,7 +1346,9 @@ export class ReportComponent implements OnInit, AfterViewInit {
           this.loadReport(true, true);
         });
       } else {
-        this.loadReport();
+        // When embedded in the dashboard, load silently (no spinner) so the
+        // dashboard doesn't appear stuck while the report fetches data.
+        this.loadReport(false, this.isEmbedded);
       }
     }
   }
@@ -1368,7 +1376,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   }
 
   applyDateRange(): void {
-    sessionStorage.removeItem(this.reportCacheKey);
+    localStorage.removeItem(this.reportCacheKey);
     this.loadReport(true);
   }
 
@@ -1389,18 +1397,19 @@ export class ReportComponent implements OnInit, AfterViewInit {
         'Group.Read.All'
       ]);
 
+      const effectiveGroupEmail = this.overrideGroupEmail || this.groupEmail;
       this.groupMembers = await firstValueFrom(
-        this.assignmentService.getGroupMembers(this.groupEmail, graphToken)
+        this.assignmentService.getGroupMembers(effectiveGroupEmail, graphToken)
       );
 
       if (this.groupMembers.length === 0) {
-        this.error = 'No CloudOps members found.';
+        this.error = `No members found for ${effectiveGroupEmail}.`;
         this.summaryRows = [];
         this.detailRows = [];
         return;
       }
 
-      const assignments = await firstValueFrom(this.assignmentService.getReportAssignments());
+      const assignments = await firstValueFrom(this.assignmentService.getReportAssignments(this.departmentFilter || undefined));
       this.rawAssignments = assignments;
       this.buildReport(assignments);
       this.saveReportToCache();
@@ -1427,7 +1436,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
     try {
       const result = await firstValueFrom(this.assignmentService.backfillCategories());
       this.backfillResult = result;
-      sessionStorage.removeItem(this.reportCacheKey);
+      localStorage.removeItem(this.reportCacheKey);
       await this.loadReport();
     } catch (err: any) {
       this.error = err?.error?.message || err?.message || 'Backfill failed.';
@@ -1599,6 +1608,22 @@ export class ReportComponent implements OnInit, AfterViewInit {
       });
     });
 
+    const ensureSummaryRow = (email: string): SummaryRow | null => {
+      const normalized = (email || '').toLowerCase().trim();
+      if (!normalized) return null;
+      let row = summaryMap.get(normalized);
+      if (!row) {
+        row = {
+          email: normalized,
+          displayName: memberMap.get(normalized)?.displayName || normalized,
+          assignedCount: 0,
+          closedCount: 0
+        };
+        summaryMap.set(normalized, row);
+      }
+      return row;
+    };
+
     assignments.forEach(assignment => {
       const assignedAt = assignment.assigned_at ? new Date(assignment.assigned_at) : null;
       const closedAt = assignment.closed_at ? new Date(assignment.closed_at) : null;
@@ -1606,23 +1631,21 @@ export class ReportComponent implements OnInit, AfterViewInit {
       const closedInRange = closedAt && closedAt >= start && closedAt <= end;
 
       const assignedUsers = (assignment.assigned_users || []).map(user => user.toLowerCase());
-      const matchedAssigned = assignedUsers.filter(user => memberMap.has(user));
       const closedBy = (assignment.closed_by || '').toLowerCase();
-      const closedByMember = closedBy && memberMap.has(closedBy);
 
-      if (assignedInRange && matchedAssigned.length) {
-        matchedAssigned.forEach(user => {
-          const row = summaryMap.get(user);
+      if (assignedInRange && assignedUsers.length) {
+        assignedUsers.forEach(user => {
+          const row = ensureSummaryRow(user);
           if (row) row.assignedCount += 1;
         });
       }
 
-      if (closedInRange && closedByMember) {
-        const row = summaryMap.get(closedBy);
+      if (closedInRange && closedBy) {
+        const row = ensureSummaryRow(closedBy);
         if (row) row.closedCount += 1;
       }
 
-      if ((assignedInRange && matchedAssigned.length) || (closedInRange && closedByMember)) {
+      if (assignedInRange || closedInRange) {
         const category = this.normalizeCategory(assignment.category);
         categoryMap.set(category, (categoryMap.get(category) || 0) + 1);
 
@@ -1655,15 +1678,16 @@ export class ReportComponent implements OnInit, AfterViewInit {
         });
 
         // Resolution time (only for tickets closed within the date range)
-        if (closedInRange && closedByMember && assignedAt && closedAt) {
+        if (closedInRange && assignedAt && closedAt) {
           const hours = (closedAt.getTime() - assignedAt.getTime()) / 3600000;
           if (hours >= 0) {
             allResolutionHours.push(hours);
             if (!catResolutionMap.has(category)) catResolutionMap.set(category, []);
             catResolutionMap.get(category)!.push(hours);
 
-            if (!closerResolutionMap.has(closedBy)) closerResolutionMap.set(closedBy, []);
-            closerResolutionMap.get(closedBy)!.push(hours);
+            const closerKey = closedBy || 'unknown';
+            if (!closerResolutionMap.has(closerKey)) closerResolutionMap.set(closerKey, []);
+            closerResolutionMap.get(closerKey)!.push(hours);
           }
         }
       }
@@ -1804,7 +1828,10 @@ export class ReportComponent implements OnInit, AfterViewInit {
   }
 
   private formatDate(date: Date): string {
-    return date.toISOString().slice(0, 10);
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
   }
 
   private applyPresetDateRange(period: Exclude<ReportPeriod, 'custom'>): void {
@@ -2103,7 +2130,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
 
   private loadReportFromCache(allowStale = false): boolean {
     try {
-      const raw = sessionStorage.getItem(this.reportCacheKey);
+      const raw = localStorage.getItem(this.reportCacheKey);
       if (!raw) return false;
 
       const cache = JSON.parse(raw);
@@ -2188,7 +2215,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
         slaActionRequired: this.slaActionRequired,
         slaWithinTargetCount: this.slaWithinTargetCount
       };
-      sessionStorage.setItem(this.reportCacheKey, JSON.stringify(payload));
+      localStorage.setItem(this.reportCacheKey, JSON.stringify(payload));
     } catch {
       // ignore storage errors
     }

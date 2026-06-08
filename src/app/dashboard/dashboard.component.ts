@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, Input, ViewChild } from '@angular/core';
+import { Component, OnInit, OnDestroy, OnChanges, SimpleChanges, ChangeDetectionStrategy, ChangeDetectorRef, Input, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
@@ -37,6 +37,14 @@ import { ReportComponent } from '../admin/report.component';
           </div>
           <div class="welcome-stats">
             <div class="date-filter-controls">
+              <div class="dept-filter" *ngIf="userRole === 'admin'">
+                <label>
+                  <span>Department</span>
+                  <select [(ngModel)]="selectedAdminDept" (ngModelChange)="onAdminDeptChange()">
+                    <option *ngFor="let d of adminDepts" [value]="d.value">{{ d.label }}</option>
+                  </select>
+                </label>
+              </div>
               <div class="date-filters">
                 <label>
                   <span>Data Filter</span>
@@ -65,7 +73,7 @@ import { ReportComponent } from '../admin/report.component';
         </div>
       </div>
 
-      <app-admin-report *ngIf="isAdmin" [isEmbedded]="true" #reportComponent></app-admin-report>
+      <app-admin-report *ngIf="isAdmin" [isEmbedded]="true" [departmentFilter]="deptFilterForReport" [overrideGroupEmail]="deptGroupEmail" #reportComponent></app-admin-report>
     </ng-container>
 
     <ng-template #overviewBlock>
@@ -443,6 +451,37 @@ import { ReportComponent } from '../admin/report.component';
       border: 1px solid rgba(255,255,255,0.16);
     }
 
+    .dept-filter {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .dept-filter label {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      font-size: 0.7rem;
+    }
+
+    .dept-filter label span {
+      color: rgba(255,255,255,0.7);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 0.65rem;
+    }
+
+    .dept-filter select {
+      padding: 5px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.12);
+      color: #fff;
+      font-size: 0.78rem;
+      cursor: pointer;
+    }
+
     .date-filters {
       display: flex;
       gap: 8px;
@@ -481,6 +520,11 @@ import { ReportComponent } from '../admin/report.component';
 
     /* Native select menus render on system background; keep option text dark. */
     .date-filters select option {
+      color: #0f172a;
+      background: #ffffff;
+    }
+
+    .dept-filter select option {
       color: #0f172a;
       background: #ffffff;
     }
@@ -1061,27 +1105,31 @@ import { ReportComponent } from '../admin/report.component';
 
   `]
 })
-export class DashboardComponent implements OnInit, OnDestroy {
+export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
 
   @Input() isEmbeddedMode = false;
+  @Input() overviewDepartmentId = '';
   @ViewChild('reportComponent') reportComponent?: ReportComponent;
 
   private get COUNT_CACHE_KEY(): string {
     const userEmail = sessionStorage.getItem('username') || 'guest';
     const userRole = sessionStorage.getItem('role') || 'user';
-    return `dashboard_ticket_counts_${userRole}_${userEmail}`;
+    const deptSuffix = this.isEmbeddedMode && this.overviewDepartmentId ? `_${this.overviewDepartmentId}` : '';
+    return `dashboard_ticket_counts_${userRole}_${userEmail}${deptSuffix}`;
   }
 
   private get TICKETS_CACHE_KEY(): string {
     const userEmail = sessionStorage.getItem('username') || 'guest';
     const userRole = sessionStorage.getItem('role') || 'user';
-    return `dashboard_tickets_${userRole}_${userEmail}_${this.selectedTab}`;
+    const deptSuffix = this.isEmbeddedMode && this.overviewDepartmentId ? `_${this.overviewDepartmentId}` : '';
+    return `dashboard_tickets_${userRole}_${userEmail}_${this.selectedTab}${deptSuffix}`;
   }
 
   private get TICKETS_CACHE_KEY_BASE(): string {
     const userEmail = sessionStorage.getItem('username') || 'guest';
     const userRole = sessionStorage.getItem('role') || 'user';
-    return `dashboard_tickets_${userRole}_${userEmail}`;
+    const deptSuffix = this.isEmbeddedMode && this.overviewDepartmentId ? `_${this.overviewDepartmentId}` : '';
+    return `dashboard_tickets_${userRole}_${userEmail}${deptSuffix}`;
   }
 
   tickets: Ticket[] = [];
@@ -1090,6 +1138,42 @@ export class DashboardComponent implements OnInit, OnDestroy {
   selectedTab: 'open' | 'closed' = 'open';
   showReportOnDashboard = false;
   showComingSoonForNonCloudOps = false;
+
+  // Department analytics config
+  readonly DEPT_CONFIG: Record<string, { id: string; groupEmail: string; name: string }> = {
+    cloudops: { id: '132475000009937630', groupEmail: 'cloudops@muraai.com', name: 'CloudOps' },
+    hr:       { id: '132475000009925079', groupEmail: 'hr@muraai.com',       name: 'HR' },
+    product:  { id: '132475000009958716', groupEmail: 'product@muraai.com',  name: 'Product' },
+    support:  { id: '132475000009948173', groupEmail: 'support@muraai.com',  name: 'Support' },
+    muraai:   { id: '132475000000010772', groupEmail: 'muraai@muraai.com',   name: 'Muraai' },
+  };
+  adminDepts = [
+    { value: 'all',      label: 'All Departments' },
+    { value: 'cloudops', label: 'CloudOps (ITSM)' },
+    { value: 'hr',       label: 'HR' },
+    { value: 'product',  label: 'Product' },
+    { value: 'support',  label: 'Support' },
+    { value: 'muraai',   label: 'Muraai' },
+  ];
+  selectedAdminDept = 'all';
+
+  get deptFilterForReport(): string {
+    if (this.userRole === 'admin') {
+      return this.selectedAdminDept === 'all' ? '' : (this.DEPT_CONFIG[this.selectedAdminDept]?.id || '');
+    }
+    const role = this.userRole === 'itsm' ? 'cloudops' : this.userRole;
+    return this.DEPT_CONFIG[role]?.id || '';
+  }
+
+  get deptGroupEmail(): string {
+    if (this.userRole === 'admin') {
+      return this.selectedAdminDept === 'all'
+        ? 'cloudops@muraai.com'
+        : (this.DEPT_CONFIG[this.selectedAdminDept]?.groupEmail || 'cloudops@muraai.com');
+    }
+    const role = this.userRole === 'itsm' ? 'cloudops' : this.userRole;
+    return this.DEPT_CONFIG[role]?.groupEmail || 'cloudops@muraai.com';
+  }
 
   // Date filter properties
   selectedPeriod: 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual' = 'custom';
@@ -1150,7 +1234,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.showReportOnDashboard = this.router.url.startsWith('/dashboard');
 
     this.initUserInfo();
-    this.showComingSoonForNonCloudOps = !this.isAdmin && !this.isEmbeddedMode;
+    // Show Coming Soon only if admin user is NOT in cloudops group
+    // CloudOps role users always see dashboard
+    const isCloudOps = sessionStorage.getItem('isCloudOps') === 'true';
+    const isAdminRole = this.userRole === 'admin';
+    this.showComingSoonForNonCloudOps = isAdminRole && !isCloudOps && !this.isEmbeddedMode;
 
     if (this.showComingSoonForNonCloudOps) {
       this.countsLoading = false;
@@ -1197,12 +1285,18 @@ export class DashboardComponent implements OnInit, OnDestroy {
       }
     }
 
+    // Force a change-detection pass so OnPush picks up whatever was loaded
+    // from localStorage synchronously above before the async network calls start.
+    this.cdr.markForCheck();
+
     // Skip network refresh entirely if local cache is still warm.
     if (!countsCacheFresh) {
-      this.loadCounts(true, false);
+      this.loadCounts(false, false);
     }
     if (!ticketsCacheFresh) {
-      this.loadTickets(true);
+      // If we already have cached data displayed, load silently (no overlay)
+      const hasCachedData = this.tickets.length > 0;
+      this.loadTickets(hasCachedData);
     }
   }
 
@@ -1211,8 +1305,21 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.destroy$.complete();
   }
 
+  ngOnChanges(changes: SimpleChanges): void {
+    if (!changes['overviewDepartmentId']) return;
+    if (!this.isEmbeddedMode) return;
+    // Skip on first initialization - ngOnInit handles the initial load
+    if (changes['overviewDepartmentId'].firstChange) return;
+
+    // Reload overview ticket data and counts when parent (View Ticket page) changes department.
+    this.ticketService.clearAllCache();
+    this.loadCounts(true, true);
+    this.loadTickets(true);
+  }
+
   get isAdmin(): boolean {
-    return this.userRole === 'admin';
+    const elevatedRoles = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
+    return elevatedRoles.has((this.userRole || '').toLowerCase());
   }
 
   initUserInfo() {
@@ -1249,7 +1356,10 @@ export class DashboardComponent implements OnInit, OnDestroy {
     if (forceRefresh || this.countsLoading) {
       this.countsLoading = true;
     }
-    this.ticketService.getTicketCounts(forceRefresh)
+    const departmentId = this.isEmbeddedMode && this.isAdmin && this.overviewDepartmentId
+      ? this.overviewDepartmentId
+      : undefined;
+    this.ticketService.getTicketCounts(forceRefresh, departmentId)
       .pipe(takeUntil(this.destroy$))
       .subscribe({
         next: counts => {
@@ -1282,8 +1392,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
       this.loadingService.show();
     }
     const filterEmail = !this.isAdmin ? this.currentUserEmail : undefined;
+    const departmentId = this.isEmbeddedMode && this.isAdmin && this.overviewDepartmentId
+      ? this.overviewDepartmentId
+      : undefined;
     // 50 records is enough for dashboard widgets and faster than 100.
-    this.ticketService.getTickets(1, 50, this.selectedTab, undefined, filterEmail)
+    this.ticketService.getTickets(1, 50, this.selectedTab, undefined, filterEmail, undefined, departmentId)
       .pipe(takeUntil(this.destroy$))
       .subscribe({
         next: res => {
@@ -1484,7 +1597,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.reportComponent.selectedPeriod = this.selectedPeriod;
     
     // Clear the report cache before loading new data
-    sessionStorage.removeItem('ITSMS_REPORT_CACHE');
+    localStorage.removeItem('ITSMS_REPORT_CACHE');
     
     // Call the report's applyDateRange which triggers loadReport
     this.reportComponent.applyDateRange();
@@ -1511,6 +1624,20 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   downloadExcel() {
     this.reportComponent?.downloadExcel();
+  }
+
+  onAdminDeptChange() {
+    if (!this.reportComponent) return;
+    // Clear the cached report for the newly selected department and reload
+    const cacheKey = this.deptFilterForReport
+      ? `ITSMS_REPORT_CACHE_${this.deptFilterForReport}`
+      : 'ITSMS_REPORT_CACHE';
+    localStorage.removeItem(cacheKey);
+    // Inputs (departmentFilter, overrideGroupEmail) are bound via template — trigger reload
+    this.reportComponent.departmentFilter = this.deptFilterForReport;
+    this.reportComponent.overrideGroupEmail = this.deptGroupEmail;
+    this.reportComponent.applyDateRange();
+    this.cdr.markForCheck();
   }
 }
 

@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
+import { Component, OnInit, OnDestroy, AfterViewInit, ChangeDetectionStrategy, ChangeDetectorRef, ViewChild, ElementRef, NgZone } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router, ActivatedRoute } from '@angular/router';
@@ -25,7 +25,8 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
         <div
           class="tab"
           [class.active]="selectedTab === 'overview'"
-          (click)="switchTab('overview')">
+          (click)="switchTab('overview')"
+          *ngIf="isCloudOpsMember || isAdmin">
           Overview
         </div>
 
@@ -64,7 +65,7 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
                 (click)="openBulkAssignDialog()">
           <i class="fas fa-users"></i> Bulk Reassign ({{ selectedTickets.size }})
         </button>
-        <div class="search-bar">
+        <div class="search-bar" *ngIf="selectedTab !== 'overview'">
           <input
             type="search"
             placeholder="Search ticket #, id, subject, or email"
@@ -86,15 +87,42 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
           My Closed
         </div>
       </div>
+      <div class="view-filter-tabs">
+        <div class="view-filter-tab"
+             [class.active]="myViewFilter === 'all'"
+             (click)="switchMyViewFilter('all')">
+          All
+        </div>
+        <div class="view-filter-tab"
+             [class.active]="myViewFilter === 'assigned'"
+             (click)="switchMyViewFilter('assigned')">
+          Assigned to Me
+        </div>
+        <div class="view-filter-tab"
+             [class.active]="myViewFilter === 'raised'"
+             (click)="switchMyViewFilter('raised')">
+          Raised by Me
+        </div>
+      </div>
     </div>
 
-    <app-dashboard *ngIf="selectedTab === 'overview'" class="embedded-overview" [isEmbeddedMode]="true"></app-dashboard>
+    <div class="sub-tabs-row" *ngIf="(selectedTab === 'open' || selectedTab === 'closed' || selectedTab === 'overview') && userRole === 'admin' && departments.length > 0">
+      <div class="dept-filter">
+        <label class="dept-label">Department:</label>
+        <select class="dept-select" [(ngModel)]="selectedDepartmentId" (ngModelChange)="onDepartmentChange()">
+          <option value="">All Departments</option>
+          <option *ngFor="let dept of departments" [value]="dept.id" [disabled]="dept.disabled">{{ dept.name }}{{ dept.disabled ? ' (Coming Soon)' : '' }}</option>
+        </select>
+      </div>
+    </div>
+
+    <app-dashboard *ngIf="selectedTab === 'overview'" class="embedded-overview" [isEmbeddedMode]="true" [overviewDepartmentId]="selectedDepartmentId"></app-dashboard>
 
     <div class="loading" *ngIf="(loadingService.loading$ | async) && selectedTab !== 'overview'">
   Loading tickets...
 </div>
 
-    <div class="table-wrap" *ngIf="filteredTickets.length > 0 && selectedTab !== 'overview'; else noTickets">
+    <div class="table-wrap" *ngIf="filteredTickets.length > 0 && selectedTab !== 'overview'">
       <table class="tickets-table">
         <thead>
           <tr>
@@ -200,36 +228,25 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
       </table>
     </div>
 
-    <ng-template #noTickets>
-      <div class="no-tickets" *ngIf="selectedTab !== 'overview'">
-        <div *ngIf="searchTerm" class="empty-search">
-          <i class="fas fa-search"></i>
-          <p>No tickets match "{{ searchTerm }}"</p>
-          <small>Try different keywords or check your search term</small>
+    <div *ngIf="filteredTickets.length === 0 && !(loadingService.loading$ | async) && selectedTab !== 'overview'" class="no-tickets">
+      <div *ngIf="searchTerm" class="empty-search">
+        <i class="fas fa-search"></i>
+        <p>No tickets match "{{ searchTerm }}"</p>
+        <small>Try different keywords or check your search term</small>
         </div>
         <div *ngIf="!searchTerm" class="empty-state">
           <i class="fas fa-inbox"></i>
           <p>No tickets found</p>
         </div>
       </div>
-    </ng-template>
 
-    <div class="pagination-controls" *ngIf="filteredTickets.length > 0 && !searchTerm && selectedTab !== 'overview'">
-      <button (click)="prevPage()" 
-              [disabled]="selectedTab === 'my' ? 
-                (myStatus === 'open' ? myTicketsOpenPage === 1 : myTicketsClosedPage === 1) : 
-                (currentPage === 1)">
-        ⬅ Previous
-      </button>
-      <span>Page {{ selectedTab === 'my' ? 
-                     (myStatus === 'open' ? myTicketsOpenPage : myTicketsClosedPage) : 
-                     currentPage }}</span>
-      <button (click)="nextPage()" 
-              [disabled]="selectedTab === 'my' ? 
-                (myStatus === 'open' ? !myTicketsOpenHasMore : !myTicketsClosedHasMore) : 
-                !hasMore">
-        Next ➡
-      </button>
+    <div class="infinite-scroll-status" #infiniteScrollTrigger *ngIf="filteredTickets.length > 0 && !searchTerm && selectedTab !== 'overview'">
+      <span *ngIf="infiniteLoading" class="loading-more">
+        <i class="fas fa-circle-notch"></i>
+        Loading more tickets...
+      </span>
+      <span *ngIf="!infiniteLoading && hasMoreForCurrentTab">Scroll down to load more tickets</span>
+      <span *ngIf="!hasMoreForCurrentTab">You have reached the end of the ticket list</span>
     </div>
 
     <div class="modal-backdrop" *ngIf="showCloseDialog || showUpdateDialog || showAssignDialog || showBulkAssignDialog">
@@ -271,50 +288,53 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
 
         <!-- Single Ticket Assign/Reassign Dialog -->
         <ng-container *ngIf="showAssignDialog">
-          <h2>{{ isReassigning ? 'Reassign' : 'Assign' }} Ticket</h2>
-          <p class="assign-ticket-info">Ticket #{{ assignTicketNumber }}</p>
-          
-          <div class="search-users">
+          <div class="assign-modal-header">
+            <span>{{ isReassigning ? 'Reassign' : 'Assign' }} Ticket</span>
+            <small class="assign-modal-ticket-ref">Ticket #{{ assignTicketNumber }}</small>
+            <button class="assign-modal-close" (click)="cancelDialogs()"><i class="fas fa-times"></i></button>
+          </div>
+
+          <div class="assign-modal-search">
             <input type="text" 
                    placeholder="Search users..." 
                    [(ngModel)]="userSearchTerm"
                    (input)="filterUsers()" />
           </div>
-          
-          <div class="selected-chips" *ngIf="selectedAssignees.length > 0">
-            <span class="chip" *ngFor="let email of selectedAssignees">
+
+          <div class="assign-modal-chips" *ngIf="selectedAssignees.length > 0">
+            <span class="assign-modal-chip" *ngFor="let email of selectedAssignees">
               {{ getUserDisplayName(email) }}
-              <button class="chip-remove" (click)="removeAssignee(email)">×</button>
+              <button class="assign-chip-remove" (click)="removeAssignee(email)">×</button>
             </span>
           </div>
-          
-          <div class="users-list">
-            <div class="user-item" 
+
+          <div class="assign-modal-users-list">
+            <div class="assign-modal-user-item" 
                  *ngFor="let user of filteredUsers"
                  [class.selected]="isUserSelected(user.email)"
                  (click)="toggleUserSelection(user.email)">
               <input type="checkbox" 
                      [checked]="isUserSelected(user.email)"
                      (click)="$event.stopPropagation()" />
-              <div class="user-info">
-                <span class="user-name">{{ user.displayName || user.email }}</span>
-                <span class="user-email">{{ user.email }}</span>
+              <div class="assign-modal-user-info">
+                <span class="assign-modal-user-name">{{ user.displayName || user.email }}</span>
+                <span class="assign-modal-user-email">{{ user.email }}</span>
               </div>
             </div>
-            <div class="no-users" *ngIf="filteredUsers.length === 0 && !loadingUsers">
+            <div class="assign-modal-no-users" *ngIf="filteredUsers.length === 0 && !loadingUsers">
               No users found
             </div>
-            <div class="loading-users" *ngIf="loadingUsers">
+            <div class="assign-modal-loading" *ngIf="loadingUsers">
               Loading users...
             </div>
           </div>
-          
-          <div class="modal-actions">
-            <button class="btn btn-secondary" (click)="cancelDialogs()">Cancel</button>
-            <button class="btn btn-primary" 
+
+          <div class="assign-modal-footer">
+            <button class="act-btn close-btn" (click)="cancelDialogs()">Cancel</button>
+            <button class="act-btn assign-btn" 
                     (click)="confirmAssign()"
                     [disabled]="selectedAssignees.length === 0">
-              {{ isReassigning ? 'Reassign' : 'Assign' }}
+              <i class="fas fa-check"></i> {{ isReassigning ? 'Reassign' : 'Assign' }}
             </button>
           </div>
         </ng-container>
@@ -473,6 +493,87 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
     :host-context(.dark-theme) .sub-tab.active {
       background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
       color: white;
+    }
+
+    .view-filter-tabs {
+      display: flex;
+      gap: 4px;
+    }
+
+    .view-filter-tab {
+      padding: 4px 10px;
+      cursor: pointer;
+      color: #64748b;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 5px;
+      font-size: 10px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+
+    .view-filter-tab:hover {
+      background: #e0f2fe;
+      color: #0369a1;
+      border-color: #7dd3fc;
+    }
+
+    .view-filter-tab.active {
+      background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+      color: white;
+      border-color: transparent;
+      font-weight: 600;
+      box-shadow: 0 2px 8px rgba(14, 165, 233, 0.3);
+    }
+
+    :host-context(.dark-theme) .view-filter-tab {
+      background: #1e293b;
+      color: #94a3b8;
+      border-color: #334155;
+    }
+
+    :host-context(.dark-theme) .view-filter-tab.active {
+      background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+      color: white;
+    }
+
+    .dept-filter {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 3px 0 8px;
+    }
+
+    .dept-label {
+      font-size: 11px;
+      font-weight: 500;
+      color: #64748b;
+    }
+
+    .dept-select {
+      padding: 4px 10px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #1e293b;
+      background: #fff;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .dept-select:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 2px rgba(59,130,246,0.12);
+    }
+
+    :host-context(.dark-theme) .dept-label {
+      color: #94a3b8;
+    }
+
+    :host-context(.dark-theme) .dept-select {
+      background: #1e293b;
+      border-color: #334155;
+      color: #e2e8f0;
     }
 
     .tab {
@@ -646,14 +747,12 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
     }
 
     .status {
-      padding: 4px 8px;
+      padding: 3px 8px;
       border-radius: 14px;
-      font-size: 9px;
-      font-weight: 700;
-      color: #fff;
+      font-size: .65rem;
+      font-weight: 600;
       display: inline-block;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
+      text-transform: capitalize;
     }
 
     .loading {
@@ -665,22 +764,22 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
     }
 
     .status.open { 
-      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-      box-shadow: 0 2px 8px rgba(59, 130, 246, 0.35);
+      background: #dbeafe;
+      color: #0031b6;
     }
     .status.inprogress { 
-      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-      box-shadow: 0 2px 8px rgba(245, 158, 11, 0.35);
+      background: #fef3c7;
+      color: #92400e;
     }
     .status.resolved { 
-      background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-      box-shadow: 0 2px 8px rgba(16, 185, 129, 0.35);
+      background: #d1fae5;
+      color: #065f46;
     }
     .status.closed { 
-      background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
-      box-shadow: 0 2px 8px rgba(107, 114, 128, 0.35);
+      background: #dcfce7;
+      color: #15803d;
     }
-    .status.unknown { background: #9ca3af; }
+    .status.unknown { background: #f3f4f6; color: #6b7280; }
 
     /* Priority Indicator Styles */
     .priority-col {
@@ -1011,6 +1110,180 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
       font-size: 15px;
     }
 
+    .assign-modal-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 18px;
+      margin: -24px -24px 12px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+      font-weight: 600;
+      color: #1e293b;
+    }
+
+    .assign-modal-ticket-ref {
+      font-size: 11px;
+      color: #94a3b8;
+      font-weight: 400;
+      margin-left: auto;
+      margin-right: 8px;
+    }
+
+    .assign-modal-close {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #64748b;
+      font-size: 15px;
+    }
+
+    .assign-modal-search {
+      padding: 2px 0 8px;
+    }
+
+    .assign-modal-search input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #1e293b;
+      outline: none;
+      box-sizing: border-box;
+      transition: all 0.2s ease;
+    }
+
+    .assign-modal-search input:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+    }
+
+    .assign-modal-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 0 0 8px;
+    }
+
+    .assign-modal-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #eff6ff;
+      color: #2563eb;
+      border: 1px solid #bfdbfe;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .assign-chip-remove {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #3b82f6;
+      font-size: 14px;
+      padding: 0;
+      line-height: 1;
+      margin-left: 2px;
+    }
+
+    .assign-modal-users-list {
+      overflow-y: auto;
+      max-height: 300px;
+      padding: 4px 0;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      margin-bottom: 10px;
+    }
+
+    .assign-modal-user-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .assign-modal-user-item:hover {
+      background: #f0f9ff;
+    }
+
+    .assign-modal-user-item.selected {
+      background: #eff6ff;
+    }
+
+    .assign-modal-user-info {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .assign-modal-user-name {
+      font-size: 13px;
+      color: #1e293b;
+      font-weight: 500;
+    }
+
+    .assign-modal-user-email {
+      font-size: 11px;
+      color: #94a3b8;
+    }
+
+    .assign-modal-no-users,
+    .assign-modal-loading {
+      padding: 16px;
+      text-align: center;
+      color: #94a3b8;
+      font-size: 13px;
+    }
+
+    .assign-modal-footer {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      padding: 12px 0 0;
+      border-top: 1px solid #e2e8f0;
+    }
+
+    .act-btn {
+      border: none;
+      border-radius: 12px;
+      padding: 8px 16px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      transition: all 0.2s ease;
+    }
+
+    .act-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .close-btn {
+      background: #e2e8f0;
+      color: #0f172a;
+    }
+
+    .close-btn:hover {
+      background: #cbd5e1;
+    }
+
+    .assign-btn {
+      background: #a78bfa;
+      color: #fff;
+    }
+
+    .assign-btn:hover:not(:disabled) {
+      background: #8b5cf6;
+    }
+
     .search-users {
       margin-bottom: 16px;
     }
@@ -1286,55 +1559,33 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
       margin-left: 0;
     }
 
-    .pagination-controls {
+    .infinite-scroll-status {
       display: flex;
-      gap: 12px;
+      gap: 10px;
       align-items: center;
       justify-content: center;
       margin-top: 14px;
       padding: 10px;
       background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
       border-radius: 10px;
-    }
-
-    .pagination-controls button {
-      padding: 6px 12px;
-      border: none;
-      border-radius: 6px;
-      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
-      color: white;
-      font-weight: 600;
-      font-size: 11px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .pagination-controls button:hover:not(:disabled) {
-      transform: translateY(-1px);
-      box-shadow: 0 3px 10px rgba(59, 130, 246, 0.3);
-    }
-
-    .pagination-controls button:disabled {
-      background: #cbd5e1;
-      cursor: not-allowed;
-    }
-
-    .pagination-controls span {
       font-weight: 600;
       font-size: 11px;
       color: #334155;
     }
 
-    :host-context(.dark-theme) .pagination-controls {
+    .loading-more {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .loading-more i {
+      animation: spin 0.9s linear infinite;
+    }
+
+    :host-context(.dark-theme) .infinite-scroll-status {
       background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-    }
-
-    :host-context(.dark-theme) .pagination-controls span {
       color: #e2e8f0;
-    }
-
-    :host-context(.dark-theme) .pagination-controls button:disabled {
-      background: #334155;
     }
 
     /* Modal Styles */
@@ -1506,13 +1757,14 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
     }
   `]
 })
-export class TicketsComponent implements OnInit, OnDestroy {
+export class TicketsComponent implements OnInit, OnDestroy, AfterViewInit {
 
   tickets: Ticket[] = [];
   filteredTickets: Ticket[] = [];
 
   selectedTab: 'open' | 'closed' | 'my' | 'overview' = 'overview';
   myStatus: 'open' | 'closed' = 'open';
+  myViewFilter: 'all' | 'assigned' | 'raised' = 'all';
   currentPage = 1;
   limit = 25;
   hasMore = false;
@@ -1530,11 +1782,33 @@ export class TicketsComponent implements OnInit, OnDestroy {
   currentUserEmail = '';
   currentUserName = '';
   allowedRequesterEmails: string[] = [];
-  userRole: 'admin' | 'user' = 'user';
+  userRole: 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user' = 'user';
+  private readonly elevatedRoles = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
+  isCloudOpsMember = false;
 
   get isAdmin(): boolean {
-    return this.userRole === 'admin';
+    return this.elevatedRoles.has(this.userRole);
   }
+
+  get hasMoreForCurrentTab(): boolean {
+    if (this.selectedTab === 'my') {
+      return this.myStatus === 'open' ? this.myTicketsOpenHasMore : this.myTicketsClosedHasMore;
+    }
+    return this.hasMore;
+  }
+
+  get infiniteLoading(): boolean {
+    return this.isInfiniteLoading;
+  }
+
+  departments: { id: string; name: string; disabled?: boolean }[] = [
+    { id: '132475000009937630', name: 'ITSM', disabled: false },
+    { id: '132475000009925079', name: 'HR', disabled: true },
+    { id: '132475000009948173', name: 'Support', disabled: true },
+    { id: '132475000009958716', name: 'Products', disabled: true },
+    { id: '132475000000010772', name: 'Muraai', disabled: true }
+  ];
+  selectedDepartmentId = '';
 
   searchTerm = '';
   private searchTerm$ = new Subject<string>();
@@ -1544,6 +1818,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   private searchCache = new Map<string, Ticket[]>(); // 🚀 Cache search results
   private isInitialLoad = true; // Track if first load or tab switch
   isRefreshing = false;
+  private isInfiniteLoading = false;
   private isAutoRefreshing = false;
   private readonly myTicketsAutoRefreshMs = 60_000;
   private dashboardQuickFilter: 'all' | 'sla' | 'assigned' = 'all';
@@ -1557,7 +1832,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   updateStatus = '';
   updatePriority = '';
 
-  statusOptions = ['Open', 'In Progress', 'Resolved', 'Closed'];
+  statusOptions = ['Open', 'Closed'];
   priorityOptions = ['Critical', 'High', 'Medium', 'Low'];
 
   // ================= ASSIGNMENT STATE =================
@@ -1587,11 +1862,22 @@ export class TicketsComponent implements OnInit, OnDestroy {
     private sslService: SslService,
     private cdr: ChangeDetectorRef,
     private router: Router,
-    private route: ActivatedRoute
+    private route: ActivatedRoute,
+    private ngZone: NgZone
   ) {}
+
+  ngAfterViewInit(): void {
+    setTimeout(() => this.setupInfiniteScrollObserver(), 500);
+  }
 
   async ngOnInit(): Promise<void> {
     await this.initCurrentUser();
+
+    // Restore department selection from sessionStorage
+    const savedDept = sessionStorage.getItem('ITSM_SELECTED_DEPT') || '';
+    if (savedDept && this.departments.some(d => d.id === savedDept)) {
+      this.selectedDepartmentId = savedDept;
+    }
 
     const dashboardStatus = (this.route.snapshot.queryParamMap.get('status') || '').toLowerCase().trim();
     const requestedTab = (this.route.snapshot.queryParamMap.get('tab') || '').toLowerCase().trim();
@@ -1609,9 +1895,10 @@ export class TicketsComponent implements OnInit, OnDestroy {
     } else if (requestedTab) {
       const allowedTabs: Array<'open' | 'closed' | 'my' | 'overview'> = this.isAdmin
         ? ['overview', 'open', 'closed', 'my']
-        : ['overview', 'my'];
+        : (this.isCloudOpsMember || this.isAdmin ? ['overview', 'my'] : ['my']);
       const parsedTab = requestedTab as 'open' | 'closed' | 'my' | 'overview';
-      this.selectedTab = allowedTabs.includes(parsedTab) ? parsedTab : 'overview';
+      const defaultTab = (this.isCloudOpsMember || this.isAdmin) ? 'overview' : 'my';
+      this.selectedTab = allowedTabs.includes(parsedTab) ? parsedTab : defaultTab;
 
       if (this.selectedTab === 'my') {
         if (requestedMyStatus === 'closed' || requestedMyStatus === 'open') {
@@ -1626,8 +1913,9 @@ export class TicketsComponent implements OnInit, OnDestroy {
     } else {
       const allowedTabs: Array<'open' | 'closed' | 'my' | 'overview'> = this.isAdmin
         ? ['overview', 'open', 'closed', 'my']
-        : ['overview', 'my'];
-      this.selectedTab = (savedSelectedTab && allowedTabs.includes(savedSelectedTab)) ? savedSelectedTab : 'overview';
+        : (this.isCloudOpsMember || this.isAdmin ? ['overview', 'my'] : ['my']);
+      const defaultTab = (this.isCloudOpsMember || this.isAdmin) ? 'overview' : 'my';
+      this.selectedTab = (savedSelectedTab && allowedTabs.includes(savedSelectedTab)) ? savedSelectedTab : defaultTab;
 
       if (savedMyStatus && ['open', 'closed'].includes(savedMyStatus)) {
         this.myStatus = savedMyStatus;
@@ -1641,7 +1929,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
     this.loadAssignmentsAsync();
     
     // 🚀 Try to restore from service-level cache first (persists across navigation)
-    const cacheKey = this.selectedTab === 'my' ? `my_${this.myStatus}` : this.selectedTab;
+    const deptSuffix = this.selectedDepartmentId ? `_dept_${this.selectedDepartmentId}` : '';
+    const cacheKey = (this.selectedTab === 'my' ? `my_${this.myStatus}` : this.selectedTab) + deptSuffix;
     const cached = this.ticketService.getTabCache(cacheKey);
     
     if (cached) {
@@ -1702,6 +1991,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.destroyScrollObserver();
     this.searchSub?.unsubscribe();
     this.autoRefreshSub?.unsubscribe();
     this.destroy$.next();
@@ -1744,7 +2034,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
     sessionStorage.setItem('ITSM_SELECTED_TAB', tab);
     
     // 🚀 Try to restore from service cache
-    const cacheKey = tab === 'my' ? `my_${this.myStatus}` : tab;
+    const deptSuffix = this.selectedDepartmentId ? `_dept_${this.selectedDepartmentId}` : '';
+    const cacheKey = (tab === 'my' ? `my_${this.myStatus}` : tab) + deptSuffix;
     const cached = this.ticketService.getTabCache(cacheKey);
     
     if (cached) {
@@ -1790,6 +2081,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
   switchMyStatus(status: 'open' | 'closed'): void {
     if (this.myStatus === status) return;
     this.dashboardQuickFilter = 'all';
+    this.myViewFilter = 'all'; // reset view filter when switching status
     
     // 🚀 Save current my-status state to service cache before switching
     this.saveToServiceCache();
@@ -1800,7 +2092,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
     sessionStorage.setItem('ITSM_MY_STATUS', status);
     
     // 🚀 Try to restore from service cache
-    const cacheKey = `my_${status}`;
+    const deptSuffix = this.selectedDepartmentId ? `_dept_${this.selectedDepartmentId}` : '';
+    const cacheKey = `my_${status}` + deptSuffix;
     const cached = this.ticketService.getTabCache(cacheKey);
     
     if (cached) {
@@ -1823,6 +2116,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     }
     
     // No valid cache, load fresh
+    this.filteredTickets = []; // clear stale data from previous sub-tab
     if (status === 'open') {
       this.myTicketsOpenPage = 1;
       this.myTicketsOpenLastApiPage = 0;
@@ -1836,16 +2130,83 @@ export class TicketsComponent implements OnInit, OnDestroy {
     this.prefetchLikelyNextView();
   }
 
+  switchMyViewFilter(filter: 'all' | 'assigned' | 'raised'): void {
+    if (this.myViewFilter === filter) return;
+    this.myViewFilter = filter;
+    // Clear caches and visible list so stale data from previous filter isn't shown
+    this.filteredTickets = [];
+    this.myTicketsOpenAll = [];
+    this.myTicketsClosedAll = [];
+    this.myTicketsOpenLastApiPage = 0;
+    this.myTicketsClosedLastApiPage = 0;
+    this.myTicketsOpenPage = 1;
+    this.myTicketsClosedPage = 1;
+    this.ticketService.invalidateTabCache();
+    this.loadTickets(true);
+  }
+
+  onDepartmentChange(): void {
+    sessionStorage.setItem('ITSM_SELECTED_DEPT', this.selectedDepartmentId);
+    if (this.selectedTab === 'overview') {
+      this.cdr.markForCheck();
+      return;
+    }
+    this.currentPage = 1;
+    this.filteredTickets = [];
+    this.ticketService.invalidateTabCache();
+    this.loadTickets(true);
+  }
+
+  @ViewChild('infiniteScrollTrigger') infiniteScrollTrigger!: ElementRef;
+  private scrollObserver: IntersectionObserver | null = null;
+
+  private setupInfiniteScrollObserver(): void {
+    this.destroyScrollObserver();
+    if (!this.infiniteScrollTrigger?.nativeElement) return;
+
+    const contentWrapper = this.infiniteScrollTrigger.nativeElement.closest('.content-wrapper') || document;
+
+    this.scrollObserver = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry?.isIntersecting) return;
+        this.ngZone.run(() => this.onScrollTriggerVisible());
+      },
+      { root: contentWrapper === document ? null : contentWrapper, rootMargin: '200px', threshold: 0 }
+    );
+    this.scrollObserver.observe(this.infiniteScrollTrigger.nativeElement);
+  }
+
+  private destroyScrollObserver(): void {
+    if (this.scrollObserver) {
+      this.scrollObserver.disconnect();
+      this.scrollObserver = null;
+    }
+  }
+
+  private onScrollTriggerVisible(): void {
+    if (this.selectedTab === 'overview') return;
+    if (this.searchTerm) return;
+    if (this.isRefreshing || this.isAutoRefreshing || this.isInfiniteLoading) return;
+    if (this.showAssignDialog || this.showBulkAssignDialog || this.showUpdateDialog || this.showCloseDialog) return;
+    if (!this.hasMoreForCurrentTab) return;
+
+    this.isInfiniteLoading = true;
+    this.cdr.markForCheck();
+    this.nextPage();
+  }
+
   private prefetchLikelyNextView(): void {
     if (this.searchTerm) return;
+    const deptSuffix = this.selectedDepartmentId ? `_dept_${this.selectedDepartmentId}` : '';
 
     if (this.selectedTab === 'my') {
       const otherStatus: 'open' | 'closed' = this.myStatus === 'open' ? 'closed' : 'open';
-      const cacheKey = `my_${otherStatus}`;
+      const cacheKey = `my_${otherStatus}` + deptSuffix;
       if (this.ticketService.getTabCache(cacheKey)) return;
 
       this.ticketService
-        .getTickets(1, this.limit, otherStatus, undefined, this.currentUserEmail)
+        .getTickets(1, this.limit, otherStatus, undefined, this.currentUserEmail, this.myViewFilter)
         .pipe(takeUntil(this.destroy$))
         .subscribe({
           next: (res) => {
@@ -1877,14 +2238,15 @@ export class TicketsComponent implements OnInit, OnDestroy {
     }
 
     const otherTab: 'open' | 'closed' = this.selectedTab === 'open' ? 'closed' : 'open';
-    if (this.ticketService.getTabCache(otherTab)) return;
+    const otherTabCacheKey = otherTab + deptSuffix;
+    if (this.ticketService.getTabCache(otherTabCacheKey)) return;
 
-    this.ticketService.getTickets(1, this.limit, otherTab)
+    this.ticketService.getTickets(1, this.limit, otherTab, undefined, undefined, undefined, this.selectedDepartmentId || undefined)
       .pipe(takeUntil(this.destroy$))
       .subscribe({
       next: (res) => {
         const data: Ticket[] = (res?.data || []).filter((t: Ticket) => this.isCorrectStatus(t, otherTab));
-        this.ticketService.setTabCache(otherTab, {
+        this.ticketService.setTabCache(otherTabCacheKey, {
           tickets: [...data],
           page: 1,
           hasMore: !!res?.hasMore
@@ -1902,7 +2264,8 @@ export class TicketsComponent implements OnInit, OnDestroy {
   private async globalSearchAllPages(
     term: string,
     status?: 'open' | 'closed',
-    filter?: (ticket: Ticket) => boolean
+    filter?: (ticket: Ticket) => boolean,
+    departmentId?: string
   ): Promise<Ticket[]> {
     let page = 1;
     let hasMore = true;
@@ -1914,7 +2277,7 @@ export class TicketsComponent implements OnInit, OnDestroy {
     while (hasMore && maxPages > 0) {
       try {
         const res = await firstValueFrom(
-          this.ticketService.getTickets(page, this.limit, status, term)
+          this.ticketService.getTickets(page, this.limit, status, term, undefined, undefined, departmentId)
         );
 
         const data: Ticket[] = res?.data || [];
@@ -1923,16 +2286,22 @@ export class TicketsComponent implements OnInit, OnDestroy {
           break;
         }
 
-        // Client-side search filter as fallback (in case API search doesn't work)
-        const searchFiltered = data.filter((t: Ticket) =>
-          (t.ticketNumber && t.ticketNumber.toLowerCase().includes(searchLower)) ||
-          (t.id && t.id.toLowerCase().includes(searchLower)) ||
-          (t.ticketId && t.ticketId.toLowerCase().includes(searchLower)) ||
-          (t.subject && t.subject.toLowerCase().includes(searchLower)) ||
-          (t.email && t.email.toLowerCase().includes(searchLower)) ||
-          (t.contact?.email && t.contact.email.toLowerCase().includes(searchLower)) ||
-          (t.assignedTo && t.assignedTo.toLowerCase().includes(searchLower))
-        );
+        // Client-side search filter — also checks locally stored assignee names
+        const searchFiltered = data.filter((t: Ticket) => {
+          const ticketId = t.id || t.ticketId || '';
+          const dbAssignment = this.assignmentsMap.get(ticketId);
+          const dbAssignees = (dbAssignment?.assigned_users || []).join(' ').toLowerCase();
+          return (
+            (t.ticketNumber && t.ticketNumber.toLowerCase().includes(searchLower)) ||
+            (t.id && t.id.toLowerCase().includes(searchLower)) ||
+            (t.ticketId && t.ticketId.toLowerCase().includes(searchLower)) ||
+            (t.subject && t.subject.toLowerCase().includes(searchLower)) ||
+            (t.email && t.email.toLowerCase().includes(searchLower)) ||
+            (t.contact?.email && t.contact.email.toLowerCase().includes(searchLower)) ||
+            (t.assignedTo && t.assignedTo.toLowerCase().includes(searchLower)) ||
+            dbAssignees.includes(searchLower)
+          );
+        });
 
         // Apply custom filter if provided (e.g., for "my tickets")
         const filtered = filter ? searchFiltered.filter(filter) : searchFiltered;
@@ -1958,17 +2327,40 @@ export class TicketsComponent implements OnInit, OnDestroy {
     this.ticketService.clearAllCache();
     this.ticketService.invalidateTabCache();
     this.searchCache.clear();
-    // Reset my tickets arrays so fresh data is fetched
-    this.myTicketsOpenAll = [];
-    this.myTicketsClosedAll = [];
-    this.myTicketsOpenLastApiPage = 0;
-    this.myTicketsClosedLastApiPage = 0;
-    this.myTicketsOpenPage = 1;
-    this.myTicketsClosedPage = 1;
-    this.loadTickets(true).finally(() => {
-      this.isRefreshing = false;
-      this.cdr.markForCheck();
-    });
+    // For My Tickets: snapshot the current display before resetting, so there's
+    // no blank screen while the server rebuilds the cache. The snapshot is replaced
+    // as soon as fresh data arrives from loadMyTickets.
+    if (this.selectedTab === 'my') {
+      const snapshot = [...this.filteredTickets];
+      this.myTicketsOpenAll = [];
+      this.myTicketsClosedAll = [];
+      this.myTicketsOpenLastApiPage = 0;
+      this.myTicketsClosedLastApiPage = 0;
+      this.myTicketsOpenPage = 1;
+      this.myTicketsClosedPage = 1;
+      // loadTickets(false) so the loading overlay doesn't wipe the snapshot
+      this.loadTickets(false).then(() => {
+        // If nothing came back, restore snapshot so the user isn't left with empty
+        if (this.filteredTickets.length === 0 && snapshot.length > 0) {
+          this.filteredTickets = snapshot;
+          this.cdr.markForCheck();
+        }
+      }).finally(() => {
+        this.isRefreshing = false;
+        this.cdr.markForCheck();
+      });
+    } else {
+      this.myTicketsOpenAll = [];
+      this.myTicketsClosedAll = [];
+      this.myTicketsOpenLastApiPage = 0;
+      this.myTicketsClosedLastApiPage = 0;
+      this.myTicketsOpenPage = 1;
+      this.myTicketsClosedPage = 1;
+      this.loadTickets(true).finally(() => {
+        this.isRefreshing = false;
+        this.cdr.markForCheck();
+      });
+    }
   }
 
   /* ================= CORE ================= */
@@ -1979,17 +2371,19 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   // Only show loading on initial page load, not on tab switches
   if (showLoadingIndicator) {
     this.loadingService.show();
-    // Clear current tickets to show loading state
-    this.filteredTickets = [];
+    // For My Tickets tab: keep current tickets visible while refreshing (avoid blank screen)
+    if (this.selectedTab !== 'my') {
+      this.filteredTickets = [];
+    }
     this.cdr.markForCheck();
   }
 
   // If there's a search term, perform search with caching
   if (this.searchTerm) {
     try {
-      // Create cache key combining search term, role, and user
+      // Create cache key combining search term, role, dept, and user
       const roleKey = this.isAdmin ? 'admin' : 'user';
-      const cacheKey = `${roleKey}|${this.currentUserEmail}|${this.searchTerm}`;
+      const cacheKey = `${roleKey}|${this.currentUserEmail}|${this.selectedDepartmentId}|${this.searchTerm}`;
       
       let searchResults: Ticket[] = [];
 
@@ -1999,10 +2393,12 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       } else {
         // Not in cache, perform search
         if (this.isAdmin) {
-          // Admin global search: all tickets across all statuses
+          // Admin global search: all tickets (filtered by selectedDepartmentId if set)
           searchResults = await this.globalSearchAllPages(
             this.searchTerm,
-            undefined
+            undefined,
+            undefined,
+            this.selectedDepartmentId || undefined
           );
         } else {
           // User global search: only their tickets across all statuses
@@ -2039,7 +2435,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       this.cdr.markForCheck();
     } else {
       const res = await firstValueFrom(
-        this.ticketService.getTickets(this.currentPage, this.limit, this.selectedTab as 'open' | 'closed')
+        this.ticketService.getTickets(this.currentPage, this.limit, this.selectedTab as 'open' | 'closed', undefined, undefined, undefined, this.selectedDepartmentId || undefined)
       );
 
       if (requestSeq !== this.myLoadSeq) return;
@@ -2048,7 +2444,19 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       const tabFiltered = data.filter((t: Ticket) =>
         this.isCorrectStatus(t, this.selectedTab as 'open' | 'closed')
       );
-      this.filteredTickets = this.applyDashboardQuickFilter(tabFiltered);
+      const pageItems = this.applyDashboardQuickFilter(tabFiltered);
+      if (this.currentPage > 1) {
+        const existingIds = new Set(this.filteredTickets.map(t => (t.id || t.ticketId || '').toString()));
+        const merged = [...this.filteredTickets];
+        for (const item of pageItems) {
+          const id = (item.id || item.ticketId || '').toString();
+          if (!id || existingIds.has(id)) continue;
+          merged.push(item);
+        }
+        this.filteredTickets = merged;
+      } else {
+        this.filteredTickets = pageItems;
+      }
 
       this.hasMore = !!res?.hasMore;
       this.saveToServiceCache();
@@ -2058,13 +2466,17 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     if (requestSeq !== this.myLoadSeq) return;
     this.messageService.error('Failed to load tickets');
   } finally {
+    this.isInfiniteLoading = false;
     if (showLoadingIndicator) this.loadingService.hide();
+    // Re-setup observer after content renders
+    setTimeout(() => this.setupInfiniteScrollObserver(), 100);
   }
 }
 
   // 🚀 Save to service-level cache (persists across navigation)
   private saveToServiceCache(): void {
-    const cacheKey = this.selectedTab === 'my' ? `my_${this.myStatus}` : this.selectedTab;
+    const deptSuffix = this.selectedDepartmentId ? `_dept_${this.selectedDepartmentId}` : '';
+    const cacheKey = (this.selectedTab === 'my' ? `my_${this.myStatus}` : this.selectedTab) + deptSuffix;
     const page = this.selectedTab === 'my' 
       ? (this.myStatus === 'open' ? this.myTicketsOpenPage : this.myTicketsClosedPage)
       : this.currentPage;
@@ -2150,7 +2562,16 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       while (allMyTickets.length < neededIndex && hasMoreOnServer && currentApiPage <= 20) {
         try {
           const res = await firstValueFrom(
-            this.ticketService.getTickets(currentApiPage, pageSize, this.myStatus, undefined, this.currentUserEmail)
+            this.ticketService.getTickets(
+              currentApiPage,
+              pageSize,
+              this.myStatus,
+              undefined,
+              this.currentUserEmail,
+              this.myViewFilter,
+              undefined,
+              this.isRefreshing
+            )
           );
 
           const data: Ticket[] = res?.data || [];
@@ -2179,8 +2600,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       }
 
       // Display current page
-      const startIdx = (currentPage - 1) * pageSize;
-      this.filteredTickets = this.applyDashboardQuickFilter(allMyTickets.slice(startIdx, neededIndex));
+      this.filteredTickets = this.applyDashboardQuickFilter(allMyTickets.slice(0, neededIndex));
       this.cdr.markForCheck();
     } catch (err) {
       console.error('Failed to load my tickets:', err);
@@ -2197,7 +2617,8 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     const ticketStatus = (ticket.status || '').toLowerCase();
     
     if (status === 'open') {
-      return ticketStatus.includes('open') || ticketStatus.includes('progress');
+      // Everything that is NOT closed/resolved counts as open
+      return !ticketStatus.includes('closed') && !ticketStatus.includes('resolved');
     } else {
       return ticketStatus.includes('closed') || ticketStatus.includes('resolved');
     }
@@ -2274,19 +2695,19 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
       if (this.myStatus === 'open') {
         if (this.myTicketsOpenHasMore) {
           this.myTicketsOpenPage++;
-          this.loadTickets();
+          this.loadTickets(false);
         }
       } else {
         if (this.myTicketsClosedHasMore) {
           this.myTicketsClosedPage++;
-          this.loadTickets();
+          this.loadTickets(false);
         }
       }
     } else {
       // Standard pagination for regular tabs
       if (!this.hasMore) return;
       this.currentPage++;
-      this.loadTickets();
+      this.loadTickets(false);
     }
   }
 
@@ -2444,6 +2865,26 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
         // INVALIDATE ALL CACHE
         this.ticketService.clearAllCache();
         this.ticketService.invalidateTabCache();
+
+        // Navigate to the closed view and show the just-closed ticket at the top
+        if (closedTicket) {
+          if (this.selectedTab === 'open') {
+            // Switch admin/elevated view to closed tab
+            this.selectedTab = 'closed';
+            sessionStorage.setItem('ITSM_SELECTED_TAB', 'closed');
+            this.currentPage = 1;
+            this.filteredTickets = [closedTicket];
+            // Load remaining closed tickets in background (silent)
+            this.loadTickets(true);
+          } else if (this.selectedTab === 'my' && this.myStatus === 'open') {
+            // Switch My Tickets to closed view
+            this.myStatus = 'closed';
+            this.filteredTickets = [closedTicket, ...this.myTicketsClosedAll
+              .filter(t => (t.id || t.ticketId) !== (closedTicket.id || closedTicket.ticketId))
+              .slice(0, this.limit - 1)];
+          }
+        }
+
         this.messageService.success('Ticket closed');
         this.cdr.markForCheck();
         this.cancelDialogs();
@@ -2595,8 +3036,12 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     this.currentUserName = (account?.name || storedName || '').trim().toLowerCase();
 
     // Load user role from sessionStorage
-    const storedRole = sessionStorage.getItem('role');
-    this.userRole = (storedRole === 'admin' ? 'admin' : 'user') as 'admin' | 'user';
+    const storedRole = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    this.userRole = (this.elevatedRoles.has(storedRole)
+      ? storedRole
+      : 'user') as 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user';
+
+    this.isCloudOpsMember = sessionStorage.getItem('isCloudOps') === 'true' || this.isAdmin;
 
     const allowed = new Set<string>();
     if (this.currentUserEmail) allowed.add(this.currentUserEmail);

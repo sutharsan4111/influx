@@ -14,7 +14,7 @@ RUN npm run build:prod
 # Stage 2: Production Image
 FROM node:18-alpine
 
-WORKDIR /app
+WORKDIR /app    
 
 ENV NODE_ENV=production
 ENV NPM_CONFIG_LOGLEVEL=warn

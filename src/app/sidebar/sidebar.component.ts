@@ -2,12 +2,13 @@ import { Component, OnInit } from '@angular/core';
 import { Router, RouterModule } from '@angular/router';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
+import { FormsModule } from '@angular/forms';
 import { MsalService } from '../services/msal.service';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterModule, CommonModule],
+  imports: [RouterModule, CommonModule, FormsModule],
   template: `
     <div class="sidebar">
 
@@ -17,12 +18,15 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-home"></i>
           <span>Dashboard</span>
         </li>
-        <li class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')">
+        <li *ngIf="isCloudOpsMember()" class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')">
           <i class="fas fa-ticket-alt"></i>
           <span>View Tickets</span>
         </li>
-        <li *ngIf="isAdmin() || isUser()"
-            class="menu-item"
+        <li *ngIf="!isCloudOpsMember()" class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')" [queryParams]="{tab: 'my'}">
+          <i class="fas fa-ticket-alt"></i>
+          <span>My Tickets</span>
+        </li>
+        <li class="menu-item"
             routerLink="/create-ticket"
             [class.active]="isActive('/create-ticket')">
           <i class="fas fa-plus-circle"></i>
@@ -35,14 +39,7 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-cog"></i>
           <span>Admin Panel</span>
         </li>
-        <li *ngIf="isAdmin()"
-            class="menu-item"
-            routerLink="/monitoring"
-            [class.active]="isActive('/monitoring')">
-          <i class="fas fa-desktop"></i>
-          <span>Monitoring</span>
-        </li>
-        <li *ngIf="isAdmin()"
+        <li *ngIf="isCloudops()"
             class="menu-item"
             routerLink="/infrastructure/ssl"
             [class.active]="isLicenceSection()">
@@ -76,8 +73,8 @@ import { MsalService } from '../services/msal.service';
           <div class="profile-info">
             <div class="name">
               {{ userName || 'User' }}
-              <span class="role-badge" [class.admin]="isAdmin()">
-                {{ isAdmin() ? 'Admin' : 'User' }}
+              <span class="role-badge" [class.admin]="isAdmin()" [class.cloudops]="isCloudops()">
+                {{ roleLabel(role) }}
               </span>
             </div>
             <div class="email">{{ userEmail }}</div>
@@ -85,6 +82,19 @@ import { MsalService } from '../services/msal.service';
         </div>
 
         <div class="profile-menu" *ngIf="isProfileMenuOpen">
+          <div class="role-switch-block" *ngIf="availableRoles.length > 1" (click)="$event.stopPropagation()">
+            <div class="role-switch-label">Switch Role</div>
+            <div class="role-pills">
+              <button
+                *ngFor="let r of availableRoles"
+                class="role-pill"
+                [class.active]="selectedRole === r"
+                (click)="selectedRole = r; $event.stopPropagation()">
+                {{ roleLabel(r) }}
+              </button>
+            </div>
+            <button class="role-switch-btn" (click)="switchRole(); $event.stopPropagation()">Apply</button>
+          </div>
           <div class="menu-dropdown-item" (click)="openProfile(); $event.stopPropagation()">
             <i class="fas fa-user"></i> Profile
           </div>
@@ -117,7 +127,7 @@ import { MsalService } from '../services/msal.service';
               <div class="profile-meta">
                 <div class="profile-name">{{ userName || profile.displayName || 'User' }}</div>
                 <div class="profile-email">{{ userEmail || profile.mail || '—' }}</div>
-                <div class="profile-role">{{ isAdmin() ? 'Admin' : 'User' }}</div>
+                <div class="profile-role">{{ roleLabel(role) }}</div>
               </div>
             </div>
 
@@ -353,6 +363,11 @@ import { MsalService } from '../services/msal.service';
       color: #fff;
     }
 
+    .role-badge.cloudops {
+      background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+      color: #fff;
+    }
+
     .profile-menu {
       position: absolute;
       bottom: 45px;
@@ -376,6 +391,61 @@ import { MsalService } from '../services/msal.service';
       color: #475569;
       font-weight: 500;
       font-size: 0.7rem;
+    }
+
+    .role-switch-block {
+      padding: 8px 10px;
+      border-bottom: 1px solid #f1f5f9;
+      display: grid;
+      gap: 6px;
+    }
+
+    .role-switch-label {
+      font-size: 0.66rem;
+      color: #64748b;
+      font-weight: 600;
+    }
+
+    .role-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .role-pill {
+      padding: 3px 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 20px;
+      font-size: 0.63rem;
+      font-weight: 500;
+      color: #475569;
+      background: #f8fafc;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .role-pill:hover {
+      border-color: #2563eb;
+      color: #2563eb;
+      background: #eff6ff;
+    }
+
+    .role-pill.active {
+      background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+      border-color: #2563eb;
+      color: #fff;
+      font-weight: 600;
+    }
+
+    .role-switch-btn {
+      border: none;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: #fff;
+      background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+      cursor: pointer;
     }
 
     .menu-dropdown-item:hover {
@@ -582,7 +652,9 @@ export class SidebarComponent implements OnInit {
   profilePhoto: string | null = null;
   isProfileMenuOpen = false;
   isProfileModalOpen = false;
-  role = sessionStorage.getItem('role') || '';
+  role = '';
+  availableRoles: string[] = [];
+  selectedRole = '';
   profile = {
     displayName: '',
     mail: '',
@@ -617,7 +689,9 @@ export class SidebarComponent implements OnInit {
   }
 
   // Always refresh role from sessionStorage
-  this.role = sessionStorage.getItem('role') || '';
+  this.role = this.toVisibleRole(sessionStorage.getItem('role') || '');
+  this.availableRoles = this.readStoredRoles();
+  this.selectedRole = this.availableRoles.includes(this.role) ? this.role : (this.availableRoles[0] || '');
 }
 
 
@@ -632,7 +706,88 @@ export class SidebarComponent implements OnInit {
   }
 
   toggleProfileMenu() {
+    this.availableRoles = this.readStoredRoles();
+    if (!this.availableRoles.includes(this.selectedRole)) {
+      this.selectedRole = this.availableRoles.includes(this.role) ? this.role : (this.availableRoles[0] || '');
+    }
     this.isProfileMenuOpen = !this.isProfileMenuOpen;
+  }
+
+  private toVisibleRole(role: string): string {
+    const normalized = (role || '').toString().toLowerCase();
+    if (normalized === 'itsm') return 'cloudops';
+    return normalized === 'user' ? '' : normalized;
+  }
+
+  private getAuthHeaders() {
+    const token = sessionStorage.getItem('accessToken') || '';
+    return {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    };
+  }
+
+  private readStoredRoles(): string[] {
+    try {
+      const parsed = JSON.parse(sessionStorage.getItem('roles') || '[]');
+      if (!Array.isArray(parsed)) return this.getVisibleRoles([this.role]);
+      const normalized = parsed.map((r: any) => (r || '').toString().toLowerCase()).filter(Boolean);
+      const visible = this.getVisibleRoles(normalized);
+      return visible.length ? visible : this.getVisibleRoles([this.role]);
+    } catch {
+      return this.getVisibleRoles([this.role]);
+    }
+  }
+
+  private getVisibleRoles(roles: string[]): string[] {
+    // Filter to only show admin and cloudops roles
+    const visible = (roles || [])
+      .map(role => role === 'itsm' ? 'cloudops' : role)
+      .filter(role => role && role !== 'user' && (role === 'admin' || role === 'cloudops'));
+    
+    return [...new Set(visible)];
+  }
+
+  roleLabel(role: string): string {
+    const map: Record<string, string> = {
+      admin: 'Admin',
+      cloudops: 'CloudOps',
+      itsm: 'CloudOps',
+      product: 'Product',
+      hr: 'HR',
+      support: 'Support',
+      muraai: 'Muraai'
+    };
+    return map[(role || '').toLowerCase()] || 'Unassigned';
+  }
+
+  switchRole() {
+    if (!this.selectedRole || this.selectedRole === this.role) {
+      this.isProfileMenuOpen = false;
+      return;
+    }
+
+    this.http.post<any>('/api/auth/switch-role', { role: this.selectedRole }, {
+      headers: this.getAuthHeaders()
+    }).subscribe({
+      next: (data) => {
+        if (data?.accessToken) sessionStorage.setItem('accessToken', data.accessToken);
+        if (data?.refreshToken) sessionStorage.setItem('refreshToken', data.refreshToken);
+        if (data?.role) {
+          sessionStorage.setItem('role', data.role);
+          this.role = this.toVisibleRole(data.role);
+        }
+        if (Array.isArray(data?.roles)) {
+          sessionStorage.setItem('roles', JSON.stringify(data.roles));
+          this.availableRoles = this.getVisibleRoles(data.roles);
+        }
+        this.isProfileMenuOpen = false;
+        this.router.navigate(['/dashboard']);
+      },
+      error: (err) => {
+        console.error('Role switch failed', err);
+      }
+    });
   }
 
   // ✅ FIXED LOGOUT (APP-ONLY)
@@ -721,5 +876,7 @@ export class SidebarComponent implements OnInit {
   }
 
   isAdmin() { return this.role === 'admin'; }
+  isCloudops() { return this.role === 'cloudops' || this.role === 'itsm'; }
   isUser() { return this.role === 'user'; }
+  isCloudOpsMember() { return sessionStorage.getItem('isCloudOps') === 'true' || this.isAdmin() || this.isCloudops(); }
 }

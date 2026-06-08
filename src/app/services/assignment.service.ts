@@ -94,9 +94,12 @@ export class AssignmentService {
     );
   }
 
-  getReportAssignments(): Observable<TicketAssignment[]> {
+  getReportAssignments(departmentId?: string): Observable<TicketAssignment[]> {
+    const url = departmentId
+      ? `${this.adminUrl}/assignments-report?departmentId=${encodeURIComponent(departmentId)}`
+      : `${this.adminUrl}/assignments-report`;
     return this.http.get<{ assignments: TicketAssignment[] }>(
-      `${this.adminUrl}/assignments-report`,
+      url,
       { headers: this.getAuthHeaders() }
     ).pipe(map(result => result.assignments || []));
   }

@@ -157,6 +157,86 @@ getActiveAccount() {
     return Array.from(mails);
   }
 
+  async getUserGroups(): Promise<{ email: string; displayName: string }[]> {
+    const token = await this.getAccessToken([
+      'User.Read',
+      'GroupMember.Read.All'
+    ]);
+
+    let url =
+      'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=mail,displayName,mailNickname';
+    const groupsMap = new Map<string, { email: string; displayName: string }>();
+
+    while (url) {
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Graph request failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const groups = Array.isArray(data.value) ? data.value : [];
+
+      groups.forEach((g: any) => {
+        const email = (g.mail || '').trim().toLowerCase();
+        const displayName = (g.displayName || g.mailNickname || email || '').trim();
+        if (!displayName && !email) return;
+        const key = email || displayName.toLowerCase();
+        if (!groupsMap.has(key)) {
+          groupsMap.set(key, { email, displayName: displayName || email });
+        }
+      });
+
+      url = data['@odata.nextLink'] || '';
+    }
+
+    return Array.from(groupsMap.values()).sort((a, b) =>
+      (a.displayName || '').localeCompare(b.displayName || '')
+    );
+  }
+
+  async getDirectoryGroups(): Promise<{ id: string; email: string; displayName: string }[]> {
+    const token = await this.getAccessToken([
+      'User.Read',
+      'Group.Read.All'
+    ]);
+
+    let url =
+      'https://graph.microsoft.com/v1.0/groups?$select=id,mail,displayName,mailNickname&$top=999';
+    const groupsMap = new Map<string, { id: string; email: string; displayName: string }>();
+
+    while (url) {
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Graph request failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const groups = Array.isArray(data.value) ? data.value : [];
+
+      groups.forEach((g: any) => {
+        const id = (g.id || '').trim();
+        const email = (g.mail || '').trim().toLowerCase();
+        const displayName = (g.displayName || g.mailNickname || email || '').trim();
+        if (!id || !displayName) return;
+        if (!groupsMap.has(id)) {
+          groupsMap.set(id, { id, email, displayName });
+        }
+      });
+
+      url = data['@odata.nextLink'] || '';
+    }
+
+    return Array.from(groupsMap.values()).sort((a, b) =>
+      (a.displayName || '').localeCompare(b.displayName || '')
+    );
+  }
+
   async getGroupMembersByEmail(groupEmail: string): Promise<{ email: string; displayName: string }[]> {
     const token = await this.getAccessToken([
       'User.Read',

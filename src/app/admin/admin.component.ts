@@ -45,7 +45,11 @@ import { Router, RouterLink } from '@angular/router';
       </div>
       <select [(ngModel)]="newRole">
         <option value="admin">Admin</option>
-        <option value="user">User</option>
+        <option value="cloudops">CloudOps</option>
+        <option value="product">Product</option>
+        <option value="hr">HR</option>
+        <option value="support">Support</option>
+        <option value="muraai">Muraai</option>
       </select>
       <button (click)="addUser()" [disabled]="!isPasswordValid || !newEmail">Add</button>
     </div>
@@ -67,7 +71,11 @@ import { Router, RouterLink } from '@angular/router';
           <td>
             <select [(ngModel)]="user.role" (change)="updateRole(user)">
               <option value="admin">Admin</option>
-              <option value="user">User</option>
+              <option value="cloudops">CloudOps</option>
+              <option value="product">Product</option>
+              <option value="hr">HR</option>
+              <option value="support">Support</option>
+              <option value="muraai">Muraai</option>
             </select>
           </td>
           <td>
@@ -397,7 +405,7 @@ export class AdminComponent implements OnInit {
 
   newEmail = '';
   newPassword = '';
-  newRole = 'user';
+  newRole = 'cloudops';
 
   users: any[] = [];
   toastMessage = '';
@@ -486,7 +494,10 @@ export class AdminComponent implements OnInit {
       return;
     }
 
-    this.users = await res.json();
+    this.users = (await res.json()).map((user: any) => ({
+      ...user,
+      role: user?.role === 'itsm' ? 'cloudops' : user?.role
+    }));
     // 🚀 Save to cache
     AdminComponent.usersCache = { users: this.users, timestamp: Date.now() };
   }
@@ -517,7 +528,7 @@ export class AdminComponent implements OnInit {
       this.showToast("User created successfully");
       this.newEmail = '';
       this.newPassword = '';
-      this.newRole = 'user';
+      this.newRole = 'cloudops';
       this.loadUsers();
     } else {
       this.showToast(data.message || "Error occurred", true);

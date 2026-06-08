@@ -524,7 +524,9 @@ export class LoginComponent implements OnInit {
       sessionStorage.setItem('accessToken', data.accessToken);
       sessionStorage.setItem('refreshToken', data.refreshToken);
       sessionStorage.setItem('role', data.role);
+      sessionStorage.setItem('roles', JSON.stringify(Array.isArray(data.roles) ? data.roles : [data.role || 'user']));
       sessionStorage.setItem('username', data.email);
+      sessionStorage.setItem('isCloudOps', data.isCloudOps ? 'true' : 'false');
 
       this.router.navigate(['/dashboard']);
     } else {
@@ -582,6 +584,7 @@ async loginWithMicrosoft() {
       sessionStorage.setItem('accessToken', data.accessToken);
       sessionStorage.setItem('refreshToken', data.refreshToken);
       sessionStorage.setItem('role', data.role);
+      sessionStorage.setItem('roles', JSON.stringify(Array.isArray(data.roles) ? data.roles : [data.role || 'user']));
       sessionStorage.setItem('username', email);
       sessionStorage.setItem('displayName', displayName);
 

@@ -105,15 +105,15 @@ export class TicketService {
   
   // Cache with timestamp to prevent excessive reloading
   private ticketsCacheWithTime = new Map<string, { data: Observable<any>, timestamp: number }>();
-  private cacheDurationMs = 5 * 60 * 1000; // 5 minutes cache - for full page navigation away and back
-  private myTicketsCacheDurationMs = 60 * 1000; // 60 seconds for personal bucket updates without API overuse
-  private countsCacheDurationMs = 2 * 60 * 1000; // 2 minutes for dashboard counts
+  private cacheDurationMs = 15 * 60 * 1000; // 15 minutes cache - reduced API calls
+  private myTicketsCacheDurationMs = 5 * 60 * 1000; // 5 minutes for personal bucket (was 60s)
+  private countsCacheDurationMs = 30 * 60 * 1000; // 30 minutes for dashboard counts (was 2 min)
   private countsCacheTime = 0;
 
   // 🚀 GLOBAL TAB CACHE - persists across navigation (component destroy/recreate)
   private globalTabCache = new Map<string, TabCacheEntry>();
-  private readonly TAB_CACHE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
-  private readonly MY_TAB_CACHE_EXPIRY_MS = 60 * 1000; // 60 seconds for My Tickets tab
+  private readonly TAB_CACHE_EXPIRY_MS = 15 * 60 * 1000; // 15 minutes (was 5)
+  private readonly MY_TAB_CACHE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes for My Tickets tab (was 60s)
 
   constructor(private http: HttpClient, private assignmentService: AssignmentService) {}
 
@@ -136,7 +136,10 @@ export class TicketService {
     limit = 27,
     status?: 'open' | 'closed',
     search?: string,
-    filterByEmail?: string
+    filterByEmail?: string,
+    filterType?: 'all' | 'assigned' | 'raised',
+    departmentId?: string,
+    forceRefresh = false
   ): Observable<any> {
 
     const params: string[] = [
@@ -147,6 +150,9 @@ export class TicketService {
     if (status) params.push(`status=${status}`);
     if (search) params.push(`search=${encodeURIComponent(search)}`);
     if (filterByEmail) params.push(`filterByEmail=${encodeURIComponent(filterByEmail)}`);
+    if (filterType && filterType !== 'all') params.push(`filterType=${filterType}`);
+    if (departmentId) params.push(`departmentId=${departmentId}`);
+    if (forceRefresh) params.push('refresh=true');
 
     const cacheKey = params.join('&');
     const effectiveCacheDurationMs = filterByEmail
@@ -155,7 +161,7 @@ export class TicketService {
 
     // Check if we have valid cached data (not expired)
     const cached = this.ticketsCacheWithTime.get(cacheKey);
-    if (cached && (Date.now() - cached.timestamp) < effectiveCacheDurationMs) {
+    if (!forceRefresh && cached && (Date.now() - cached.timestamp) < effectiveCacheDurationMs) {
       return cached.data;
     }
 
@@ -187,6 +193,14 @@ export class TicketService {
   { headers: this.getAuthHeaders() }
 );
 
+  }
+
+  getZohoStatuses(): Observable<string[]> {
+    return this.http.get<string[]>('/api/zoho/statuses', { headers: this.getAuthHeaders() });
+  }
+
+  getDepartments(): Observable<{ id: string; name: string }[]> {
+    return this.http.get<{ id: string; name: string }[]>('/api/zoho/departments', { headers: this.getAuthHeaders() });
   }
 
   /* ================= CONVERSATIONS (FIXED) ================= */
@@ -288,9 +302,13 @@ export class TicketService {
     return this.updateTicket(ticketId, { status: 'Open' });
   }
 
+  inProgressTicket(ticketId: string) {
+    return this.updateTicket(ticketId, { status: 'In Progress' });
+  }
+
   /* ================= COUNTS ================= */
 
-  getTicketCounts(forceRefresh = false): Observable<any> {
+  getTicketCounts(forceRefresh = false, departmentId?: string): Observable<any> {
 
   // If force refresh requested or cache is expired
   if (forceRefresh || (Date.now() - this.countsCacheTime) > this.countsCacheDurationMs) {
@@ -298,10 +316,19 @@ export class TicketService {
     this.countsCacheTime = 0;
   }
 
+  // Invalidate cache if departmentId changed
+  const cacheKeyDept = departmentId || '';
+  if ((this as any)._lastCountsDept !== cacheKeyDept) {
+    this.ticketCountsCache = undefined;
+    this.countsCacheTime = 0;
+    (this as any)._lastCountsDept = cacheKeyDept;
+  }
+
   if (!this.ticketCountsCache) {
+    const params = departmentId ? `?departmentId=${departmentId}` : '';
     this.ticketCountsCache = this.http
       .get<any>(
-        `${this.apiUrl}/counts`,
+        `${this.apiUrl}/counts${params}`,
         { headers: this.getAuthHeaders() }
       )
       .pipe(
