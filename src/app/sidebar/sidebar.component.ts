@@ -39,6 +39,13 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-cog"></i>
           <span>Admin Panel</span>
         </li>
+        <li *ngIf="isCloudOpsMember()"
+            class="menu-item"
+            routerLink="/monitoring/assets"
+            [class.active]="isMonitoringSection()">
+          <i class="fas fa-broadcast-tower"></i>
+          <span>Monitoring</span>
+        </li>
         <li *ngIf="isCloudops()"
             class="menu-item"
             routerLink="/infrastructure/ssl"
@@ -869,6 +876,10 @@ export class SidebarComponent implements OnInit {
 
   isAdminSection() {
     return this.router.url.startsWith('/admin');
+  }
+
+  isMonitoringSection() {
+    return this.router.url.startsWith('/monitoring');
   }
 
   isLicenceSection() {

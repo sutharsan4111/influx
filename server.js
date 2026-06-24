@@ -5,6 +5,7 @@ const express = require("express");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
 const path = require("path");
+const { exec } = require('child_process');
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const compression = require("compression");
@@ -287,6 +288,28 @@ async function runMigrations() {
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_monitoring_telemetry_device_time
         ON monitoring_telemetry (device_id, reported_at DESC)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS monitoring_azure_resources (
+        resource_id VARCHAR(255) PRIMARY KEY,
+        resource_name VARCHAR(255) NOT NULL,
+        resource_type VARCHAR(255) NOT NULL,
+        status VARCHAR(100) NOT NULL DEFAULT 'Unknown',
+        region VARCHAR(100) NOT NULL DEFAULT 'Unknown',
+        cpu_percent NUMERIC(6,2) DEFAULT 0,
+        memory_percent NUMERIC(6,2) DEFAULT 0,
+        storage_gb NUMERIC(10,2) DEFAULT 0,
+        last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        owner_email VARCHAR(255) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_monitoring_azure_resources_owner_email
+        ON monitoring_azure_resources (owner_email);
     `);
 
     // 🚀 Production performance indexes (007). Idempotent.
@@ -654,6 +677,194 @@ app.get('/api/monitoring/devices/:deviceId/history', authenticateToken, authoriz
   } catch (err) {
     console.error('Monitoring history error:', err);
     res.status(500).json({ message: 'Failed to fetch history' });
+  }
+});
+
+app.get('/api/monitoring/assets', authenticateToken, async (req, res) => {
+  try {
+    const queryEmail = (req.query.userEmail || '').toString().trim().toLowerCase();
+    const effectiveEmail = req.user?.email?.toString().toLowerCase() || '';
+    const targetEmail = req.user?.role === 'admin' && queryEmail ? queryEmail : effectiveEmail;
+
+    if (!targetEmail) {
+      return res.status(400).json({ message: 'User email is required' });
+    }
+
+    const result = await pool.query(`
+      SELECT
+        device_id,
+        hostname,
+        user_name,
+        user_email,
+        ip_address,
+        os_name,
+        os_version,
+        os_build,
+        last_seen,
+        updated_at,
+        t.cpu_percent,
+        t.memory_percent,
+        t.disk_percent,
+        t.reported_at
+      FROM monitoring_devices d
+      LEFT JOIN LATERAL (
+        SELECT cpu_percent, memory_percent, disk_percent, reported_at
+        FROM monitoring_telemetry t
+        WHERE t.device_id = d.device_id
+        ORDER BY t.reported_at DESC, t.id DESC
+        LIMIT 1
+      ) t ON true
+      WHERE LOWER(d.user_email) = $1
+      ORDER BY d.last_seen DESC NULLS LAST, d.hostname ASC
+    `, [targetEmail]);
+
+    const rows = result.rows.map(row => ({
+      asset_id: row.device_id,
+      hostname: row.hostname,
+      owner_email: row.user_email,
+      status: row.last_seen && Date.now() - new Date(row.last_seen).getTime() < 5 * 60 * 1000 ? 'Online' : 'Offline',
+      last_seen: row.last_seen,
+      cpu_percent: Number(row.cpu_percent) || 0,
+      memory_percent: Number(row.memory_percent) || 0,
+      disk_percent: Number(row.disk_percent) || 0,
+      primary_issue: row.cpu_percent > 90 || row.memory_percent > 90 || row.disk_percent > 90 ? 'Resource warning' : 'No issues'
+    }));
+
+    res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json(rows);
+  } catch (err) {
+    console.error('Monitoring assets error:', err);
+    res.status(500).json({ message: 'Failed to fetch assets' });
+  }
+});
+
+app.get('/api/monitoring/azure', authenticateToken, async (req, res) => {
+  try {
+    const queryEmail = (req.query.userEmail || '').toString().trim().toLowerCase();
+    const effectiveEmail = req.user?.email?.toString().toLowerCase() || '';
+    const targetEmail = queryEmail || effectiveEmail;
+
+    if (!targetEmail) {
+      return res.status(400).json({ message: 'User email is required' });
+    }
+
+    const result = await pool.query(`
+      SELECT
+        resource_id,
+        resource_name,
+        resource_type,
+        status,
+        region,
+        cpu_percent,
+        memory_percent,
+        storage_gb,
+        last_updated
+      FROM monitoring_azure_resources
+      WHERE LOWER(owner_email) = $1
+      ORDER BY last_updated DESC
+      LIMIT 200
+    `, [targetEmail]);
+
+    res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.json(result.rows.map(row => ({
+      resource_id: row.resource_id,
+      resource_name: row.resource_name,
+      resource_type: row.resource_type,
+      status: row.status,
+      region: row.region,
+      cpu_percent: Number(row.cpu_percent) || 0,
+      memory_percent: Number(row.memory_percent) || 0,
+      storage_gb: Number(row.storage_gb) || 0,
+      last_updated: row.last_updated
+    })));
+  } catch (err) {
+    console.error('Azure monitoring error:', err);
+    res.status(500).json({ message: 'Failed to fetch Azure resources' });
+  }
+});
+
+// Temporary: Seed sample Azure resources for the authenticated user (dev helper)
+app.post('/api/monitoring/azure/seed', authenticateToken, async (req, res) => {
+  try {
+    const ownerEmail = (req.user?.email || '').toString().toLowerCase();
+    if (!ownerEmail) return res.status(400).json({ message: 'No authenticated user email available' });
+
+    const samples = [
+      {
+        resource_id: `${ownerEmail}-vm-01`,
+        resource_name: 'Dev-VM-01',
+        resource_type: 'Virtual Machine',
+        status: 'Healthy',
+        region: 'eastus',
+        cpu_percent: 12.5,
+        memory_percent: 34.2,
+        storage_gb: 128
+      },
+      {
+        resource_id: `${ownerEmail}-sqldb-01`,
+        resource_name: 'AppDB-01',
+        resource_type: 'SQL Database',
+        status: 'Healthy',
+        region: 'eastus2',
+        cpu_percent: 5.1,
+        memory_percent: 21.3,
+        storage_gb: 256
+      },
+      {
+        resource_id: `${ownerEmail}-appsvc-01`,
+        resource_name: 'WebApp-01',
+        resource_type: 'App Service',
+        status: 'Warning',
+        region: 'westus',
+        cpu_percent: 78.4,
+        memory_percent: 65.2,
+        storage_gb: 10
+      }
+    ];
+
+    const client = await pool.connect();
+    try {
+      for (const s of samples) {
+        await client.query(`
+          INSERT INTO monitoring_azure_resources (
+            resource_id, resource_name, resource_type, status, region,
+            cpu_percent, memory_percent, storage_gb, last_updated, owner_email, created_at, updated_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,NOW(),NOW())
+          ON CONFLICT (resource_id) DO UPDATE SET
+            resource_name = EXCLUDED.resource_name,
+            resource_type = EXCLUDED.resource_type,
+            status = EXCLUDED.status,
+            region = EXCLUDED.region,
+            cpu_percent = EXCLUDED.cpu_percent,
+            memory_percent = EXCLUDED.memory_percent,
+            storage_gb = EXCLUDED.storage_gb,
+            last_updated = NOW(),
+            owner_email = EXCLUDED.owner_email,
+            updated_at = NOW()
+        `, [
+          s.resource_id,
+          s.resource_name,
+          s.resource_type,
+          s.status,
+          s.region,
+          s.cpu_percent,
+          s.memory_percent,
+          s.storage_gb,
+          ownerEmail
+        ]);
+      }
+    } finally {
+      client.release();
+    }
+
+    res.json({ status: 'ok', inserted: samples.length });
+  } catch (err) {
+    console.error('Seed Azure error:', err);
+    res.status(500).json({ message: 'Failed to seed Azure resources' });
   }
 });
 
@@ -5502,6 +5713,128 @@ app.post('/api/feedback/report', authenticateToken, async (req, res) => {
   }
 });
 
+// ------------------------
+// Start server
+// ------------------------
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+
+  // Per-user counts caches are warmed on each user's first dashboard request
+  // via the SWR pattern. No shared pre-warm needed (it caused wrong 0-counts
+  // for assigned/SLA metrics because no real userEmail was available at boot).
+});
+
+// Run the Azure Backup PowerShell report script (runs PowerShell on the host)
+app.post('/api/monitoring/azure/run-report', authenticateToken, authorizeElevated, async (req, res) => {
+  try {
+    const AZ_DIR = path.join(__dirname, 'azure-monitoring');
+    const SCRIPT_NAME = 'backup advanced 24-04-2026.ps1';
+    const scriptPath = path.join(AZ_DIR, SCRIPT_NAME);
+
+    if (!fs.existsSync(scriptPath)) {
+      return res.status(404).json({ message: 'PowerShell script not found', path: scriptPath });
+    }
+
+    const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`;
+    console.log('[AZ-RUN] Executing:', cmd);
+
+    exec(cmd, { maxBuffer: 10 * 1024 * 1024, timeout: 20 * 60 * 1000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error('[AZ-RUN] Script error:', err?.message || err);
+        return res.status(500).json({ message: 'Script execution failed', error: err?.message || String(err), stdout, stderr });
+      }
+
+      // After run, find latest generated HTML and log files
+      try {
+        const files = fs.readdirSync(AZ_DIR).map(f => ({ name: f, mtime: fs.statSync(path.join(AZ_DIR, f)).mtimeMs }));
+        const html = files.filter(f => f.name.toLowerCase().endsWith('.html')).sort((a,b)=>b.mtime-a.mtime)[0];
+        const log = files.filter(f => f.name.toLowerCase().endsWith('.log')).sort((a,b)=>b.mtime-a.mtime)[0];
+
+        return res.json({ status: 'ok', stdout, stderr, report: html ? html.name : null, log: log ? log.name : null });
+      } catch (e) {
+        return res.json({ status: 'ok', stdout, stderr, note: 'completed but failed to lookup report files' });
+      }
+    });
+  } catch (err) {
+    console.error('Run-report error:', err);
+    res.status(500).json({ message: 'Failed to start script', error: err?.message || err });
+  }
+});
+
+// Parse the latest AzureBackupMonitor_*.log into structured JSON
+app.get('/api/monitoring/azure/report-log', authenticateToken, authorizeElevated, async (req, res) => {
+  try {
+    const AZ_DIR = path.join(__dirname, 'azure-monitoring');
+    if (!fs.existsSync(AZ_DIR)) return res.status(404).json({ message: 'azure-monitoring directory not found' });
+
+    const files = fs.readdirSync(AZ_DIR)
+      .filter(f => f.toLowerCase().endsWith('.log'))
+      .map(f => ({ name: f, mtime: fs.statSync(path.join(AZ_DIR, f)).mtimeMs }))
+      .sort((a,b) => b.mtime - a.mtime);
+
+    if (!files.length) return res.status(404).json({ message: 'No log files found' });
+
+    const latest = path.join(AZ_DIR, files[0].name);
+    const raw = fs.readFileSync(latest, 'utf8');
+
+    const lines = raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    const parsed = { file: files[0].name, subscriptions: [], summary: [], raw: raw };
+
+    let currentSub = null;
+    let currentVault = null;
+
+    for (const line of lines) {
+      // Subscription header
+      const subMatch = /Subscription:\s*\[(.*?)\]\s*\((.*?)\)/i.exec(line);
+      if (subMatch) {
+        currentSub = { name: subMatch[1], id: subMatch[2], vaults: [] };
+        parsed.subscriptions.push(currentSub);
+        currentVault = null;
+        continue;
+      }
+
+      // Vault
+      const vaultMatch = /Vault:\s*\[(.*?)\]\s*RG:\s*\[(.*?)\]/i.exec(line);
+      if (vaultMatch) {
+        currentVault = { name: vaultMatch[1], resourceGroup: vaultMatch[2], items: [], vmBackupsProcessed: 0, fileShareBackupsProcessed: 0 };
+        if (currentSub) currentSub.vaults.push(currentVault);
+        continue;
+      }
+
+      // RP status lines like: [RP-OK] name : Application Consistent | Snapshot and Vault-Standard (10 RPs)
+      const rpMatch = /\[RP-([A-Z0-9_-]+)\]\s+([^:]+)\s*:\s*(.*?)\s*\((\d+)\s+RPs\)/i.exec(line);
+      if (rpMatch && currentVault) {
+        currentVault.items.push({ tag: rpMatch[1], item: rpMatch[2].trim(), details: rpMatch[3].trim(), recoveryPoints: Number(rpMatch[4]) });
+        continue;
+      }
+
+      // VM/File counts
+      const vmMatch = /VM backups processed:\s*(\d+)/i.exec(line);
+      if (vmMatch && currentVault) { currentVault.vmBackupsProcessed = Number(vmMatch[1]); continue; }
+      const fsMatch = /File Share backups processed:\s*(\d+)/i.exec(line);
+      if (fsMatch && currentVault) { currentVault.fileShareBackupsProcessed = Number(fsMatch[1]); continue; }
+
+      // Found subscriptions summary
+      const foundSub = /\[SUCCESS\]\s*Found\s*(\d+)\s*subscription\(s\)\s*in\s*\[(.*?)\s*\((.*?)\)\]/i.exec(line);
+      if (foundSub) {
+        parsed.summary.push({ subscriptionsFound: Number(foundSub[1]), tenantDisplay: foundSub[2], tenantId: foundSub[3] });
+        continue;
+      }
+
+      // Generic info lines with [INFO] or [SUCCESS] or [WARN]
+      const gen = /\[(INFO|SUCCESS|WARN|ERROR|SECTION)\]\s*(.*)/i.exec(line);
+      if (gen) {
+        parsed.summary.push({ level: gen[1], message: gen[2] });
+      }
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    console.error('Report-log parse error:', err);
+    res.status(500).json({ message: 'Failed to parse report log', error: err?.message || err });
+  }
+});
+
 // -------------------------------------------------------
 // SPA fallback (Angular routing) - MUST BE LAST
 // -------------------------------------------------------
@@ -5512,16 +5845,4 @@ app.get("*", (req, res) => {
       : path.join(angularPath, "index.html");
 
   res.sendFile(indexPath);
-});
-
-
-// ------------------------
-// Start server
-// ------------------------
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-
-  // Per-user counts caches are warmed on each user's first dashboard request
-  // via the SWR pattern. No shared pre-warm needed (it caused wrong 0-counts
-  // for assigned/SLA metrics because no real userEmail was available at boot).
 });

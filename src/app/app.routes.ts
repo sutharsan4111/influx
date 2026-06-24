@@ -50,7 +50,20 @@ export const routes: Routes = [
       {
         path: 'monitoring',
         loadComponent: () =>
-          import('./admin/monitoring.component').then(m => m.MonitoringComponent)
+          import('./monitoring/monitoring-shell.component').then(m => m.MonitoringShellComponent),
+        children: [
+          { path: '', redirectTo: 'assets', pathMatch: 'full' },
+          {
+            path: 'assets',
+            loadComponent: () =>
+              import('./monitoring/asset-monitoring.component').then(m => m.AssetMonitoringComponent)
+          },
+          {
+            path: 'azure',
+            loadComponent: () =>
+              import('./monitoring/azure-monitoring.component').then(m => m.AzureMonitoringComponent)
+          }
+        ]
       },
       {
         path: 'admin/user-roles',
