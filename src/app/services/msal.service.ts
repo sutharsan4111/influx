@@ -86,6 +86,18 @@ getActiveAccount() {
     }
   }
 
+  async tryGetAccessTokenSilent(scopes: string[]): Promise<string | null> {
+    await this.ensureInitialized();
+    const account = this.getAccount();
+    if (!account) return null;
+    try {
+      const result = await this.msal!.acquireTokenSilent({ scopes, account });
+      return result.accessToken;
+    } catch {
+      return null;
+    }
+  }
+
   async isUserInGroup(groupEmail: string): Promise<boolean> {
     const token = await this.getAccessToken([
       'User.Read',

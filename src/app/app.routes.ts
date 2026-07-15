@@ -48,22 +48,14 @@ export const routes: Routes = [
           import('./admin/admin.component').then(m => m.AdminComponent)
       },
       {
-        path: 'monitoring',
+        path: 'features',
         loadComponent: () =>
-          import('./monitoring/monitoring-shell.component').then(m => m.MonitoringShellComponent),
-        children: [
-          { path: '', redirectTo: 'assets', pathMatch: 'full' },
-          {
-            path: 'assets',
-            loadComponent: () =>
-              import('./monitoring/asset-monitoring.component').then(m => m.AssetMonitoringComponent)
-          },
-          {
-            path: 'azure',
-            loadComponent: () =>
-              import('./monitoring/azure-monitoring.component').then(m => m.AzureMonitoringComponent)
-          }
-        ]
+          import('./features/features.component').then(m => m.FeaturesComponent)
+      },
+      {
+        path: 'azure-backup',
+        loadComponent: () =>
+          import('./azure-backup/azure-backup.component').then(m => m.AzureBackupComponent)
       },
       {
         path: 'admin/user-roles',

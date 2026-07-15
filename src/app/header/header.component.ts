@@ -21,6 +21,9 @@ import { ReportSuggestionModalComponent } from './report-suggestion-modal.compon
       />
     </div>
     <div class="right">
+      <button class="features-btn" (click)="openFeatures()" title="View Features">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+      </button>
       <button class="theme-toggle" (click)="toggleTheme()" [title]="isDarkTheme ? 'Switch to Light Mode' : 'Switch to Dark Mode'">
         <div class="theme-icon-wrapper" [class.dark]="isDarkTheme">
           <img *ngIf="isDarkTheme" src="assets/batman.svg" class="theme-icon batman" alt="Dark Mode" />
@@ -70,6 +73,38 @@ import { ReportSuggestionModalComponent } from './report-suggestion-modal.compon
       align-items: center;
       gap: 8px;
       margin-left: auto;
+    }
+
+    .features-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px;
+      background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
+      border: 1px solid #cbd5e1;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      width: 26px;
+      height: 26px;
+      min-width: 26px;
+      color: #7c3aed;
+    }
+
+    .features-btn:hover {
+      border-color: #7c3aed;
+      box-shadow: 0 2px 8px rgba(124, 58, 237, 0.2);
+      transform: translateY(-1px);
+    }
+
+    .features-btn svg {
+      width: 14px;
+      height: 14px;
+      transition: transform 0.3s ease;
+    }
+
+    .features-btn:hover svg {
+      transform: scale(1.15);
     }
 
     .report-btn {
@@ -210,6 +245,17 @@ import { ReportSuggestionModalComponent } from './report-suggestion-modal.compon
     :host-context(.dark-theme) .report-icon {
       color: #93c5fd;
     }
+
+    :host-context(.dark-theme) .features-btn {
+      background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+      border-color: #475569;
+      color: #a78bfa;
+    }
+
+    :host-context(.dark-theme) .features-btn:hover {
+      border-color: #a78bfa;
+      box-shadow: 0 4px 15px rgba(167, 139, 250, 0.25);
+    }
   `]
 })
 export class HeaderComponent implements OnInit {
@@ -234,6 +280,10 @@ export class HeaderComponent implements OnInit {
 
   openReportModal() {
     this.showReportModal = true;
+  }
+
+  openFeatures() {
+    this.router.navigate(['/features']);
   }
 
   closeReportModal() {

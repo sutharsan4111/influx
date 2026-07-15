@@ -1,33 +1,21 @@
-# Production Multi-Stage Build
+# Base image with Node.js 20 + PowerShell Core for Azure backup collection
+FROM node:20
 
-# Stage 1: Build Angular
-FROM node:18-alpine AS build
-
-WORKDIR /app
-
-COPY package*.json ./
-RUN npm install --legacy-peer-deps
-
-COPY . .
-RUN npm run build:prod
-
-# Stage 2: Production Image
-FROM node:18-alpine
-
-WORKDIR /app    
+WORKDIR /usr/src/app
 
 ENV NODE_ENV=production
 ENV NPM_CONFIG_LOGLEVEL=warn
 
-COPY --from=build /app/dist ./dist
-COPY --from=build /app/server.js ./
-COPY --from=build /app/db.js ./
-COPY --from=build /app/migrations ./migrations
-COPY --from=build /app/runMigration.js ./
-COPY --from=build /app/package*.json ./
+# Install PowerShell Core (pwsh) for Azure backup collection
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates apt-transport-https && \
+    wget -q https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/powershell_7.4.6-1.deb_amd64.deb && \
+    dpkg -i powershell_7.4.6-1.deb_amd64.deb 2>/dev/null || apt-get install -f -y && \
+    rm -f powershell_7.4.6-1.deb_amd64.deb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN npm install --omit=dev --legacy-peer-deps
+# Install Azure PowerShell modules required by the backup collection script
+RUN pwsh -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted" && \
+    pwsh -Command "Install-Module -Name Az.Accounts, Az.RecoveryServices, Az.Resources -Scope AllUsers -Force -AllowClobber"
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]

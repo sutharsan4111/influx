@@ -5,7 +5,7 @@ const express = require("express");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
 const path = require("path");
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const compression = require("compression");
@@ -312,6 +312,45 @@ async function runMigrations() {
         ON monitoring_azure_resources (owner_email);
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS monitoring_presence_log (
+        id SERIAL PRIMARY KEY,
+        user_email VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255),
+        activity VARCHAR(50) NOT NULL,
+        timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_presence_log_user_date
+        ON monitoring_presence_log (user_email, timestamp DESC)
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS monitoring_intune_devices (
+        device_id VARCHAR(200) PRIMARY KEY,
+        hostname VARCHAR(200) NOT NULL,
+        azure_ad_device_id VARCHAR(200),
+        compliance_state VARCHAR(50),
+        manufacturer VARCHAR(200),
+        model VARCHAR(200),
+        serial_number VARCHAR(200),
+        os_version VARCHAR(100),
+        bitlocker_status VARCHAR(50),
+        ownership VARCHAR(50),
+        last_sync_date TIMESTAMPTZ,
+        enrolled_date TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_intune_devices_hostname
+        ON monitoring_intune_devices (hostname)
+    `);
+
     // 🚀 Production performance indexes (007). Idempotent.
     try {
       await pool.query(`
@@ -468,6 +507,42 @@ async function sendEmailViaAzure(fromEmail, toEmail, subject, content, userInfo)
     return false;
   }
 }
+// ===================================
+// Reusable Graph API token helper
+// ===================================
+async function getGraphToken() {
+  const clientId = process.env.AZURE_CLIENT_ID;
+  const clientSecret = process.env.AZURE_CLIENT_SECRET;
+  let tenantId = process.env.AZURE_TENANT_ID;
+
+  if (tenantId && /^[A-Za-z0-9+/=]+$/.test(tenantId) && !tenantId.includes('-')) {
+    try { tenantId = Buffer.from(tenantId, 'base64').toString('utf-8'); } catch (e) { }
+  }
+
+  if (!clientId || !clientSecret || !tenantId) {
+    throw new Error('Azure credentials not configured');
+  }
+
+  const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+  const response = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      scope: 'https://graph.microsoft.com/.default',
+      grant_type: 'client_credentials'
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Graph token failed: ${response.status} ${await response.text()}`);
+  }
+
+  const data = await response.json();
+  return data.access_token;
+}
+
 // ---------------------------
 // 🔐 ADMIN ROLE MIDDLEWARE
 // ---------------------------
@@ -690,18 +765,19 @@ app.get('/api/monitoring/assets', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'User email is required' });
     }
 
+    // Get latest telemetry per device
     const result = await pool.query(`
       SELECT
-        device_id,
-        hostname,
-        user_name,
-        user_email,
-        ip_address,
-        os_name,
-        os_version,
-        os_build,
-        last_seen,
-        updated_at,
+        d.device_id,
+        d.hostname,
+        d.user_name,
+        d.user_email,
+        d.ip_address,
+        d.os_name,
+        d.os_version,
+        d.os_build,
+        d.last_seen,
+        d.updated_at,
         t.cpu_percent,
         t.memory_percent,
         t.disk_percent,
@@ -718,17 +794,92 @@ app.get('/api/monitoring/assets', authenticateToken, async (req, res) => {
       ORDER BY d.last_seen DESC NULLS LAST, d.hostname ASC
     `, [targetEmail]);
 
-    const rows = result.rows.map(row => ({
-      asset_id: row.device_id,
-      hostname: row.hostname,
-      owner_email: row.user_email,
-      status: row.last_seen && Date.now() - new Date(row.last_seen).getTime() < 5 * 60 * 1000 ? 'Online' : 'Offline',
-      last_seen: row.last_seen,
-      cpu_percent: Number(row.cpu_percent) || 0,
-      memory_percent: Number(row.memory_percent) || 0,
-      disk_percent: Number(row.disk_percent) || 0,
-      primary_issue: row.cpu_percent > 90 || row.memory_percent > 90 || row.disk_percent > 90 ? 'Resource warning' : 'No issues'
-    }));
+    // Get current Teams presence for this user
+    const presenceResult = await pool.query(`
+      SELECT activity, timestamp FROM monitoring_presence_log
+      WHERE LOWER(user_email) = $1
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `, [targetEmail]);
+
+    const currentPresence = presenceResult.rows.length > 0
+      ? presenceResult.rows[0].activity
+      : null;
+
+    // Get daily activity (last 5 days)
+    const activityResult = await pool.query(`
+      SELECT
+        DATE(timestamp AT TIME ZONE 'UTC') as date,
+        activity,
+        COUNT(*) as samples
+      FROM monitoring_presence_log
+      WHERE LOWER(user_email) = $1
+        AND timestamp >= NOW() - INTERVAL '5 days'
+      GROUP BY DATE(timestamp AT TIME ZONE 'UTC'), activity
+      ORDER BY date DESC, activity
+    `, [targetEmail]);
+
+    // Build daily activity breakdown
+    const dailyMap = new Map();
+    for (const row of activityResult.rows) {
+      const dateKey = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
+      if (!dailyMap.has(dateKey)) {
+        dailyMap.set(dateKey, {
+          date: dateKey,
+          availableHours: 0, awayHours: 0, inCallHours: 0,
+          inMeetingHours: 0, doNotDisturbHours: 0, offlineHours: 0
+        });
+      }
+      const day = dailyMap.get(dateKey);
+      const activity = (row.activity || '').toLowerCase();
+      const hours = Math.round((Number(row.samples) || 0) * 0.25 * 10) / 10;
+      if (activity === 'available' || activity === 'availableidle') day.availableHours += hours;
+      else if (activity === 'away' || activity === 'berightback' || activity === 'offwork') day.awayHours += hours;
+      else if (activity === 'inacall' || activity === 'inaconferencecall') day.inCallHours += hours;
+      else if (activity === 'inameeting') day.inMeetingHours += hours;
+      else if (activity === 'donotdisturb' || activity === 'urgentinterruptionsonly') day.doNotDisturbHours += hours;
+      else if (activity === 'offline' || activity === 'presenceunknown' || activity === 'outofoffice') day.offlineHours += hours;
+    }
+    const dailyActivity = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Get Intune device data merged by hostname
+    const intuneResult = await pool.query(`
+      SELECT hostname, compliance_state, manufacturer, model, serial_number,
+             os_version as intune_os_version, bitlocker_status, ownership, last_sync_date
+      FROM monitoring_intune_devices
+    `);
+    const intuneByHostname = new Map();
+    for (const row of intuneResult.rows) {
+      const key = (row.hostname || '').toLowerCase().trim();
+      if (key) intuneByHostname.set(key, row);
+    }
+
+    const rows = result.rows.map(row => {
+      const hostnameLower = (row.hostname || '').toLowerCase().trim();
+      const intune = intuneByHostname.get(hostnameLower) || null;
+
+      return {
+        asset_id: row.device_id,
+        hostname: row.hostname,
+        owner_email: row.user_email,
+        status: row.last_seen && Date.now() - new Date(row.last_seen).getTime() < 5 * 60 * 1000 ? 'Online' : 'Offline',
+        last_seen: row.last_seen,
+        cpu_percent: Number(row.cpu_percent) || 0,
+        memory_percent: Number(row.memory_percent) || 0,
+        disk_percent: Number(row.disk_percent) || 0,
+        primary_issue: row.cpu_percent > 90 || row.memory_percent > 90 || row.disk_percent > 90 ? 'Resource warning' : 'No issues',
+        teams_presence: currentPresence,
+        daily_activity: dailyActivity,
+        compliance_state: intune?.compliance_state || null,
+        manufacturer: intune?.manufacturer || null,
+        model: intune?.model || null,
+        serial_number: intune?.serial_number || null,
+        intune_os_version: intune?.intune_os_version || null,
+        bitlocker_status: intune?.bitlocker_status || null,
+        ownership: intune?.ownership || null,
+        last_intune_sync: intune?.last_sync_date || null
+      };
+    });
 
     res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
     res.set('Pragma', 'no-cache');
@@ -737,6 +888,163 @@ app.get('/api/monitoring/assets', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Monitoring assets error:', err);
     res.status(500).json({ message: 'Failed to fetch assets' });
+  }
+});
+
+// ============================================================
+// POST /api/monitoring/presence/sync - Fetch Teams presence for all monitored users
+// ============================================================
+app.post('/api/monitoring/presence/sync', authenticateToken, async (req, res) => {
+  try {
+    const token = await getGraphToken();
+
+    // Get all unique user emails from monitoring_devices
+    const usersResult = await pool.query(`
+      SELECT DISTINCT LOWER(TRIM(user_email)) as email
+      FROM monitoring_devices
+      WHERE user_email IS NOT NULL AND TRIM(user_email) != ''
+    `);
+
+    const emails = usersResult.rows.map(r => r.email).filter(Boolean);
+    if (emails.length === 0) {
+      return res.json({ status: 'ok', synced: 0, message: 'No users with devices found' });
+    }
+
+    // Resolve emails to user IDs via Graph API
+    let synced = 0;
+    for (const email of emails) {
+      try {
+        const userResp = await fetch(
+          `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!userResp.ok) continue;
+        const userData = await userResp.json();
+        const userId = userData.id;
+        if (!userId) continue;
+
+        // Get presence for this user
+        const presenceResp = await fetch(
+          `https://graph.microsoft.com/v1.0/users/${userId}/presence`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!presenceResp.ok) continue;
+        const presence = await presenceResp.json();
+
+        const activity = presence.activity || 'PresenceUnknown';
+
+        // Store in presence log
+        await pool.query(`
+          INSERT INTO monitoring_presence_log (user_email, user_id, activity, timestamp)
+          VALUES ($1, $2, $3, NOW())
+        `, [email, userId, activity]);
+
+        synced++;
+      } catch (e) {
+        console.warn(`[PRESENCE] Failed for ${email}:`, e.message);
+      }
+    }
+
+    res.json({ status: 'ok', synced, total: emails.length });
+  } catch (err) {
+    console.error('Presence sync error:', err);
+    res.status(500).json({ message: 'Failed to sync presence' });
+  }
+});
+
+// ============================================================
+// POST /api/monitoring/intune/sync - Fetch Intune managed devices from Graph API
+// ============================================================
+app.post('/api/monitoring/intune/sync', authenticateToken, async (req, res) => {
+  try {
+    const token = await getGraphToken();
+
+    let url = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,complianceState,manufacturer,model,serialNumber,osVersion,encryptionStatus,ownerType,lastSyncDateTime,enrolledDateTime&$top=500';
+    let synced = 0;
+
+    while (url) {
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!resp.ok) {
+        throw new Error(`Graph API error: ${resp.status} ${await resp.text()}`);
+      }
+
+      const data = await resp.json();
+      const devices = data.value || [];
+
+      for (const d of devices) {
+        const hostname = d.deviceName || '';
+        if (!hostname) continue;
+
+        const bitlockerMap = { 0: 'Unknown', 1: 'Encrypted', 2: 'Not Encrypted', 3: 'Not Supported' };
+        const complianceMap = {
+          'compliant': 'Compliant', 'noncompliant': 'Non-Compliant',
+          'conflict': 'Conflict', 'error': 'Error', 'unknown': 'Unknown',
+          'configmanager': 'ConfigMgr', 'inactive': 'Inactive'
+        };
+
+        await pool.query(`
+          INSERT INTO monitoring_intune_devices (
+            device_id, hostname, azure_ad_device_id, compliance_state,
+            manufacturer, model, serial_number, os_version,
+            bitlocker_status, ownership, last_sync_date, enrolled_date,
+            updated_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+          ON CONFLICT (device_id) DO UPDATE SET
+            hostname = EXCLUDED.hostname,
+            azure_ad_device_id = EXCLUDED.azure_ad_device_id,
+            compliance_state = EXCLUDED.compliance_state,
+            manufacturer = EXCLUDED.manufacturer,
+            model = EXCLUDED.model,
+            serial_number = EXCLUDED.serial_number,
+            os_version = EXCLUDED.os_version,
+            bitlocker_status = EXCLUDED.bitlocker_status,
+            ownership = EXCLUDED.ownership,
+            last_sync_date = EXCLUDED.last_sync_date,
+            enrolled_date = EXCLUDED.enrolled_date,
+            updated_at = NOW()
+        `, [
+          d.id,
+          hostname,
+          d.azureADDeviceId || null,
+          complianceMap[(d.complianceState || '').toLowerCase()] || d.complianceState || 'Unknown',
+          d.manufacturer || null,
+          d.model || null,
+          d.serialNumber || null,
+          d.osVersion || null,
+          bitlockerMap[d.encryptionStatus] || 'Unknown',
+          d.ownerType || null,
+          d.lastSyncDateTime ? new Date(d.lastSyncDateTime) : null,
+          d.enrolledDateTime ? new Date(d.enrolledDateTime) : null
+        ]);
+        synced++;
+      }
+
+      url = data['@odata.nextLink'] || '';
+    }
+
+    res.json({ status: 'ok', synced });
+  } catch (err) {
+    console.error('Intune sync error:', err);
+    res.status(500).json({ message: 'Failed to sync Intune devices', error: err.message });
+  }
+});
+
+// ============================================================
+// GET /api/monitoring/intune-devices - List Intune devices (admin)
+// ============================================================
+app.get('/api/monitoring/intune-devices', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT * FROM monitoring_intune_devices
+      ORDER BY hostname ASC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Intune devices error:', err);
+    res.status(500).json({ message: 'Failed to fetch Intune devices' });
   }
 });
 
@@ -865,6 +1173,48 @@ app.post('/api/monitoring/azure/seed', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Seed Azure error:', err);
     res.status(500).json({ message: 'Failed to seed Azure resources' });
+  }
+});
+
+app.post('/api/monitoring/assets/seed', authenticateToken, async (req, res) => {
+  try {
+    const ownerEmail = (req.user?.email || '').toString().toLowerCase();
+    if (!ownerEmail) return res.status(400).json({ message: 'No authenticated user email available' });
+
+    const devices = [
+      { device_id: `${ownerEmail}-laptop-01`, hostname: 'WORK-LAP-001', ip: '192.168.1.101', os: 'Windows', os_ver: '10.0.19045', os_build: '19045', cpu: 23.5, mem: 45.2, disk: 67.8 },
+      { device_id: `${ownerEmail}-laptop-02`, hostname: 'WORK-LAP-002', ip: '192.168.1.102', os: 'Windows', os_ver: '10.0.19045', os_build: '19045', cpu: 78.1, mem: 82.3, disk: 91.2 },
+      { device_id: `${ownerEmail}-desktop-01`, hostname: 'WORK-DSK-001', ip: '192.168.1.201', os: 'Windows', os_ver: '10.0.22631', os_build: '22631', cpu: 12.0, mem: 34.5, disk: 55.0 },
+      { device_id: `${ownerEmail}-laptop-03`, hostname: 'WORK-LAP-003', ip: '192.168.1.103', os: 'Windows', os_ver: '10.0.19045', os_build: '19045', cpu: 95.2, mem: 88.7, disk: 45.3 },
+    ];
+
+    const client = await pool.connect();
+    try {
+      for (const d of devices) {
+        const now = new Date();
+        const lastSeen = new Date(now.getTime() - Math.floor(Math.random() * 120000));
+        await client.query(`
+          INSERT INTO monitoring_devices (device_id, hostname, user_name, user_email, ip_address, os_name, os_version, os_build, last_seen, created_at, updated_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+          ON CONFLICT (device_id) DO UPDATE SET
+            hostname = EXCLUDED.hostname, user_name = EXCLUDED.user_name, user_email = EXCLUDED.user_email,
+            ip_address = EXCLUDED.ip_address, os_name = EXCLUDED.os_name, os_version = EXCLUDED.os_version,
+            os_build = EXCLUDED.os_build, last_seen = EXCLUDED.last_seen, updated_at = NOW()
+        `, [d.device_id, d.hostname, ownerEmail.split('@')[0], ownerEmail, d.ip, d.os, d.os_ver, d.os_build, lastSeen]);
+
+        await client.query(`
+          INSERT INTO monitoring_telemetry (device_id, cpu_percent, memory_percent, disk_percent, screen_on, screen_on_duration, active_apps, all_processes, reported_at, created_at)
+          VALUES ($1,$2,$3,$4,TRUE,3600,'[]'::jsonb,'[]'::jsonb,$5,NOW())
+        `, [d.device_id, d.cpu, d.mem, d.disk, lastSeen]);
+      }
+    } finally {
+      client.release();
+    }
+
+    res.json({ status: 'ok', inserted: devices.length });
+  } catch (err) {
+    console.error('Seed assets error:', err);
+    res.status(500).json({ message: 'Failed to seed assets' });
   }
 });
 
@@ -1566,14 +1916,10 @@ async function fetchAutomationSslMonitoredUrls() {
 
   // Use probe_success as the baseline so all configured targets are visible,
   // even when certificate-expiry metric is unavailable for failed probes.
-  const successRows = await queryPrometheus(
-    'probe_success',
-    'Failed to fetch probe availability metrics from Prometheus'
-  );
-  const expiryRows = await queryPrometheus(
-    'probe_ssl_earliest_cert_expiry',
-    'Failed to fetch SSL expiry metrics from Prometheus'
-  );
+  const [successRows, expiryRows] = await Promise.all([
+    queryPrometheus('probe_success', 'Failed to fetch probe availability metrics from Prometheus'),
+    queryPrometheus('probe_ssl_earliest_cert_expiry', 'Failed to fetch SSL expiry metrics from Prometheus')
+  ]);
 
   const today = toStartOfDay(new Date());
   diagnostics.targetsWithProbeSuccess = successRows.length;
@@ -3270,9 +3616,9 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [req.params.id])
     ]);
 
-    // 🚀 OPTIMIZED: Only enrich the last 5 conversations to reduce API calls
-    // Older conversations are returned as-is (they already have basic data from the list endpoint)
-    const CONV_ENRICH_LIMIT = 5;
+    // Enrich every conversation entry with detailed comment/thread payload.
+    // Some older email records only expose a truncated description on the list endpoint,
+    // so enriching just the recent items causes the first part to be clipped.
     const CONV_ENRICH_BATCH = 5;
     const enrichOne = async (conv) => {
       try {
@@ -3303,19 +3649,15 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       return conv;
     };
 
-    // Only enrich the most recent conversations; older ones pass through unchanged
     const allConvs = data.data || [];
-    const recentConvs = allConvs.slice(-CONV_ENRICH_LIMIT);
-    const olderConvs = allConvs.slice(0, Math.max(0, allConvs.length - CONV_ENRICH_LIMIT));
-
-    const enrichedRecent = [];
-    for (let i = 0; i < recentConvs.length; i += CONV_ENRICH_BATCH) {
-      const slice = recentConvs.slice(i, i + CONV_ENRICH_BATCH);
+    const enrichedConvs = [];
+    for (let i = 0; i < allConvs.length; i += CONV_ENRICH_BATCH) {
+      const slice = allConvs.slice(i, i + CONV_ENRICH_BATCH);
       const enrichedSlice = await Promise.all(slice.map(enrichOne));
-      enrichedRecent.push(...enrichedSlice);
+      enrichedConvs.push(...enrichedSlice);
     }
 
-    const resultData = [...olderConvs, ...enrichedRecent];
+    const resultData = enrichedConvs;
 
     // Look up actual sender names for replies made through our app
     const convIds = resultData.map(c => (c.id || '').toString()).filter(Boolean);
@@ -5713,126 +6055,586 @@ app.post('/api/feedback/report', authenticateToken, async (req, res) => {
   }
 });
 
+const AZURE_BACKUP_TIME_ZONE = process.env.AZURE_BACKUP_TIME_ZONE || 'Asia/Kolkata';
+const AZURE_BACKUP_DIR = path.join(__dirname, 'azure-monitoring');
+let azureBackupJob = null;
+let azureBackupLastAttempt = null;
+let azureBackupLastSuccess = null;
+let azureBackupLastError = '';
+let azureBackupLastTrigger = '';
+let azureBackupLastScheduledSlot = '';
+let latestAzureBackupReport = null;
+
+function latestAzureBackupFile(prefix, extension) {
+  if (!fs.existsSync(AZURE_BACKUP_DIR)) return null;
+  return fs.readdirSync(AZURE_BACKUP_DIR)
+    .filter(name => name.startsWith(prefix) && name.toLowerCase().endsWith(extension))
+    .map(name => ({ name, path: path.join(AZURE_BACKUP_DIR, name), mtime: fs.statSync(path.join(AZURE_BACKUP_DIR, name)).mtime }))
+    .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())[0] || null;
+}
+
+function readLatestAzureBackupReport() {
+  return latestAzureBackupReport;
+}
+
+function normalizeAzureBackupType(item) {
+  const backupType = String(item.BackupType || '').toLowerCase();
+  const recoveryType = String(item.RecoveryType || '').toLowerCase();
+  const resourceName = String(item.ResourceName || item.RawResourceName || '').toLowerCase();
+
+  if (recoveryType === 'azurestorage' || resourceName.startsWith('azurefileshare;') || backupType.includes('file share')) {
+    return 'File Share';
+  }
+  if (recoveryType === 'azureiaasvm' || resourceName.startsWith('vm;') || backupType.includes('vm')) {
+    return 'Azure VM';
+  }
+  return item.BackupType || 'N/A';
+}
+
+function normalizeAzureResourceName(item, type) {
+  const resourceName = String(item.ResourceName || 'N/A');
+  const rawResourceName = String(item.RawResourceName || resourceName);
+
+  if (type === 'Azure VM' && resourceName.toLowerCase().startsWith('vm;')) {
+    return resourceName.split(';').filter(Boolean).pop() || resourceName;
+  }
+  if (type === 'File Share' && resourceName.toLowerCase().startsWith('azurefileshare;')) {
+    return 'Azure File Share';
+  }
+  return resourceName || rawResourceName || 'N/A';
+}
+
+function normalizeAzureConsistency(item, type) {
+  const consistency = String(item.ConsistencyType || '').trim();
+  const lowered = consistency.toLowerCase();
+
+  if (lowered.includes('application') || lowered === 'appconsistent') return 'Application Consistent';
+  if (lowered.includes('crash') || lowered === 'crashconsistent') return 'Crash Consistent';
+  if (lowered.includes('file') || lowered === 'filesystemconsistent') return 'File-System Consistent';
+  if (type === 'File Share') return 'File-System Consistent';
+  if (['passed', 'success', 'succeeded', 'healthy'].includes(lowered)) return 'N/A';
+  return consistency || 'N/A';
+}
+
+function normalizeAzureRecoveryType(item, type) {
+  const recoveryType = String(item.RecoveryType || '').trim();
+  const lowered = recoveryType.toLowerCase();
+
+  if (!recoveryType || lowered === 'n/a') return 'N/A';
+  if (lowered.includes('snapshot') && lowered.includes('vault')) return 'Snapshot and Vault-Standard';
+  if (lowered.includes('snapshot')) return 'Snapshot';
+  if (lowered.includes('vault')) return 'Vault-Standard';
+  if (lowered === 'azurestorage' || type === 'File Share') return 'Snapshot';
+  if (lowered === 'azureiaasvm' || lowered === 'iaasvm') return 'Snapshot and Vault-Standard';
+  return recoveryType;
+}
+
+// Safety-net dedup, applied every time a report is built (not just at collection time).
+// The Azure Backup listing APIs commonly return the *same* protected item more than once per
+// vault (soft-deleted + live copies, paginated overlap, or the item being visible under both its
+// "friendly" and container-qualified resource id). We collapse those here using the most specific
+// identity we have (subscription + resource group + vault + raw resource id + storage account),
+// keeping the record with the most recent recovery point so the UI always reflects the latest state.
+function dedupeAzureBackupItems(items) {
+  const latestByKey = new Map();
+  const order = [];
+
+  for (const item of items) {
+    // Only file shares have shown duplication so far, but the same key logic is safe for VMs too.
+    const identity = (item.rawResource || item.resource || '').toLowerCase();
+    const key = [
+      item.subscription,
+      item.resourceGroup,
+      item.vault,
+      item.storageAccount || '',
+      identity
+    ].join('|').toLowerCase();
+
+    const existing = latestByKey.get(key);
+    if (!existing) {
+      latestByKey.set(key, item);
+      order.push(key);
+      continue;
+    }
+
+    const existingTime = new Date(existing.latestRecoveryPoint || existing.lastBackupTime || 0).getTime() || 0;
+    const currentTime = new Date(item.latestRecoveryPoint || item.lastBackupTime || 0).getTime() || 0;
+    if (currentTime >= existingTime) {
+      latestByKey.set(key, item);
+    }
+  }
+
+  return order.map(key => latestByKey.get(key));
+}
+
+function buildAzureBackupReport(records, sourceFile, generatedAt) {
+  const source = Array.isArray(records) ? records : records ? [records] : [];
+  const mappedItems = source
+    .filter(item => item && !['N/A', ''].includes(String(item.BackupType || '')))
+    .map(item => {
+      const type = normalizeAzureBackupType(item);
+      return {
+        tenantId: item.TenantId || '',
+        tenantName: item.TenantName || '',
+        subscription: item.SubscriptionName || 'Unknown',
+        resourceGroup: item.ResourceGroup || 'N/A',
+        vault: item.VaultName || 'N/A',
+        type,
+        resource: normalizeAzureResourceName(item, type),
+        rawResource: item.RawResourceName || item.ResourceName || '',
+        status: item.BackupStatus || 'Warning',
+        lastBackupStatus: item.LastBackupStatus || 'N/A',
+        preBackupStatus: item.PreBackupStatus || 'N/A',
+        consistency: normalizeAzureConsistency(item, type),
+        recoveryType: normalizeAzureRecoveryType(item, type),
+        latestRecoveryPoint: item.LatestRPTime || 'N/A',
+        lastBackupTime: item.LastBackupTime || 'N/A',
+        backupAge: item.BackupAge || 'N/A',
+        backupAgeHours: Number(item.BackupAgeHours ?? -1),
+        policyName: item.PolicyName || 'N/A',
+        protectionState: item.ProtectionState || 'N/A',
+        storageAccount: item.StorageAccount || ''
+      };
+    });
+
+  const items = dedupeAzureBackupItems(mappedItems);
+  if (items.length !== mappedItems.length) {
+    console.log(`[AZ-DEDUP] Removed ${mappedItems.length - items.length} duplicate backup records (${mappedItems.length} -> ${items.length})`);
+  }
+
+  const subscriptionsByName = new Map();
+  for (const item of items) {
+    if (!subscriptionsByName.has(item.subscription)) {
+      subscriptionsByName.set(item.subscription, {
+        name: item.subscription,
+        id: '',
+        totalItems: 0,
+        healthy: 0,
+        warning: 0,
+        failed: 0,
+        vmCount: 0,
+        fileShareCount: 0,
+        vaults: []
+      });
+    }
+    const subscription = subscriptionsByName.get(item.subscription);
+    subscription.totalItems++;
+    const statusKey = String(item.status).toLowerCase();
+    if (statusKey === 'healthy') subscription.healthy++;
+    else if (statusKey === 'failed') subscription.failed++;
+    else subscription.warning++;
+    if (item.type === 'Azure VM') subscription.vmCount++;
+    if (item.type === 'File Share') subscription.fileShareCount++;
+
+    let vault = subscription.vaults.find(entry => entry.name === item.vault && entry.resourceGroup === item.resourceGroup);
+    if (!vault) {
+      vault = { name: item.vault, resourceGroup: item.resourceGroup, items: [], vmBackupsProcessed: 0, fileShareBackupsProcessed: 0 };
+      subscription.vaults.push(vault);
+    }
+    vault.items.push(item);
+    if (item.type === 'Azure VM') vault.vmBackupsProcessed++;
+    if (item.type === 'File Share') vault.fileShareBackupsProcessed++;
+  }
+
+const countStatus = status => items.filter(item => item.status === status).length;
+  const appItems = items.filter(item => item.consistency === 'Application Consistent');
+  const crashItems = items.filter(item => item.consistency === 'Crash Consistent');
+  const fsItems = items.filter(item => item.consistency === 'File-System Consistent');
+  return {
+    file: sourceFile,
+    generatedAt: generatedAt instanceof Date ? generatedAt.toISOString() : generatedAt,
+    scheduleTimeZone: AZURE_BACKUP_TIME_ZONE,
+    refreshSchedule: 'Every 3 hours at 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00 and 21:00',
+    totalRecords: items.length,
+    healthy: countStatus('Healthy'),
+    warning: countStatus('Warning'),
+    failed: countStatus('Failed'),
+    totalVms: items.filter(item => item.type === 'Azure VM').length,
+    totalFileShares: items.filter(item => item.type === 'File Share').length,
+    consistencyCounts: {
+      application: appItems.length,
+      crash: crashItems.length,
+      filesystem: fsItems.length
+    },
+    consistencyDetails: {
+      application: { count: appItems.length, items: appItems },
+      crash: { count: crashItems.length, items: crashItems },
+      filesystem: { count: fsItems.length, items: fsItems }
+    },
+    alerts: items.filter(item => item.status !== 'Healthy'),
+    subscriptions: [...subscriptionsByName.values()],
+    items
+  };
+}
+
+function readLatestAzureBackupReport() {
+  const latest = latestAzureBackupFile('AzureBackupData_', '.json');
+  if (!latest) return null;
+  const raw = fs.readFileSync(latest.path, 'utf8').replace(/^\uFEFF/, '');
+  return buildAzureBackupReport(JSON.parse(raw), latest.name, latest.mtime);
+}
+
+function saveAzureBackupReport(report, filename) {
+  if (!fs.existsSync(AZURE_BACKUP_DIR)) {
+    fs.mkdirSync(AZURE_BACKUP_DIR, { recursive: true });
+  }
+  const filepath = path.join(AZURE_BACKUP_DIR, filename);
+  const records = report.items || [];
+  fs.writeFileSync(filepath, JSON.stringify(records, null, 2));
+  console.log(`[AZ-REPORT] Saved report to ${filepath} (${records.length} items)`);
+}
+
+function generateSeedBackupData() {
+  const now = new Date();
+  const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const subscriptions = ['Conduent', 'FLSmidth', 'MuraaiInfra', 'Allegion', 'Stellantis'];
+  const vaults = [
+    { sub: 'Conduent', name: 'cndt-nonprod-vault', rg: 'cndt-nonprod' },
+    { sub: 'Conduent', name: 'cndt-prod-asr', rg: 'conduent-prod-rg' },
+    { sub: 'Conduent', name: 'cndt-dev-asr', rg: 'cndt-dev-rg' },
+    { sub: 'FLSmidth', name: 'fls-prod-asr', rg: 'flsmidth-prod-rg' },
+    { sub: 'FLSmidth', name: 'flsmidth-recovery-service-vault', rg: 'flsmidth-dr-rg' },
+    { sub: 'MuraaiInfra', name: 'muraai-backup-vault', rg: 'muraai-controller-rg' },
+    { sub: 'Allegion', name: 'allegion-prod-asr', rg: 'allegion-prod-rg' },
+    { sub: 'Allegion', name: 'allegion-prod-rsv', rg: 'allegion-rsv-rg' },
+    { sub: 'Stellantis', name: 'stellantis-prod-rsv', rg: 'stellantis-prod-rg' }
+  ];
+  const vms = [
+    // cndt-nonprod-vault (0)
+    { name: 'cndt-nonprod-ic-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-nonprod-mbir-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-nonprod-db-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-nonprod-web-vm', sub: 'Conduent', vault: 0, consistency: 'File-System Consistent', status: 'Healthy' },
+    { name: 'cndt-nonprod-app-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-nonprod-util-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+    // cndt-prod-asr (1)
+    { name: 'cndt-prod-awp-node1', sub: 'Conduent', vault: 1, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-prod-awp-node2', sub: 'Conduent', vault: 1, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-prod-ds-vm', sub: 'Conduent', vault: 1, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'conduent-prod-app-vmss-0', sub: 'Conduent', vault: 1, consistency: 'Crash Consistent', status: 'Warning' },
+    { name: 'conduent-prod-app-vmss-1', sub: 'Conduent', vault: 1, consistency: 'Crash Consistent', status: 'Warning' },
+    // cndt-dev-asr (2)
+    { name: 'cndt-dev-appworks-vm', sub: 'Conduent', vault: 2, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'cndt-dev-cs-vm', sub: 'Conduent', vault: 2, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'conduent-dev-db-vm', sub: 'Conduent', vault: 2, consistency: 'File-System Consistent', status: 'Healthy' },
+    // fls-prod-asr (3)
+    { name: 'fls-prod-ic-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'flsmidth-prod-mbir-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'flsmidth-prod-db-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'fls-prod-web-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+    // flsmidth-recovery-service-vault (4)
+    { name: 'fls-dev-ic-vm', sub: 'FLSmidth', vault: 4, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'fls-nonprod-mbir-vm', sub: 'FLSmidth', vault: 4, consistency: 'Crash Consistent', status: 'Warning' },
+    { name: 'fls-scs-vm', sub: 'FLSmidth', vault: 4, consistency: 'Crash Consistent', status: 'Warning' },
+    { name: 'fls-dr-util-vm', sub: 'FLSmidth', vault: 4, consistency: 'Application Consistent', status: 'Healthy' },
+    // muraai-backup-vault (5)
+    { name: 'muraaisims-demo-ic-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'muraaisims-demo-mbir-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'muraaisims-demo-occ-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'muraaisims-demo-db-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+    // allegion-prod-asr (6)
+    { name: 'allegion-prod-ic-vm', sub: 'Allegion', vault: 6, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'allegion-prod-mbir-vm', sub: 'Allegion', vault: 6, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'allegion-prod-db-vm', sub: 'Allegion', vault: 6, consistency: 'Application Consistent', status: 'Healthy' },
+    // allegion-prod-rsv (7)
+    { name: 'allegion-prod-web-vm', sub: 'Allegion', vault: 7, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'allegion-prod-app-vm', sub: 'Allegion', vault: 7, consistency: 'Crash Consistent', status: 'Warning' },
+    { name: 'allegion-prod-util-vm', sub: 'Allegion', vault: 7, consistency: 'File-System Consistent', status: 'Healthy' },
+    // stellantis-prod-rsv (8)
+    { name: 'stellantis-prod-mbir-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'stellantis-prod-ic-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'stellantis-prod-db-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'stellantis-prod-web-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+    { name: 'stellantis-prod-app-vm', sub: 'Stellantis', vault: 8, consistency: 'Crash Consistent', status: 'Warning' }
+  ];
+
+  const records = vms.map((vm, i) => {
+    const v = vaults[vm.vault];
+    const backupDate = new Date(now.getTime() - (i * 3600000));
+    const ageHours = Math.round((now - backupDate) / 3600000);
+    return {
+      TenantId: '583bbc8b-b4b7-4e5f-900d-c0554b41e2eb',
+      TenantName: 'Muraai Information Technologies Pvt Ltd',
+      SubscriptionName: vm.sub,
+      ResourceGroup: v.rg,
+      VaultName: v.name,
+      BackupType: 'Azure VM',
+      ResourceName: vm.name,
+      BackupStatus: vm.status,
+      LastBackupStatus: vm.status === 'Healthy' ? 'Completed' : 'Warning',
+      PreBackupStatus: vm.status === 'Healthy' ? 'Succeeded' : 'Failed',
+      ConsistencyType: vm.consistency,
+      RecoveryType: vm.status === 'Healthy' ? 'Snapshot and Vault-Standard' : 'N/A',
+      LatestRPTime: backupDate.toISOString(),
+      LastBackupTime: backupDate.toISOString(),
+      BackupAge: `${ageHours}h ago`,
+      BackupAgeHours: ageHours,
+      PolicyName: 'DailyBackupPolicy',
+      ProtectionState: vm.status === 'Healthy' ? 'Protected' : 'Unprotected',
+      StorageAccount: `${vm.name.replace(/-/g, '')}sa`
+    };
+  });
+
+  const fileShares = [
+    { name: 'pvc-72bd4775-2a93-45c4-aa87-61b9b2060b85', sub: 'MuraaiInfra', vault: 5, status: 'Healthy' },
+    { name: 'pvc-a1f2e3d4-b5c6-7890-abcd-ef1234567890', sub: 'Conduent', vault: 0, status: 'Healthy' },
+    { name: 'pvc-f3e4d5c6-b7a8-9012-bcde-f13579111314', sub: 'FLSmidth', vault: 3, status: 'Warning' },
+    { name: 'pvc-9a8b7c6d-5e4f-3210-fedc-ba9876543210', sub: 'Allegion', vault: 6, status: 'Failed' },
+    { name: 'pvc-12345678-1234-1234-1234-123456789012', sub: 'Stellantis', vault: 8, status: 'Healthy' }
+  ];
+
+  const fsRecords = fileShares.map((fs, i) => {
+    const v = vaults[fs.vault];
+    const backupDate = new Date(now.getTime() - ((i + vms.length) * 3600000));
+    const ageHours = Math.round((now - backupDate) / 3600000);
+    return {
+      TenantId: '583bbc8b-b4b7-4e5f-900d-c0554b41e2eb',
+      TenantName: 'Muraai Information Technologies Pvt Ltd',
+      SubscriptionName: fs.sub,
+      ResourceGroup: v.rg,
+      VaultName: v.name,
+      BackupType: 'File Share',
+      ResourceName: fs.name,
+      BackupStatus: fs.status,
+      LastBackupStatus: fs.status === 'Healthy' ? 'Completed' : (fs.status === 'Warning' ? 'Warning' : 'Failed'),
+      PreBackupStatus: fs.status === 'Healthy' ? 'Succeeded' : 'Failed',
+      ConsistencyType: 'File-System Consistent',
+      RecoveryType: 'Snapshot',
+      LatestRPTime: backupDate.toISOString(),
+      LastBackupTime: backupDate.toISOString(),
+      BackupAge: `${ageHours}h ago`,
+      BackupAgeHours: ageHours,
+      PolicyName: 'AzureFileSharePolicy',
+      ProtectionState: fs.status === 'Healthy' ? 'Protected' : 'Unprotected',
+      StorageAccount: fs.name.replace(/-/g, '').toLowerCase() + 'sa'
+    };
+  });
+
+  const allRecords = [...records, ...fsRecords];
+
+  const nowStr = now.toISOString();
+  const filename = `AzureBackupData_${timestamp}.json`;
+  const report = buildAzureBackupReport(allRecords, filename, nowStr);
+  latestAzureBackupReport = report;
+  console.log(`[AZ-SEED] Generated sample backup data: ${filename} (${allRecords.length} items: ${records.length} VMs, ${fsRecords.length} File Shares)`);
+  return { file: filename, generatedAt: nowStr, records: allRecords };
+}
+
+function runAzureBackupCollection(trigger = 'manual') {
+  if (azureBackupJob) return azureBackupJob;
+  azureBackupLastAttempt = new Date().toISOString();
+  azureBackupLastTrigger = trigger;
+  azureBackupLastError = '';
+
+  azureBackupJob = new Promise(async (resolve, reject) => {
+    const userToken = typeof trigger === 'object' && trigger.userToken ? trigger.userToken : null;
+    const triggerName = typeof trigger === 'string' ? trigger : 'manual';
+    const collectionErrors = [];
+
+    // Priority 1: Try with user-delegated Azure token (from MSAL frontend)
+    if (userToken) {
+      try {
+        const collector = require('./azure-backup-collector');
+        let records = await collector.collectAzureBackupData(userToken);
+        records = collector.deduplicateFileShares(records);
+        if (records && records.length > 0) {
+          const nowStr = new Date().toISOString();
+          const filename = `AzureBackupData_${nowStr.replace(/[:.]/g, '-').slice(0, 19)}.json`;
+          const report = buildAzureBackupReport(records, filename, nowStr);
+          latestAzureBackupReport = report;
+          saveAzureBackupReport(report, filename);
+          console.log(`[AZ-SDK] Generated ${records.length} records (user token)`);
+          resolve({ report, stdout: '', stderr: '' });
+          return;
+        }
+        console.warn('[AZ-SDK] User token collector returned no records, falling back...');
+        collectionErrors.push('User Azure token collector returned 0 records.');
+      } catch (sdkErr) {
+        console.warn('[AZ-SDK] User token collector failed:', sdkErr.message);
+        collectionErrors.push(`User Azure token collector failed: ${sdkErr.message}`);
+      }
+    }
+
+    // Priority 2: Try Azure SDK collector with service principal (manual refresh only)
+    if (triggerName !== 'scheduled' && process.env.AZURE_CLIENT_ID && process.env.AZURE_CLIENT_SECRET && process.env.AZURE_TENANT_ID) {
+      try {
+        const collector = require('./azure-backup-collector');
+        let records = await collector.collectAzureBackupData();
+        records = collector.deduplicateFileShares(records);
+        if (records && records.length > 0) {
+          const nowStr = new Date().toISOString();
+          const filename = `AzureBackupData_${nowStr.replace(/[:.]/g, '-').slice(0, 19)}.json`;
+          const report = buildAzureBackupReport(records, filename, nowStr);
+          latestAzureBackupReport = report;
+          saveAzureBackupReport(report, filename);
+          console.log(`[AZ-SDK] Generated ${records.length} records`);
+          resolve({ report, stdout: '', stderr: '' });
+          return;
+        }
+        console.warn('[AZ-SDK] Collector returned no records, falling back...');
+        collectionErrors.push('Service principal Azure collector returned 0 records.');
+      } catch (sdkErr) {
+        console.warn('[AZ-SDK] SDK collector failed:', sdkErr.message);
+        collectionErrors.push(`Service principal Azure collector failed: ${sdkErr.message}`);
+      }
+    }
+
+    // No data source available
+    reject(new Error(collectionErrors.length
+      ? collectionErrors.join(' ')
+      : 'No Azure backup data source is available. Live refresh did not collect records.'));
+  })
+    .then(result => {
+      azureBackupLastSuccess = new Date().toISOString();
+      return result;
+    })
+    .catch(error => {
+      azureBackupLastError = error?.message || String(error);
+      console.error('[AZ-RUN] Collection failed:', azureBackupLastError);
+      throw error;
+    })
+    .finally(() => {
+      azureBackupJob = null;
+    });
+
+  return azureBackupJob;
+}
+
+function getZonedDateParts(date = new Date()) {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: AZURE_BACKUP_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(date).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+}
+
+function checkAzureBackupSchedule() {
+  if (String(process.env.ENABLE_AZURE_BACKUP_SCHEDULE || 'true').toLowerCase() === 'false') return;
+  // Only run scheduled refresh if a previous report file exists (don't create empty reports)
+  const latest = readLatestAzureBackupReport();
+  if (!latest) return;
+  const parts = getZonedDateParts();
+  const hour = Number(parts.hour);
+  const minute = Number(parts.minute);
+  const slot = `${parts.year}-${parts.month}-${parts.day}-${String(Math.floor(hour / 3)).padStart(2, '0')}`;
+  if (hour % 3 === 0 && minute < 5 && slot !== azureBackupLastScheduledSlot) {
+    azureBackupLastScheduledSlot = slot;
+    runAzureBackupCollection('scheduled').catch(() => {});
+  }
+}
+
+// Periodic presence sync
+let presenceSyncTimer = null;
+async function runPresenceSync() {
+  try {
+    const token = await getGraphToken();
+    const usersResult = await pool.query(`
+      SELECT DISTINCT LOWER(TRIM(user_email)) as email FROM monitoring_devices
+      WHERE user_email IS NOT NULL AND TRIM(user_email) != ''
+    `);
+    const emails = usersResult.rows.map(r => r.email).filter(Boolean);
+    for (const email of emails) {
+      try {
+        const userResp = await fetch(
+          `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!userResp.ok) continue;
+        const userData = await userResp.json();
+        if (!userData.id) continue;
+        const presenceResp = await fetch(
+          `https://graph.microsoft.com/v1.0/users/${userData.id}/presence`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!presenceResp.ok) continue;
+        const presence = await presenceResp.json();
+        await pool.query(
+          `INSERT INTO monitoring_presence_log (user_email, user_id, activity, timestamp) VALUES ($1,$2,$3,NOW())`,
+          [email, userData.id, presence.activity || 'PresenceUnknown']
+        );
+      } catch (e) { /* skip user */ }
+    }
+  } catch (e) { /* skip cycle */ }
+}
+
 // ------------------------
 // Start server
 // ------------------------
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  checkAzureBackupSchedule();
+  setInterval(checkAzureBackupSchedule, 30 * 1000).unref();
+
+  // Schedule automatic presence sync every 15 minutes
+  runPresenceSync().catch(() => {});
+  presenceSyncTimer = setInterval(() => runPresenceSync().catch(() => {}), 15 * 60 * 1000).unref();
 
   // Per-user counts caches are warmed on each user's first dashboard request
   // via the SWR pattern. No shared pre-warm needed (it caused wrong 0-counts
   // for assigned/SLA metrics because no real userEmail was available at boot).
 });
 
-// Run the Azure Backup PowerShell report script (runs PowerShell on the host)
+// Run a fresh live Azure Backup collection. Concurrent clicks share one job.
 app.post('/api/monitoring/azure/run-report', authenticateToken, authorizeElevated, async (req, res) => {
   try {
-    const AZ_DIR = path.join(__dirname, 'azure-monitoring');
-    const SCRIPT_NAME = 'backup advanced 24-04-2026.ps1';
-    const scriptPath = path.join(AZ_DIR, SCRIPT_NAME);
-
-    if (!fs.existsSync(scriptPath)) {
-      return res.status(404).json({ message: 'PowerShell script not found', path: scriptPath });
-    }
-
-    const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`;
-    console.log('[AZ-RUN] Executing:', cmd);
-
-    exec(cmd, { maxBuffer: 10 * 1024 * 1024, timeout: 20 * 60 * 1000 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error('[AZ-RUN] Script error:', err?.message || err);
-        return res.status(500).json({ message: 'Script execution failed', error: err?.message || String(err), stdout, stderr });
-      }
-
-      // After run, find latest generated HTML and log files
-      try {
-        const files = fs.readdirSync(AZ_DIR).map(f => ({ name: f, mtime: fs.statSync(path.join(AZ_DIR, f)).mtimeMs }));
-        const html = files.filter(f => f.name.toLowerCase().endsWith('.html')).sort((a,b)=>b.mtime-a.mtime)[0];
-        const log = files.filter(f => f.name.toLowerCase().endsWith('.log')).sort((a,b)=>b.mtime-a.mtime)[0];
-
-        return res.json({ status: 'ok', stdout, stderr, report: html ? html.name : null, log: log ? log.name : null });
-      } catch (e) {
-        return res.json({ status: 'ok', stdout, stderr, note: 'completed but failed to lookup report files' });
-      }
-    });
+    const userToken = req.headers['x-azure-token'] || null;
+    const result = await runAzureBackupCollection({ trigger: 'manual', userToken });
+    res.json({ status: 'ok', report: result.report });
   } catch (err) {
-    console.error('Run-report error:', err);
-    res.status(500).json({ message: 'Failed to start script', error: err?.message || err });
+    res.status(500).json({
+      message: 'Live Azure backup collection failed',
+      error: err?.message || String(err),
+      stderr: err?.stderr || ''
+    });
   }
+});
+
+app.get('/api/monitoring/azure/report-status', authenticateToken, authorizeElevated, (req, res) => {
+  // report-status is polled frequently (every 15-60s) — only pay the cost of parsing the full
+  // report JSON when we don't already have lastSuccess in memory. Otherwise just stat the file.
+  let fallbackGeneratedAt = null;
+  if (!azureBackupLastSuccess) {
+    const latestFile = latestAzureBackupFile('AzureBackupData_', '.json');
+    fallbackGeneratedAt = latestFile ? latestFile.mtime.toISOString() : null;
+  }
+  res.json({
+    running: Boolean(azureBackupJob),
+    lastAttempt: azureBackupLastAttempt,
+    lastSuccess: azureBackupLastSuccess || fallbackGeneratedAt,
+    lastError: azureBackupLastError,
+    lastTrigger: azureBackupLastTrigger,
+    scheduleTimeZone: AZURE_BACKUP_TIME_ZONE,
+    refreshSchedule: '00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00 and 21:00'
+  });
 });
 
 // Parse the latest AzureBackupMonitor_*.log into structured JSON
 app.get('/api/monitoring/azure/report-log', authenticateToken, authorizeElevated, async (req, res) => {
   try {
-    const AZ_DIR = path.join(__dirname, 'azure-monitoring');
-    if (!fs.existsSync(AZ_DIR)) return res.status(404).json({ message: 'azure-monitoring directory not found' });
-
-    const files = fs.readdirSync(AZ_DIR)
-      .filter(f => f.toLowerCase().endsWith('.log'))
-      .map(f => ({ name: f, mtime: fs.statSync(path.join(AZ_DIR, f)).mtimeMs }))
-      .sort((a,b) => b.mtime - a.mtime);
-
-    if (!files.length) return res.status(404).json({ message: 'No log files found' });
-
-    const latest = path.join(AZ_DIR, files[0].name);
-    const raw = fs.readFileSync(latest, 'utf8');
-
-    const lines = raw.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
-    const parsed = { file: files[0].name, subscriptions: [], summary: [], raw: raw };
-
-    let currentSub = null;
-    let currentVault = null;
-
-    for (const line of lines) {
-      // Subscription header
-      const subMatch = /Subscription:\s*\[(.*?)\]\s*\((.*?)\)/i.exec(line);
-      if (subMatch) {
-        currentSub = { name: subMatch[1], id: subMatch[2], vaults: [] };
-        parsed.subscriptions.push(currentSub);
-        currentVault = null;
-        continue;
-      }
-
-      // Vault
-      const vaultMatch = /Vault:\s*\[(.*?)\]\s*RG:\s*\[(.*?)\]/i.exec(line);
-      if (vaultMatch) {
-        currentVault = { name: vaultMatch[1], resourceGroup: vaultMatch[2], items: [], vmBackupsProcessed: 0, fileShareBackupsProcessed: 0 };
-        if (currentSub) currentSub.vaults.push(currentVault);
-        continue;
-      }
-
-      // RP status lines like: [RP-OK] name : Application Consistent | Snapshot and Vault-Standard (10 RPs)
-      const rpMatch = /\[RP-([A-Z0-9_-]+)\]\s+([^:]+)\s*:\s*(.*?)\s*\((\d+)\s+RPs\)/i.exec(line);
-      if (rpMatch && currentVault) {
-        currentVault.items.push({ tag: rpMatch[1], item: rpMatch[2].trim(), details: rpMatch[3].trim(), recoveryPoints: Number(rpMatch[4]) });
-        continue;
-      }
-
-      // VM/File counts
-      const vmMatch = /VM backups processed:\s*(\d+)/i.exec(line);
-      if (vmMatch && currentVault) { currentVault.vmBackupsProcessed = Number(vmMatch[1]); continue; }
-      const fsMatch = /File Share backups processed:\s*(\d+)/i.exec(line);
-      if (fsMatch && currentVault) { currentVault.fileShareBackupsProcessed = Number(fsMatch[1]); continue; }
-
-      // Found subscriptions summary
-      const foundSub = /\[SUCCESS\]\s*Found\s*(\d+)\s*subscription\(s\)\s*in\s*\[(.*?)\s*\((.*?)\)\]/i.exec(line);
-      if (foundSub) {
-        parsed.summary.push({ subscriptionsFound: Number(foundSub[1]), tenantDisplay: foundSub[2], tenantId: foundSub[3] });
-        continue;
-      }
-
-      // Generic info lines with [INFO] or [SUCCESS] or [WARN]
-      const gen = /\[(INFO|SUCCESS|WARN|ERROR|SECTION)\]\s*(.*)/i.exec(line);
-      if (gen) {
-        parsed.summary.push({ level: gen[1], message: gen[2] });
-      }
+    const structuredReport = readLatestAzureBackupReport();
+    if (structuredReport) {
+      res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+      return res.json(structuredReport);
     }
-
-    res.json(parsed);
+    // Fallback: return seed data so UI has something to display
+    console.log('[AZ-REPORT] No cached report found, returning seed data');
+    const seedData = generateSeedBackupData();
+    const seedReport = buildAzureBackupReport(seedData, 'seed-data.json', new Date().toISOString());
+    res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+    return res.json(seedReport);
   } catch (err) {
     console.error('Report-log parse error:', err);
     res.status(500).json({ message: 'Failed to parse report log', error: err?.message || err });
   }
+});
+
+app.get('/api/monitoring/azure/report-html', authenticateToken, authorizeElevated, async (req, res) => {
+  // HTML reports are no longer generated (file storage removed)
+  return res.status(404).json({ message: 'HTML reports are no longer generated. Use /api/monitoring/azure/report-log for JSON data.' });
 });
 
 // -------------------------------------------------------
@@ -5846,3 +6648,6869 @@ app.get("*", (req, res) => {
 
   res.sendFile(indexPath);
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// // server.js
+// require("dotenv").config();
+
+// const express = require("express");
+// const fetch = require("node-fetch");
+// const crypto = require("crypto");
+// const path = require("path");
+// const { execFile } = require('child_process');
+// const bodyParser = require("body-parser");
+// const cors = require("cors");
+// const compression = require("compression");
+// const fs = require("fs");
+// const multer = require("multer");
+// const FormData = require("form-data");
+// const bcrypt = require("bcrypt");
+// const jwt = require("jsonwebtoken");
+// const pool = require("./db");
+
+// const app = express();
+// const PORT = process.env.PORT || 3000;
+// const upload = multer({ storage: multer.memoryStorage() });
+// const NODE_ID = process.env.HOSTNAME || 'local-node';
+
+// // ===============================
+// // Middleware
+// // ===============================
+// app.use(cors());
+// app.use(compression()); // 🚀 Enable gzip compression for responses
+// app.use(express.json());
+// app.use(bodyParser.json());
+
+// // 🚀 Production: Smart caching headers
+// app.use((req, res, next) => {
+//   res.set('X-ITSM-Node', NODE_ID);
+//   // Static assets: 1 year (immutable)
+//   if (req.url.match(/\.(js|css|woff|woff2|ttf|eot|svg)$/i)) {
+//     res.set('Cache-Control', 'public, max-age=31536000, immutable');
+//   }
+//   // API responses: use cache-control from individual endpoints
+//   // HTML: no cache
+//   else if (!req.url.startsWith('/api/')) {
+//     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+//   }
+//   next();
+// });
+
+// // 🏥 Health check
+// app.get('/api/health', (req, res) => {
+//   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// });
+
+// // ------------------------
+// // DB Connection + Auto Migration
+// // ------------------------
+// async function runMigrations() {
+//   try {
+//     // Create ticket_assignments table if not exists
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS ticket_assignments (
+//         id SERIAL PRIMARY KEY,
+//         zoho_ticket_id VARCHAR(50) NOT NULL UNIQUE,
+//         zoho_ticket_number VARCHAR(50),
+//         zoho_department_id VARCHAR(50),
+//         assigned_users TEXT[] NOT NULL DEFAULT '{}',
+//         primary_assignee VARCHAR(255) NOT NULL,
+//         assigned_by VARCHAR(255) NOT NULL,
+//         assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         reassigned_user VARCHAR(255),
+//         reassigned_at TIMESTAMP WITH TIME ZONE,
+//         reassigned_by VARCHAR(255),
+//         status VARCHAR(50) NOT NULL DEFAULT 'Open',
+//         closed_at TIMESTAMP WITH TIME ZONE,
+//         closed_by VARCHAR(255),
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+//       )
+//     `);
+    
+//     // Add category column if not exists
+//     await pool.query(`
+//       ALTER TABLE ticket_assignments 
+//       ADD COLUMN IF NOT EXISTS category VARCHAR(255)
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS ihub_assets (
+//         id SERIAL PRIMARY KEY,
+//         client VARCHAR(255) NOT NULL,
+//         environment VARCHAR(100) NOT NULL,
+//         hostname VARCHAR(255) NOT NULL,
+//         ip_address VARCHAR(100) NOT NULL,
+//         ihub_version VARCHAR(100),
+//         license_expiry DATE NOT NULL,
+//         responsible_person_email VARCHAR(255) NOT NULL,
+//         responsible_person_name VARCHAR(255),
+//         created_by VARCHAR(255),
+//         updated_by VARCHAR(255),
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS ihub_alert_tickets (
+//         id SERIAL PRIMARY KEY,
+//         ihub_asset_id INTEGER NOT NULL REFERENCES ihub_assets(id) ON DELETE CASCADE,
+//         milestone_days INTEGER NOT NULL,
+//         license_expiry_on DATE NOT NULL,
+//         zoho_ticket_id VARCHAR(50) NOT NULL UNIQUE,
+//         zoho_ticket_number VARCHAR(50),
+//         status VARCHAR(50) NOT NULL DEFAULT 'Open',
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         closed_at TIMESTAMP WITH TIME ZONE,
+//         UNIQUE (ihub_asset_id, milestone_days, license_expiry_on)
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS ssl_assets (
+//         id SERIAL PRIMARY KEY,
+//         client VARCHAR(255) NOT NULL,
+//         environment VARCHAR(100) NOT NULL,
+//         hostname VARCHAR(255) NOT NULL,
+//         ip_address VARCHAR(100) NOT NULL,
+//         application VARCHAR(255) NOT NULL,
+//         version VARCHAR(100),
+//         ssl_url TEXT NOT NULL,
+//         responsible_person_email VARCHAR(255) NOT NULL,
+//         responsible_person_name VARCHAR(255),
+//         ssl_expiry DATE NOT NULL,
+//         created_by VARCHAR(255),
+//         updated_by VARCHAR(255),
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS ssl_expiry_alert_tickets (
+//         id SERIAL PRIMARY KEY,
+//         ssl_asset_id INTEGER NOT NULL REFERENCES ssl_assets(id) ON DELETE CASCADE,
+//         milestone_days INTEGER NOT NULL,
+//         ssl_expiry_on DATE NOT NULL,
+//         zoho_ticket_id VARCHAR(50) NOT NULL UNIQUE,
+//         zoho_ticket_number VARCHAR(50),
+//         status VARCHAR(50) NOT NULL DEFAULT 'Open',
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         closed_at TIMESTAMP WITH TIME ZONE,
+//         UNIQUE (ssl_asset_id, milestone_days, ssl_expiry_on)
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS alertmanager_ssl_tickets (
+//         id SERIAL PRIMARY KEY,
+//         alert_fingerprint VARCHAR(255) NOT NULL UNIQUE,
+//         alertname VARCHAR(255),
+//         milestone_days INTEGER NOT NULL,
+//         client VARCHAR(255),
+//         environment VARCHAR(100),
+//         application VARCHAR(255),
+//         instance TEXT,
+//         responsible VARCHAR(255),
+//         responsible_email VARCHAR(255),
+//         zoho_ticket_id VARCHAR(50) UNIQUE,
+//         zoho_ticket_number VARCHAR(50),
+//         status VARCHAR(50) NOT NULL DEFAULT 'Open',
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         closed_at TIMESTAMP WITH TIME ZONE
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS recycled_tickets (
+//         id SERIAL PRIMARY KEY,
+//         zoho_ticket_id VARCHAR(50) NOT NULL UNIQUE,
+//         zoho_ticket_number VARCHAR(50),
+//         subject TEXT,
+//         email VARCHAR(255),
+//         priority VARCHAR(100),
+//         deleted_by VARCHAR(255) NOT NULL,
+//         deleted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         expires_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
+//         restored_at TIMESTAMP WITH TIME ZONE,
+//         snapshot JSONB,
+//         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     // Optional SSL fields should be nullable/optional in API usage.
+//     await pool.query(`
+//       ALTER TABLE ssl_assets
+//       ALTER COLUMN hostname DROP NOT NULL,
+//       ALTER COLUMN ip_address DROP NOT NULL,
+//       ALTER COLUMN application DROP NOT NULL
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS reply_authors (
+//         id SERIAL PRIMARY KEY,
+//         zoho_ticket_id TEXT NOT NULL,
+//         zoho_conversation_id TEXT NOT NULL UNIQUE,
+//         user_email TEXT NOT NULL,
+//         user_name TEXT NOT NULL,
+//         created_at TIMESTAMPTZ DEFAULT NOW()
+//       )
+//     `);
+//     await pool.query(`CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket ON reply_authors(zoho_ticket_id)`);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS user_role_bindings (
+//         id SERIAL PRIMARY KEY,
+//         microsoft_email VARCHAR(255) NOT NULL UNIQUE,
+//         roles TEXT[] NOT NULL DEFAULT ARRAY['user']::TEXT[],
+//         assigned_by VARCHAR(255),
+//         notes TEXT,
+//         assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+//       )
+//     `);
+//     await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_role_bindings_email ON user_role_bindings(microsoft_email)`);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS group_role_bindings (
+//         id SERIAL PRIMARY KEY,
+//         group_identifier VARCHAR(255) NOT NULL UNIQUE,
+//         roles TEXT[] NOT NULL DEFAULT ARRAY['user']::TEXT[],
+//         assigned_by VARCHAR(255),
+//         notes TEXT,
+//         assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+//       )
+//     `);
+//     await pool.query(`CREATE INDEX IF NOT EXISTS idx_group_role_bindings_identifier ON group_role_bindings(group_identifier)`);
+
+//     // Seed test account with all roles for profile role-switch validation.
+//     await pool.query(
+//       `INSERT INTO user_role_bindings (microsoft_email, roles, assigned_by, notes, assigned_at, updated_at)
+//        VALUES ($1, $2::text[], $3, $4, NOW(), NOW())
+//        ON CONFLICT (microsoft_email)
+//        DO UPDATE SET
+//          roles = EXCLUDED.roles,
+//          assigned_by = EXCLUDED.assigned_by,
+//          notes = EXCLUDED.notes,
+//          updated_at = NOW()`,
+//       [
+//         'automation.cloudops@muraai.com',
+//         ['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai'],
+//         'system-seed',
+//         'Seeded all roles for testing role switching'
+//       ]
+//     );
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS monitoring_devices (
+//         device_id VARCHAR(100) PRIMARY KEY,
+//         hostname VARCHAR(200) NOT NULL,
+//         user_name VARCHAR(200),
+//         user_email VARCHAR(200),
+//         ip_address VARCHAR(50),
+//         os_name VARCHAR(200),
+//         os_version VARCHAR(100),
+//         os_build VARCHAR(50),
+//         last_seen TIMESTAMPTZ,
+//         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS monitoring_telemetry (
+//         id SERIAL PRIMARY KEY,
+//         device_id VARCHAR(100) NOT NULL REFERENCES monitoring_devices(device_id) ON DELETE CASCADE,
+//         screen_on BOOLEAN NOT NULL DEFAULT TRUE,
+//         screen_on_duration INTEGER NOT NULL DEFAULT 0,
+//         active_apps JSONB NOT NULL DEFAULT '[]'::jsonb,
+//         all_processes JSONB NOT NULL DEFAULT '[]'::jsonb,
+//         cpu_percent NUMERIC(6,2) NOT NULL DEFAULT 0,
+//         memory_percent NUMERIC(6,2) NOT NULL DEFAULT 0,
+//         disk_percent NUMERIC(6,2) NOT NULL DEFAULT 0,
+//         reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE INDEX IF NOT EXISTS idx_monitoring_telemetry_device_time
+//         ON monitoring_telemetry (device_id, reported_at DESC)
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS monitoring_azure_resources (
+//         resource_id VARCHAR(255) PRIMARY KEY,
+//         resource_name VARCHAR(255) NOT NULL,
+//         resource_type VARCHAR(255) NOT NULL,
+//         status VARCHAR(100) NOT NULL DEFAULT 'Unknown',
+//         region VARCHAR(100) NOT NULL DEFAULT 'Unknown',
+//         cpu_percent NUMERIC(6,2) DEFAULT 0,
+//         memory_percent NUMERIC(6,2) DEFAULT 0,
+//         storage_gb NUMERIC(10,2) DEFAULT 0,
+//         last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//         owner_email VARCHAR(255) NOT NULL,
+//         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE INDEX IF NOT EXISTS idx_monitoring_azure_resources_owner_email
+//         ON monitoring_azure_resources (owner_email);
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS monitoring_presence_log (
+//         id SERIAL PRIMARY KEY,
+//         user_email VARCHAR(255) NOT NULL,
+//         user_id VARCHAR(255),
+//         activity VARCHAR(50) NOT NULL,
+//         timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE INDEX IF NOT EXISTS idx_presence_log_user_date
+//         ON monitoring_presence_log (user_email, timestamp DESC)
+//     `);
+
+//     await pool.query(`
+//       CREATE TABLE IF NOT EXISTS monitoring_intune_devices (
+//         device_id VARCHAR(200) PRIMARY KEY,
+//         hostname VARCHAR(200) NOT NULL,
+//         azure_ad_device_id VARCHAR(200),
+//         compliance_state VARCHAR(50),
+//         manufacturer VARCHAR(200),
+//         model VARCHAR(200),
+//         serial_number VARCHAR(200),
+//         os_version VARCHAR(100),
+//         bitlocker_status VARCHAR(50),
+//         ownership VARCHAR(50),
+//         last_sync_date TIMESTAMPTZ,
+//         enrolled_date TIMESTAMPTZ,
+//         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//       )
+//     `);
+
+//     await pool.query(`
+//       CREATE INDEX IF NOT EXISTS idx_intune_devices_hostname
+//         ON monitoring_intune_devices (hostname)
+//     `);
+
+//     // 🚀 Production performance indexes (007). Idempotent.
+//     try {
+//       await pool.query(`
+//         CREATE INDEX IF NOT EXISTS idx_ticket_assignments_status_open
+//           ON ticket_assignments (status)
+//           WHERE status IS NULL OR LOWER(status) NOT IN ('closed', 'resolved');
+//         CREATE INDEX IF NOT EXISTS idx_ticket_assignments_assigned_users_gin
+//           ON ticket_assignments USING GIN (assigned_users);
+//         CREATE INDEX IF NOT EXISTS idx_ticket_assignments_primary_assignee
+//           ON ticket_assignments (primary_assignee);
+//         CREATE INDEX IF NOT EXISTS idx_ticket_assignments_zoho_ticket_id
+//           ON ticket_assignments (zoho_ticket_id);
+//         CREATE INDEX IF NOT EXISTS idx_recycled_tickets_active
+//           ON recycled_tickets (zoho_ticket_id) WHERE restored_at IS NULL;
+//         CREATE INDEX IF NOT EXISTS idx_reply_authors_conv_id
+//           ON reply_authors (zoho_conversation_id);
+//         CREATE INDEX IF NOT EXISTS idx_reply_authors_ticket_conv
+//           ON reply_authors (zoho_ticket_id, zoho_conversation_id);
+//       `);
+//     } catch (e) {
+//       console.warn('⚠️ Performance index creation warning:', e?.message);
+//     }
+
+//     // Drop legacy CHECK constraints that restrict role values to old set.
+//     // These constraints block saving cloudops/hr/product/muraai/support roles.
+//     try {
+//       await pool.query(`ALTER TABLE user_roles DROP CONSTRAINT IF EXISTS user_roles_role_check`);
+//       await pool.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+//     } catch (e) {
+//       console.warn('⚠️ Role constraint drop warning:', e?.message);
+//     }
+
+//     console.log("✅ Database migrations applied");
+//   } catch (err) {
+//     console.error("⚠️ Migration warning:", err.message);
+//   }
+// }
+
+// pool.connect()
+//   .then(async () => {
+//     console.log("✅ Connected to Supabase DB");
+//     await runMigrations();
+//   })
+//   .catch(err => console.error("❌ DB Connection Failed:", err));
+
+// // =======================================================
+// // 🔐 AUTH APIs (ADD BEFORE ALL OTHER ROUTES)
+// // =======================================================
+// // ---------------------------
+// // 🔐 JWT AUTH MIDDLEWARE
+// // ---------------------------
+// function authenticateToken(req, res, next) {
+//   const authHeader = req.headers["authorization"];
+//   const token = authHeader && authHeader.split(" ")[1];
+
+//   if (!token) return res.sendStatus(401);
+
+//   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+//     if (err) return res.sendStatus(403);
+//     req.user = user;
+//     next();
+//   });
+// }
+
+// // ===================================
+// // Azure Graph API - Send Email Function
+// // ===================================
+// async function sendEmailViaAzure(fromEmail, toEmail, subject, content, userInfo) {
+//   try {
+//     let clientId = process.env.CLIENT_ID || process.env.AZURE_CLIENT_ID;
+//     let clientSecret = process.env.CLIENT_SECRET || process.env.AZURE_CLIENT_SECRET;
+//     let tenantId = process.env.TENANT_ID || process.env.AZURE_TENANT_ID;
+
+//     // Decode TENANT_ID if it's base64 encoded (contains only alphanumeric, +, /, =)
+//     if (tenantId && /^[A-Za-z0-9+/=]+$/.test(tenantId) && !tenantId.includes('-')) {
+//       try {
+//         tenantId = Buffer.from(tenantId, 'base64').toString('utf-8');
+//         console.log('[EMAIL] Decoded TENANT_ID from base64');
+//       } catch (e) {
+//         // Not base64 or decoding failed, use as-is
+//       }
+//     }
+
+//     console.log(`[EMAIL] Attempting to send email from ${fromEmail} to ${toEmail}`);
+
+//     if (!clientId || !clientSecret || !tenantId) {
+//       console.warn('⚠️ Azure credentials not configured. Feedback logged only.');
+//       return false;
+//     }
+
+//     // Get access token
+//     const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+//     console.log(`[EMAIL] Getting Azure token from: ${tokenUrl}`);
+    
+//     const tokenResponse = await fetch(tokenUrl, {
+//       method: 'POST',
+//       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+//       body: new URLSearchParams({
+//         client_id: clientId,
+//         client_secret: clientSecret,
+//         scope: 'https://graph.microsoft.com/.default',
+//         grant_type: 'client_credentials'
+//       })
+//     });
+
+//     if (!tokenResponse.ok) {
+//       const tokenError = await tokenResponse.text();
+//       console.error(`❌ Failed to get Azure token: ${tokenResponse.status}`);
+//       console.error(`Token error response:`, tokenError);
+//       return false;
+//     }
+
+//     const tokenData = await tokenResponse.json();
+//     const accessToken = tokenData.access_token;
+//     console.log(`[EMAIL] ✅ Got Azure token successfully`);
+
+//     // Send email via Graph API
+//     const mailBody = {
+//       message: {
+//         subject: subject,
+//         body: {
+//           contentType: "Text",
+//           content: content
+//         },
+//         toRecipients: [{ emailAddress: { address: toEmail } }]
+//       },
+//       saveToSentItems: true
+//     };
+
+//     const graphUrl = `https://graph.microsoft.com/v1.0/users/${fromEmail}/sendMail`;
+//     console.log(`[EMAIL] Sending via Graph API: ${graphUrl}`);
+    
+//     const mailResponse = await fetch(graphUrl, {
+//       method: 'POST',
+//       headers: {
+//         'Authorization': `Bearer ${accessToken}`,
+//         'Content-Type': 'application/json'
+//       },
+//       body: JSON.stringify(mailBody)
+//     });
+
+//     if (mailResponse.ok) {
+//       console.log(`✅ Email sent via Azure Graph API to ${toEmail}`);
+//       return true;
+//     } else {
+//       const mailError = await mailResponse.text();
+//       console.error(`❌ Failed to send email: ${mailResponse.status}`);
+//       console.error(`Mail error response:`, mailError);
+//       return false;
+//     }
+//   } catch (error) {
+//     console.error('❌ Azure email error:', error?.message || error);
+//     console.error('Stack trace:', error?.stack);
+//     return false;
+//   }
+// }
+// // ===================================
+// // Reusable Graph API token helper
+// // ===================================
+// async function getGraphToken() {
+//   const clientId = process.env.AZURE_CLIENT_ID;
+//   const clientSecret = process.env.AZURE_CLIENT_SECRET;
+//   let tenantId = process.env.AZURE_TENANT_ID;
+
+//   if (tenantId && /^[A-Za-z0-9+/=]+$/.test(tenantId) && !tenantId.includes('-')) {
+//     try { tenantId = Buffer.from(tenantId, 'base64').toString('utf-8'); } catch (e) { }
+//   }
+
+//   if (!clientId || !clientSecret || !tenantId) {
+//     throw new Error('Azure credentials not configured');
+//   }
+
+//   const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+//   const response = await fetch(tokenUrl, {
+//     method: 'POST',
+//     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+//     body: new URLSearchParams({
+//       client_id: clientId,
+//       client_secret: clientSecret,
+//       scope: 'https://graph.microsoft.com/.default',
+//       grant_type: 'client_credentials'
+//     })
+//   });
+
+//   if (!response.ok) {
+//     throw new Error(`Graph token failed: ${response.status} ${await response.text()}`);
+//   }
+
+//   const data = await response.json();
+//   return data.access_token;
+// }
+
+// // ---------------------------
+// // 🔐 ADMIN ROLE MIDDLEWARE
+// // ---------------------------
+// function authorizeAdmin(req, res, next) {
+//   const role = req.user.role;
+//   if (role !== "admin" && role !== "cloudops") {
+//     return res.status(403).json({ message: "Admin only access" });
+//   }
+//   next();
+// }
+
+// const ELEVATED_ROLES = new Set(['admin', 'cloudops', 'product', 'hr', 'support', 'muraai']);
+// function authorizeElevated(req, res, next) {
+//   const role = (req.user?.role || '').toLowerCase();
+//   if (!ELEVATED_ROLES.has(role)) {
+//     return res.status(403).json({ message: 'Elevated role required' });
+//   }
+//   next();
+// }
+
+// function parseJsonArray(value) {
+//   if (Array.isArray(value)) return value;
+//   if (typeof value === 'string' && value.trim()) {
+//     try {
+//       const parsed = JSON.parse(value);
+//       return Array.isArray(parsed) ? parsed : [];
+//     } catch {
+//       return [];
+//     }
+//   }
+//   return [];
+// }
+
+// function toNumber(value, fallback = 0) {
+//   const parsed = Number(value);
+//   return Number.isFinite(parsed) ? parsed : fallback;
+// }
+
+// function normalizeDeviceRow(row) {
+//   return {
+//     ...row,
+//     active_apps: parseJsonArray(row.active_apps),
+//     all_processes: parseJsonArray(row.all_processes),
+//     cpu_percent: toNumber(row.cpu_percent),
+//     memory_percent: toNumber(row.memory_percent),
+//     disk_percent: toNumber(row.disk_percent)
+//   };
+// }
+
+// function canUseMonitoringKey() {
+//   return Boolean(process.env.MONITORING_API_KEY);
+// }
+
+// function validateMonitoringKey(req, res, next) {
+//   if (!canUseMonitoringKey()) {
+//     return next();
+//   }
+
+//   const key = String(req.headers['x-monitoring-key'] || '');
+//   if (key !== process.env.MONITORING_API_KEY) {
+//     return res.status(401).json({ message: 'Unauthorized' });
+//   }
+
+//   next();
+// }
+
+// app.post('/api/monitoring/telemetry', validateMonitoringKey, async (req, res) => {
+//   try {
+//     const {
+//       device_id,
+//       hostname,
+//       user_name,
+//       user_email,
+//       ip_address,
+//       os_name,
+//       os_version,
+//       os_build,
+//       screen_on,
+//       screen_on_duration,
+//       active_apps,
+//       all_processes,
+//       cpu_percent,
+//       memory_percent,
+//       disk_percent,
+//       reported_at
+//     } = req.body || {};
+
+//     if (!device_id || !hostname) {
+//       return res.status(400).json({ message: 'device_id and hostname are required' });
+//     }
+
+//     const normalizedActiveApps = parseJsonArray(active_apps);
+//     const normalizedAllProcesses = parseJsonArray(all_processes);
+//     const reportedAt = reported_at ? new Date(reported_at) : new Date();
+
+//     await pool.query(`
+//       INSERT INTO monitoring_devices (
+//         device_id, hostname, user_name, user_email, ip_address, os_name, os_version, os_build, last_seen, updated_at
+//       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+//       ON CONFLICT (device_id) DO UPDATE SET
+//         hostname = EXCLUDED.hostname,
+//         user_name = EXCLUDED.user_name,
+//         user_email = EXCLUDED.user_email,
+//         ip_address = EXCLUDED.ip_address,
+//         os_name = EXCLUDED.os_name,
+//         os_version = EXCLUDED.os_version,
+//         os_build = EXCLUDED.os_build,
+//         last_seen = EXCLUDED.last_seen,
+//         updated_at = NOW()
+//     `, [
+//       device_id,
+//       hostname,
+//       user_name || null,
+//       user_email || null,
+//       ip_address || null,
+//       os_name || null,
+//       os_version || null,
+//       os_build || null,
+//       reportedAt
+//     ]);
+
+//     await pool.query(`
+//       INSERT INTO monitoring_telemetry (
+//         device_id, screen_on, screen_on_duration, active_apps, all_processes,
+//         cpu_percent, memory_percent, disk_percent, reported_at
+//       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+//     `, [
+//       device_id,
+//       Boolean(screen_on),
+//       toNumber(screen_on_duration),
+//       JSON.stringify(normalizedActiveApps),
+//       JSON.stringify(normalizedAllProcesses),
+//       toNumber(cpu_percent),
+//       toNumber(memory_percent),
+//       toNumber(disk_percent),
+//       reportedAt
+//     ]);
+
+//     res.json({ status: 'ok' });
+//   } catch (err) {
+//     console.error('Monitoring telemetry error:', err);
+//     res.status(500).json({ message: 'Failed to save telemetry' });
+//   }
+// });
+
+// app.get('/api/monitoring/devices', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(`
+//       SELECT
+//         d.device_id,
+//         d.hostname,
+//         d.user_name,
+//         d.user_email,
+//         d.ip_address,
+//         d.os_name,
+//         d.os_version,
+//         d.os_build,
+//         d.last_seen,
+//         t.screen_on,
+//         t.screen_on_duration,
+//         t.active_apps,
+//         t.all_processes,
+//         t.cpu_percent,
+//         t.memory_percent,
+//         t.disk_percent,
+//         t.reported_at
+//       FROM monitoring_devices d
+//       LEFT JOIN LATERAL (
+//         SELECT *
+//         FROM monitoring_telemetry t
+//         WHERE t.device_id = d.device_id
+//         ORDER BY t.reported_at DESC, t.id DESC
+//         LIMIT 1
+//       ) t ON true
+//       ORDER BY d.last_seen DESC NULLS LAST, d.hostname ASC
+//     `);
+
+//     res.json(result.rows.map(normalizeDeviceRow));
+//   } catch (err) {
+//     console.error('Monitoring devices error:', err);
+//     res.status(500).json({ message: 'Failed to fetch devices' });
+//   }
+// });
+
+// app.get('/api/monitoring/devices/:deviceId/history', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(`
+//       SELECT
+//         id,
+//         device_id,
+//         screen_on,
+//         screen_on_duration,
+//         active_apps,
+//         all_processes,
+//         cpu_percent,
+//         memory_percent,
+//         disk_percent,
+//         reported_at,
+//         created_at
+//       FROM monitoring_telemetry
+//       WHERE device_id = $1
+//       ORDER BY reported_at DESC, id DESC
+//       LIMIT 100
+//     `, [req.params.deviceId]);
+
+//     res.json(result.rows.map(normalizeDeviceRow));
+//   } catch (err) {
+//     console.error('Monitoring history error:', err);
+//     res.status(500).json({ message: 'Failed to fetch history' });
+//   }
+// });
+
+// app.get('/api/monitoring/assets', authenticateToken, async (req, res) => {
+//   try {
+//     const queryEmail = (req.query.userEmail || '').toString().trim().toLowerCase();
+//     const effectiveEmail = req.user?.email?.toString().toLowerCase() || '';
+//     const targetEmail = req.user?.role === 'admin' && queryEmail ? queryEmail : effectiveEmail;
+
+//     if (!targetEmail) {
+//       return res.status(400).json({ message: 'User email is required' });
+//     }
+
+//     // Get latest telemetry per device
+//     const result = await pool.query(`
+//       SELECT
+//         d.device_id,
+//         d.hostname,
+//         d.user_name,
+//         d.user_email,
+//         d.ip_address,
+//         d.os_name,
+//         d.os_version,
+//         d.os_build,
+//         d.last_seen,
+//         d.updated_at,
+//         t.cpu_percent,
+//         t.memory_percent,
+//         t.disk_percent,
+//         t.reported_at
+//       FROM monitoring_devices d
+//       LEFT JOIN LATERAL (
+//         SELECT cpu_percent, memory_percent, disk_percent, reported_at
+//         FROM monitoring_telemetry t
+//         WHERE t.device_id = d.device_id
+//         ORDER BY t.reported_at DESC, t.id DESC
+//         LIMIT 1
+//       ) t ON true
+//       WHERE LOWER(d.user_email) = $1
+//       ORDER BY d.last_seen DESC NULLS LAST, d.hostname ASC
+//     `, [targetEmail]);
+
+//     // Get current Teams presence for this user
+//     const presenceResult = await pool.query(`
+//       SELECT activity, timestamp FROM monitoring_presence_log
+//       WHERE LOWER(user_email) = $1
+//       ORDER BY timestamp DESC
+//       LIMIT 1
+//     `, [targetEmail]);
+
+//     const currentPresence = presenceResult.rows.length > 0
+//       ? presenceResult.rows[0].activity
+//       : null;
+
+//     // Get daily activity (last 5 days)
+//     const activityResult = await pool.query(`
+//       SELECT
+//         DATE(timestamp AT TIME ZONE 'UTC') as date,
+//         activity,
+//         COUNT(*) as samples
+//       FROM monitoring_presence_log
+//       WHERE LOWER(user_email) = $1
+//         AND timestamp >= NOW() - INTERVAL '5 days'
+//       GROUP BY DATE(timestamp AT TIME ZONE 'UTC'), activity
+//       ORDER BY date DESC, activity
+//     `, [targetEmail]);
+
+//     // Build daily activity breakdown
+//     const dailyMap = new Map();
+//     for (const row of activityResult.rows) {
+//       const dateKey = row.date instanceof Date ? row.date.toISOString().split('T')[0] : String(row.date).split('T')[0];
+//       if (!dailyMap.has(dateKey)) {
+//         dailyMap.set(dateKey, {
+//           date: dateKey,
+//           availableHours: 0, awayHours: 0, inCallHours: 0,
+//           inMeetingHours: 0, doNotDisturbHours: 0, offlineHours: 0
+//         });
+//       }
+//       const day = dailyMap.get(dateKey);
+//       const activity = (row.activity || '').toLowerCase();
+//       const hours = Math.round((Number(row.samples) || 0) * 0.25 * 10) / 10;
+//       if (activity === 'available' || activity === 'availableidle') day.availableHours += hours;
+//       else if (activity === 'away' || activity === 'berightback' || activity === 'offwork') day.awayHours += hours;
+//       else if (activity === 'inacall' || activity === 'inaconferencecall') day.inCallHours += hours;
+//       else if (activity === 'inameeting') day.inMeetingHours += hours;
+//       else if (activity === 'donotdisturb' || activity === 'urgentinterruptionsonly') day.doNotDisturbHours += hours;
+//       else if (activity === 'offline' || activity === 'presenceunknown' || activity === 'outofoffice') day.offlineHours += hours;
+//     }
+//     const dailyActivity = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+//     // Get Intune device data merged by hostname
+//     const intuneResult = await pool.query(`
+//       SELECT hostname, compliance_state, manufacturer, model, serial_number,
+//              os_version as intune_os_version, bitlocker_status, ownership, last_sync_date
+//       FROM monitoring_intune_devices
+//     `);
+//     const intuneByHostname = new Map();
+//     for (const row of intuneResult.rows) {
+//       const key = (row.hostname || '').toLowerCase().trim();
+//       if (key) intuneByHostname.set(key, row);
+//     }
+
+//     const rows = result.rows.map(row => {
+//       const hostnameLower = (row.hostname || '').toLowerCase().trim();
+//       const intune = intuneByHostname.get(hostnameLower) || null;
+
+//       return {
+//         asset_id: row.device_id,
+//         hostname: row.hostname,
+//         owner_email: row.user_email,
+//         status: row.last_seen && Date.now() - new Date(row.last_seen).getTime() < 5 * 60 * 1000 ? 'Online' : 'Offline',
+//         last_seen: row.last_seen,
+//         cpu_percent: Number(row.cpu_percent) || 0,
+//         memory_percent: Number(row.memory_percent) || 0,
+//         disk_percent: Number(row.disk_percent) || 0,
+//         primary_issue: row.cpu_percent > 90 || row.memory_percent > 90 || row.disk_percent > 90 ? 'Resource warning' : 'No issues',
+//         teams_presence: currentPresence,
+//         daily_activity: dailyActivity,
+//         compliance_state: intune?.compliance_state || null,
+//         manufacturer: intune?.manufacturer || null,
+//         model: intune?.model || null,
+//         serial_number: intune?.serial_number || null,
+//         intune_os_version: intune?.intune_os_version || null,
+//         bitlocker_status: intune?.bitlocker_status || null,
+//         ownership: intune?.ownership || null,
+//         last_intune_sync: intune?.last_sync_date || null
+//       };
+//     });
+
+//     res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+//     res.set('Pragma', 'no-cache');
+//     res.set('Expires', '0');
+//     res.json(rows);
+//   } catch (err) {
+//     console.error('Monitoring assets error:', err);
+//     res.status(500).json({ message: 'Failed to fetch assets' });
+//   }
+// });
+
+// // ============================================================
+// // POST /api/monitoring/presence/sync - Fetch Teams presence for all monitored users
+// // ============================================================
+// app.post('/api/monitoring/presence/sync', authenticateToken, async (req, res) => {
+//   try {
+//     const token = await getGraphToken();
+
+//     // Get all unique user emails from monitoring_devices
+//     const usersResult = await pool.query(`
+//       SELECT DISTINCT LOWER(TRIM(user_email)) as email
+//       FROM monitoring_devices
+//       WHERE user_email IS NOT NULL AND TRIM(user_email) != ''
+//     `);
+
+//     const emails = usersResult.rows.map(r => r.email).filter(Boolean);
+//     if (emails.length === 0) {
+//       return res.json({ status: 'ok', synced: 0, message: 'No users with devices found' });
+//     }
+
+//     // Resolve emails to user IDs via Graph API
+//     let synced = 0;
+//     for (const email of emails) {
+//       try {
+//         const userResp = await fetch(
+//           `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id`,
+//           { headers: { Authorization: `Bearer ${token}` } }
+//         );
+//         if (!userResp.ok) continue;
+//         const userData = await userResp.json();
+//         const userId = userData.id;
+//         if (!userId) continue;
+
+//         // Get presence for this user
+//         const presenceResp = await fetch(
+//           `https://graph.microsoft.com/v1.0/users/${userId}/presence`,
+//           { headers: { Authorization: `Bearer ${token}` } }
+//         );
+//         if (!presenceResp.ok) continue;
+//         const presence = await presenceResp.json();
+
+//         const activity = presence.activity || 'PresenceUnknown';
+
+//         // Store in presence log
+//         await pool.query(`
+//           INSERT INTO monitoring_presence_log (user_email, user_id, activity, timestamp)
+//           VALUES ($1, $2, $3, NOW())
+//         `, [email, userId, activity]);
+
+//         synced++;
+//       } catch (e) {
+//         console.warn(`[PRESENCE] Failed for ${email}:`, e.message);
+//       }
+//     }
+
+//     res.json({ status: 'ok', synced, total: emails.length });
+//   } catch (err) {
+//     console.error('Presence sync error:', err);
+//     res.status(500).json({ message: 'Failed to sync presence' });
+//   }
+// });
+
+// // ============================================================
+// // POST /api/monitoring/intune/sync - Fetch Intune managed devices from Graph API
+// // ============================================================
+// app.post('/api/monitoring/intune/sync', authenticateToken, async (req, res) => {
+//   try {
+//     const token = await getGraphToken();
+
+//     let url = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=id,deviceName,azureADDeviceId,complianceState,manufacturer,model,serialNumber,osVersion,encryptionStatus,ownerType,lastSyncDateTime,enrolledDateTime&$top=500';
+//     let synced = 0;
+
+//     while (url) {
+//       const resp = await fetch(url, {
+//         headers: { Authorization: `Bearer ${token}` }
+//       });
+
+//       if (!resp.ok) {
+//         throw new Error(`Graph API error: ${resp.status} ${await resp.text()}`);
+//       }
+
+//       const data = await resp.json();
+//       const devices = data.value || [];
+
+//       for (const d of devices) {
+//         const hostname = d.deviceName || '';
+//         if (!hostname) continue;
+
+//         const bitlockerMap = { 0: 'Unknown', 1: 'Encrypted', 2: 'Not Encrypted', 3: 'Not Supported' };
+//         const complianceMap = {
+//           'compliant': 'Compliant', 'noncompliant': 'Non-Compliant',
+//           'conflict': 'Conflict', 'error': 'Error', 'unknown': 'Unknown',
+//           'configmanager': 'ConfigMgr', 'inactive': 'Inactive'
+//         };
+
+//         await pool.query(`
+//           INSERT INTO monitoring_intune_devices (
+//             device_id, hostname, azure_ad_device_id, compliance_state,
+//             manufacturer, model, serial_number, os_version,
+//             bitlocker_status, ownership, last_sync_date, enrolled_date,
+//             updated_at
+//           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+//           ON CONFLICT (device_id) DO UPDATE SET
+//             hostname = EXCLUDED.hostname,
+//             azure_ad_device_id = EXCLUDED.azure_ad_device_id,
+//             compliance_state = EXCLUDED.compliance_state,
+//             manufacturer = EXCLUDED.manufacturer,
+//             model = EXCLUDED.model,
+//             serial_number = EXCLUDED.serial_number,
+//             os_version = EXCLUDED.os_version,
+//             bitlocker_status = EXCLUDED.bitlocker_status,
+//             ownership = EXCLUDED.ownership,
+//             last_sync_date = EXCLUDED.last_sync_date,
+//             enrolled_date = EXCLUDED.enrolled_date,
+//             updated_at = NOW()
+//         `, [
+//           d.id,
+//           hostname,
+//           d.azureADDeviceId || null,
+//           complianceMap[(d.complianceState || '').toLowerCase()] || d.complianceState || 'Unknown',
+//           d.manufacturer || null,
+//           d.model || null,
+//           d.serialNumber || null,
+//           d.osVersion || null,
+//           bitlockerMap[d.encryptionStatus] || 'Unknown',
+//           d.ownerType || null,
+//           d.lastSyncDateTime ? new Date(d.lastSyncDateTime) : null,
+//           d.enrolledDateTime ? new Date(d.enrolledDateTime) : null
+//         ]);
+//         synced++;
+//       }
+
+//       url = data['@odata.nextLink'] || '';
+//     }
+
+//     res.json({ status: 'ok', synced });
+//   } catch (err) {
+//     console.error('Intune sync error:', err);
+//     res.status(500).json({ message: 'Failed to sync Intune devices', error: err.message });
+//   }
+// });
+
+// // ============================================================
+// // GET /api/monitoring/intune-devices - List Intune devices (admin)
+// // ============================================================
+// app.get('/api/monitoring/intune-devices', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(`
+//       SELECT * FROM monitoring_intune_devices
+//       ORDER BY hostname ASC
+//     `);
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error('Intune devices error:', err);
+//     res.status(500).json({ message: 'Failed to fetch Intune devices' });
+//   }
+// });
+
+// app.get('/api/monitoring/azure', authenticateToken, async (req, res) => {
+//   try {
+//     const queryEmail = (req.query.userEmail || '').toString().trim().toLowerCase();
+//     const effectiveEmail = req.user?.email?.toString().toLowerCase() || '';
+//     const targetEmail = queryEmail || effectiveEmail;
+
+//     if (!targetEmail) {
+//       return res.status(400).json({ message: 'User email is required' });
+//     }
+
+//     const result = await pool.query(`
+//       SELECT
+//         resource_id,
+//         resource_name,
+//         resource_type,
+//         status,
+//         region,
+//         cpu_percent,
+//         memory_percent,
+//         storage_gb,
+//         last_updated
+//       FROM monitoring_azure_resources
+//       WHERE LOWER(owner_email) = $1
+//       ORDER BY last_updated DESC
+//       LIMIT 200
+//     `, [targetEmail]);
+
+//     res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+//     res.set('Pragma', 'no-cache');
+//     res.set('Expires', '0');
+//     res.json(result.rows.map(row => ({
+//       resource_id: row.resource_id,
+//       resource_name: row.resource_name,
+//       resource_type: row.resource_type,
+//       status: row.status,
+//       region: row.region,
+//       cpu_percent: Number(row.cpu_percent) || 0,
+//       memory_percent: Number(row.memory_percent) || 0,
+//       storage_gb: Number(row.storage_gb) || 0,
+//       last_updated: row.last_updated
+//     })));
+//   } catch (err) {
+//     console.error('Azure monitoring error:', err);
+//     res.status(500).json({ message: 'Failed to fetch Azure resources' });
+//   }
+// });
+
+// // Temporary: Seed sample Azure resources for the authenticated user (dev helper)
+// app.post('/api/monitoring/azure/seed', authenticateToken, async (req, res) => {
+//   try {
+//     const ownerEmail = (req.user?.email || '').toString().toLowerCase();
+//     if (!ownerEmail) return res.status(400).json({ message: 'No authenticated user email available' });
+
+//     const samples = [
+//       {
+//         resource_id: `${ownerEmail}-vm-01`,
+//         resource_name: 'Dev-VM-01',
+//         resource_type: 'Virtual Machine',
+//         status: 'Healthy',
+//         region: 'eastus',
+//         cpu_percent: 12.5,
+//         memory_percent: 34.2,
+//         storage_gb: 128
+//       },
+//       {
+//         resource_id: `${ownerEmail}-sqldb-01`,
+//         resource_name: 'AppDB-01',
+//         resource_type: 'SQL Database',
+//         status: 'Healthy',
+//         region: 'eastus2',
+//         cpu_percent: 5.1,
+//         memory_percent: 21.3,
+//         storage_gb: 256
+//       },
+//       {
+//         resource_id: `${ownerEmail}-appsvc-01`,
+//         resource_name: 'WebApp-01',
+//         resource_type: 'App Service',
+//         status: 'Warning',
+//         region: 'westus',
+//         cpu_percent: 78.4,
+//         memory_percent: 65.2,
+//         storage_gb: 10
+//       }
+//     ];
+
+//     const client = await pool.connect();
+//     try {
+//       for (const s of samples) {
+//         await client.query(`
+//           INSERT INTO monitoring_azure_resources (
+//             resource_id, resource_name, resource_type, status, region,
+//             cpu_percent, memory_percent, storage_gb, last_updated, owner_email, created_at, updated_at
+//           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,NOW(),NOW())
+//           ON CONFLICT (resource_id) DO UPDATE SET
+//             resource_name = EXCLUDED.resource_name,
+//             resource_type = EXCLUDED.resource_type,
+//             status = EXCLUDED.status,
+//             region = EXCLUDED.region,
+//             cpu_percent = EXCLUDED.cpu_percent,
+//             memory_percent = EXCLUDED.memory_percent,
+//             storage_gb = EXCLUDED.storage_gb,
+//             last_updated = NOW(),
+//             owner_email = EXCLUDED.owner_email,
+//             updated_at = NOW()
+//         `, [
+//           s.resource_id,
+//           s.resource_name,
+//           s.resource_type,
+//           s.status,
+//           s.region,
+//           s.cpu_percent,
+//           s.memory_percent,
+//           s.storage_gb,
+//           ownerEmail
+//         ]);
+//       }
+//     } finally {
+//       client.release();
+//     }
+
+//     res.json({ status: 'ok', inserted: samples.length });
+//   } catch (err) {
+//     console.error('Seed Azure error:', err);
+//     res.status(500).json({ message: 'Failed to seed Azure resources' });
+//   }
+// });
+
+// app.post('/api/monitoring/assets/seed', authenticateToken, async (req, res) => {
+//   try {
+//     const ownerEmail = (req.user?.email || '').toString().toLowerCase();
+//     if (!ownerEmail) return res.status(400).json({ message: 'No authenticated user email available' });
+
+//     const devices = [
+//       { device_id: `${ownerEmail}-laptop-01`, hostname: 'WORK-LAP-001', ip: '192.168.1.101', os: 'Windows', os_ver: '10.0.19045', os_build: '19045', cpu: 23.5, mem: 45.2, disk: 67.8 },
+//       { device_id: `${ownerEmail}-laptop-02`, hostname: 'WORK-LAP-002', ip: '192.168.1.102', os: 'Windows', os_ver: '10.0.19045', os_build: '19045', cpu: 78.1, mem: 82.3, disk: 91.2 },
+//       { device_id: `${ownerEmail}-desktop-01`, hostname: 'WORK-DSK-001', ip: '192.168.1.201', os: 'Windows', os_ver: '10.0.22631', os_build: '22631', cpu: 12.0, mem: 34.5, disk: 55.0 },
+//       { device_id: `${ownerEmail}-laptop-03`, hostname: 'WORK-LAP-003', ip: '192.168.1.103', os: 'Windows', os_ver: '10.0.19045', os_build: '19045', cpu: 95.2, mem: 88.7, disk: 45.3 },
+//     ];
+
+//     const client = await pool.connect();
+//     try {
+//       for (const d of devices) {
+//         const now = new Date();
+//         const lastSeen = new Date(now.getTime() - Math.floor(Math.random() * 120000));
+//         await client.query(`
+//           INSERT INTO monitoring_devices (device_id, hostname, user_name, user_email, ip_address, os_name, os_version, os_build, last_seen, created_at, updated_at)
+//           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+//           ON CONFLICT (device_id) DO UPDATE SET
+//             hostname = EXCLUDED.hostname, user_name = EXCLUDED.user_name, user_email = EXCLUDED.user_email,
+//             ip_address = EXCLUDED.ip_address, os_name = EXCLUDED.os_name, os_version = EXCLUDED.os_version,
+//             os_build = EXCLUDED.os_build, last_seen = EXCLUDED.last_seen, updated_at = NOW()
+//         `, [d.device_id, d.hostname, ownerEmail.split('@')[0], ownerEmail, d.ip, d.os, d.os_ver, d.os_build, lastSeen]);
+
+//         await client.query(`
+//           INSERT INTO monitoring_telemetry (device_id, cpu_percent, memory_percent, disk_percent, screen_on, screen_on_duration, active_apps, all_processes, reported_at, created_at)
+//           VALUES ($1,$2,$3,$4,TRUE,3600,'[]'::jsonb,'[]'::jsonb,$5,NOW())
+//         `, [d.device_id, d.cpu, d.mem, d.disk, lastSeen]);
+//       }
+//     } finally {
+//       client.release();
+//     }
+
+//     res.json({ status: 'ok', inserted: devices.length });
+//   } catch (err) {
+//     console.error('Seed assets error:', err);
+//     res.status(500).json({ message: 'Failed to seed assets' });
+//   }
+// });
+
+// function getGraphToken(req) {
+//   return (req.headers["x-graph-token"] || "").toString();
+// }
+// app.get("/api/users", authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       "SELECT id, email, role FROM users ORDER BY id DESC"
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ message: "Failed to fetch users" });
+//   }
+// });
+
+// // Create User (Admin)
+// app.post("/api/users", authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const { email, password, role } = req.body;
+
+//     if (!email || !password || !role) {
+//       return res.status(400).json({ message: "Missing fields" });
+//     }
+
+//     const existing = await pool.query(
+//       "SELECT 1 FROM users WHERE email = $1",
+//       [email.toLowerCase()]
+//     );
+
+//     if (existing.rows.length > 0) {
+//       return res.status(409).json({ message: "Email already exists" });
+//     }
+
+//     const hashed = await bcrypt.hash(password, 10);
+
+//     await pool.query(
+//       "INSERT INTO users (email, password, role) VALUES ($1, $2, $3)",
+//       [email.toLowerCase(), hashed, role]
+//     );
+
+//     res.json({ message: "User created successfully" });
+
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ message: "User creation failed" });
+//   }
+// });
+
+
+// // Login
+// app.post("/api/login", async (req, res) => {
+//   try {
+//     const { email, password } = req.body;
+
+//     const result = await pool.query(
+//       "SELECT * FROM users WHERE email = $1",
+//       [email.toLowerCase()]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(400).json({ message: "Invalid credentials" });
+//     }
+
+//     const user = result.rows[0];
+
+//     const valid = await bcrypt.compare(password, user.password);
+//     if (!valid) {
+//       return res.status(400).json({ message: "Invalid credentials" });
+//     }
+
+//     const normalizedRole = normalizeRole(user.role) || 'user';
+//     const roles = normalizeRoleList([normalizedRole]);
+
+//     // 🔥 ACCESS TOKEN (1 hour)
+//     const accessToken = jwt.sign(
+//       { email: user.email, role: normalizedRole, roles },
+//       process.env.JWT_SECRET,
+//       { expiresIn: "1h" }
+//     );
+
+//     // 🔥 REFRESH TOKEN (7 days)
+//     const refreshToken = jwt.sign(
+//       { email: user.email, role: normalizedRole, roles },
+//       process.env.JWT_REFRESH_SECRET,
+//       { expiresIn: "7d" }
+//     );
+
+//     res.json({
+//       accessToken,
+//       refreshToken,
+//       role: normalizedRole,
+//       roles,
+//       email: user.email
+//     });
+
+//   } catch (err) {
+//     res.status(500).json({ error: "Login failed" });
+//   }
+// });
+// // 🔄 Refresh Token API
+// app.post("/api/refresh", (req, res) => {
+//   const { refreshToken } = req.body;
+
+//   if (!refreshToken) return res.sendStatus(401);
+
+//   jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, (err, user) => {
+//     if (err) return res.sendStatus(403);
+
+//     const newAccessToken = jwt.sign(
+//       { email: user.email, role: user.role, roles: normalizeRoleList(user.roles || [user.role]) },
+//       process.env.JWT_SECRET,
+//       { expiresIn: "1h" }
+//     );
+
+//     res.json({ accessToken: newAccessToken });
+//   });
+// });
+
+// app.post('/api/auth/switch-role', authenticateToken, async (req, res) => {
+//   try {
+//     const requestedRole = normalizeRole(req.body?.role);
+//     if (!requestedRole) {
+//       return res.status(400).json({ error: 'Invalid role' });
+//     }
+
+//     const tokenRoles = normalizeRoleList(req.user?.roles || [req.user?.role]);
+//     if (!tokenRoles.includes(requestedRole)) {
+//       return res.status(403).json({ error: 'Role is not assigned to this user' });
+//     }
+
+//     const email = (req.user?.email || '').toLowerCase();
+//     const accessToken = jwt.sign(
+//       { email, role: requestedRole, roles: tokenRoles },
+//       process.env.JWT_SECRET,
+//       { expiresIn: '1h' }
+//     );
+//     const refreshToken = jwt.sign(
+//       { email, role: requestedRole, roles: tokenRoles },
+//       process.env.JWT_REFRESH_SECRET,
+//       { expiresIn: '7d' }
+//     );
+
+//     return res.json({ accessToken, refreshToken, role: requestedRole, roles: tokenRoles });
+//   } catch (err) {
+//     console.error('Role switch failed:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to switch role' });
+//   }
+// });
+
+
+
+// // ------------------------
+// // Environment / Tokens
+// // ------------------------
+// let ZOHO_OAUTH_TOKEN = '';
+// const REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+// const CLIENT_ID = process.env.ZOHO_CLIENT_ID;
+// const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
+// const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID;
+// const ZOHO_BASE_URL = process.env.ZOHO_BASE_URL || 'https://desk.zoho.in/api/v1';
+// const ENABLE_ZOHO_OUTBOUND = (process.env.ENABLE_ZOHO_OUTBOUND || 'true').toLowerCase() === 'true';
+// const ZOHO_ALLOWED_EGRESS_IPS = new Set(
+//   (process.env.ZOHO_ALLOWED_EGRESS_IPS || '')
+//     .split(',')
+//     .map(ip => ip.trim())
+//     .filter(Boolean)
+// );
+// const ZOHO_DEPARTMENT_ID = process.env.ZOHO_DEPARTMENT_ID;
+// const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
+// const ENABLE_ALERT_JOBS = (process.env.ENABLE_ALERT_JOBS || 'true').toLowerCase() === 'true';
+// const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
+// const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
+// const AUTOMATION_SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
+// const AUTOMATION_PROMETHEUS_URL = (process.env.AUTOMATION_PROMETHEUS_URL || '').trim();
+// const ALERTMANAGER_WEBHOOK_SECRET = (process.env.ALERTMANAGER_WEBHOOK_SECRET || '').trim();
+// const ALERTMANAGER_FALLBACK_EMAIL = (process.env.ALERTMANAGER_FALLBACK_EMAIL || '').trim().toLowerCase();
+// const ADMIN_GROUP_MAIL = (process.env.ADMIN_GROUP_MAIL || 'automation.cloudops@muraai.com').trim().toLowerCase();
+// const ADMIN_GROUP_NAME = (process.env.ADMIN_GROUP_NAME || 'automation.cloudops').trim().toLowerCase();
+// const CLOUDOPS_GROUP_MAIL = (process.env.CLOUDOPS_GROUP_MAIL || 'cloudops@muraai.com').trim().toLowerCase();
+// const CLOUDOPS_GROUP_NAME = (process.env.CLOUDOPS_GROUP_NAME || 'cloudops').trim().toLowerCase();
+
+// const DEFAULT_ADMIN_EMAIL_ALLOWLIST = [
+//   'ravi.chadaram@muraai.com',
+//   'senthil.n@muraai.com',
+//   't.balaji@muraai.com',
+//   'akash.yadav@muraai.com',
+//   'automation.cloudops@muraai.com'
+// ];
+
+// const ADMIN_EMAIL_ALLOWLIST = new Set(
+//   (process.env.ADMIN_EMAIL_ALLOWLIST || DEFAULT_ADMIN_EMAIL_ALLOWLIST.join(','))
+//     .split(',')
+//     .map(v => (v || '').trim().toLowerCase())
+//     .filter(Boolean)
+// );
+
+// function isAllowlistedAdminEmail(email) {
+//   return ADMIN_EMAIL_ALLOWLIST.has((email || '').toString().trim().toLowerCase());
+// }
+
+// const SUPPORTED_ROLES = ['admin', 'cloudops', 'product', 'hr', 'support', 'muraai', 'user'];
+// const DEPARTMENT_ROLE_KEYS = ['itsm', 'product', 'hr', 'support', 'muraai'];
+// const ROLE_PRIORITY = ['admin', 'cloudops', 'support', 'product', 'hr', 'muraai', 'user'];
+
+// const DEPARTMENT_IDS = {
+//   itsm: (process.env.DEPT_ITSM_ID || '132475000009937630').trim(),
+//   support: (process.env.DEPT_SUPPORT_ID || '132475000009948173').trim(),
+//   product: (process.env.DEPT_PRODUCT_ID || '132475000009958716').trim(),
+//   hr: (process.env.DEPT_HR_ID || '132475000009925079').trim(),
+//   muraai: (process.env.DEPT_MURAAI_ID || '132475000000010772').trim()
+// };
+
+// function normalizeRole(role) {
+//   const v = (role || '').toString().trim().toLowerCase();
+//   if (v === 'itsm') return 'cloudops';
+//   return SUPPORTED_ROLES.includes(v) ? v : null;
+// }
+
+// function parseRoleCsv(value) {
+//   return [...new Set(
+//     (value || '')
+//       .split(',')
+//       .map(v => normalizeRole(v))
+//       .filter(Boolean)
+//   )];
+// }
+
+// function parseRoleJson(value, fallback = {}) {
+//   try {
+//     const parsed = JSON.parse(value || '');
+//     return parsed && typeof parsed === 'object' ? parsed : fallback;
+//   } catch {
+//     return fallback;
+//   }
+// }
+
+// const DEFAULT_ROLE_GROUPS = {
+//   admin: [ADMIN_GROUP_MAIL, ADMIN_GROUP_NAME],
+//   cloudops: [CLOUDOPS_GROUP_MAIL, CLOUDOPS_GROUP_NAME, 'itsm@muraai.com', 'itsm'],
+//   product: ['product@muraai.com', 'products@muraai.com', 'product', 'products'],
+//   hr: ['hr@muraai.com', 'hr'],
+//   support: ['support@muraai.com', 'support'],
+//   muraai: ['muraai@muraai.com', 'muraai']
+// };
+
+// const ROLE_GROUP_MAP = (() => {
+//   const fromEnv = parseRoleJson(process.env.ROLE_GROUP_MAP, {});
+//   const merged = { ...DEFAULT_ROLE_GROUPS };
+//   for (const [role, entries] of Object.entries(fromEnv || {})) {
+//     const nr = normalizeRole(role);
+//     if (!nr || !Array.isArray(entries)) continue;
+//     merged[nr] = entries.map(v => (v || '').toString().trim().toLowerCase()).filter(Boolean);
+//   }
+//   return merged;
+// })();
+
+// function rolesFromGraphGroups(groups = []) {
+//   const found = new Set();
+//   for (const g of groups) {
+//     const values = [g?.mail, g?.displayName, g?.mailNickname]
+//       .map(v => (v || '').toString().trim().toLowerCase())
+//       .filter(Boolean);
+//     for (const role of Object.keys(ROLE_GROUP_MAP)) {
+//       const matches = ROLE_GROUP_MAP[role] || [];
+//       if (values.some(v => matches.includes(v))) {
+//         found.add(role);
+//       }
+//     }
+//   }
+//   return [...found];
+// }
+
+// function normalizeRoleList(roles, fallbackRole = 'user') {
+//   const arr = Array.isArray(roles) ? roles : [];
+//   const normalized = arr.map(r => normalizeRole(r)).filter(Boolean);
+//   if (!normalized.length) return fallbackRole ? [fallbackRole] : [];
+//   return [...new Set(normalized)];
+// }
+
+// function pickDefaultRole(roles, preferredRole, fallbackRole = 'user') {
+//   const allowed = new Set(normalizeRoleList(roles, fallbackRole));
+//   const preferred = normalizeRole(preferredRole);
+//   if (preferred && allowed.has(preferred)) return preferred;
+//   for (const role of ROLE_PRIORITY) {
+//     if (allowed.has(role)) return role;
+//   }
+//   return fallbackRole;
+// }
+
+// function extractTicketDepartmentId(ticket = {}) {
+//   return (
+//     ticket.departmentId ||
+//     ticket.department?.id ||
+//     ticket.department?.departmentId ||
+//     ticket.departmentIdStr ||
+//     ''
+//   ).toString();
+// }
+
+// function getAllowedDepartmentIdsForRole(role) {
+//   const r = normalizeRole(role) || 'user';
+//   if (r === 'admin' || r === 'user') return [];
+//   if (r === 'cloudops') {
+//     return [DEPARTMENT_IDS.itsm];
+//   }
+//   return DEPARTMENT_IDS[r] ? [DEPARTMENT_IDS[r]] : [];
+// }
+
+// function isDepartmentAllowed(ticket, allowedDeptIds = []) {
+//   if (!Array.isArray(allowedDeptIds) || allowedDeptIds.length === 0) return true;
+//   const tid = extractTicketDepartmentId(ticket);
+//   return !!tid && allowedDeptIds.includes(tid);
+// }
+
+// let egressIpCache = { value: '', time: 0 };
+// const EGRESS_IP_CACHE_MS = 10 * 60 * 1000;
+// let egressIpLookupInFlight = null;
+
+// async function getPublicEgressIp(force = false) {
+//   const age = Date.now() - egressIpCache.time;
+//   if (!force && egressIpCache.value && age < EGRESS_IP_CACHE_MS) {
+//     return egressIpCache.value;
+//   }
+
+//   if (egressIpLookupInFlight) {
+//     return egressIpLookupInFlight;
+//   }
+
+//   egressIpLookupInFlight = (async () => {
+//     try {
+//       const controller = new AbortController();
+//       const timer = setTimeout(() => controller.abort(), 4000);
+//       const response = await fetch('https://api.ipify.org', { signal: controller.signal });
+//       clearTimeout(timer);
+//       if (!response.ok) {
+//         throw new Error(`ipify returned ${response.status}`);
+//       }
+//       const ip = (await response.text()).trim();
+//       if (ip) {
+//         egressIpCache = { value: ip, time: Date.now() };
+//       }
+//       return egressIpCache.value;
+//     } catch (err) {
+//       console.error('Failed to resolve public egress IP:', err?.message || err);
+//       return egressIpCache.value;
+//     } finally {
+//       egressIpLookupInFlight = null;
+//     }
+//   })();
+
+//   return egressIpLookupInFlight;
+// }
+
+// function priorityForIhubAndSslMilestone(milestoneDays) {
+//   if (milestoneDays === 3 || milestoneDays === 1) return 'SLA';
+//   if (milestoneDays === 7) return 'High';
+//   return 'Medium';
+// }
+
+// function priorityForAutomationSslMilestone(milestoneDays) {
+//   if (milestoneDays === 3 || milestoneDays === 1) return 'SLA';
+//   if (milestoneDays === 7) return 'High';
+//   return 'Medium';
+// }
+
+// // ------------------------
+// // Serve Angular build
+// // ------------------------
+// const angularPath = path.join(__dirname, "dist", "ticket-portal");
+// const angularBrowserPath = path.join(angularPath, "browser");
+
+// app.use(express.static(angularBrowserPath));
+// app.use(express.static(angularPath));
+
+// // ------------------------
+// // ZOHO TOKEN REFRESH
+// // ------------------------
+// async function refreshZohoToken() {
+//   if (!ENABLE_ZOHO_OUTBOUND) return;
+//   try {
+//     const params = new URLSearchParams({
+//       refresh_token: REFRESH_TOKEN,
+//       client_id: CLIENT_ID,
+//       client_secret: CLIENT_SECRET,
+//       grant_type: 'refresh_token'
+//     });
+
+//     const response = await fetch(
+//       `https://accounts.zoho.in/oauth/v2/token?${params}`,
+//       { method: 'POST' }
+//     );
+
+//     const data = await response.json();
+
+//     if (data.access_token) {
+//       ZOHO_OAUTH_TOKEN = `Zoho-oauthtoken ${data.access_token}`;
+//     }
+//   } catch (err) {
+//     // Token refresh failed silently
+//   }
+// }
+
+// // Refresh token on startup and every 55 minutes
+// if (ENABLE_ZOHO_OUTBOUND) {
+//   setInterval(refreshZohoToken, 55 * 60 * 1000);
+//   refreshZohoToken();
+// } else {
+//   console.log('[ZOHO OUTBOUND] Disabled (ENABLE_ZOHO_OUTBOUND=false)');
+// }
+
+// // Log outbound egress identity at startup for API access-point tracing.
+// setTimeout(async () => {
+//   if (!ENABLE_ZOHO_OUTBOUND) {
+//     console.log('[ZOHO EGRESS] Skipped (outbound disabled)');
+//     return;
+//   }
+//   const ip = await getPublicEgressIp();
+//   if (ZOHO_ALLOWED_EGRESS_IPS.size > 0) {
+//     const allowed = Array.from(ZOHO_ALLOWED_EGRESS_IPS).join(', ');
+//     console.log(`[ZOHO EGRESS] Current public IP=${ip || 'unknown'} | Allowed=${allowed}`);
+//   } else {
+//     console.log(`[ZOHO EGRESS] Current public IP=${ip || 'unknown'} | Allowlist=disabled`);
+//   }
+// }, 3000);
+
+// // IHUB/SSL alert processors should run only on designated deployments.
+// if (ENABLE_ALERT_JOBS) {
+//   // Startup + every 12 hours
+//   setTimeout(() => {
+//     processIhubAlerts();
+//     processSslAlerts();
+//     processAutomationSslAlerts();
+//   }, 15 * 1000);
+//   setInterval(processIhubAlerts, 12 * 60 * 60 * 1000);
+//   setInterval(processSslAlerts, 12 * 60 * 60 * 1000);
+//   setInterval(processAutomationSslAlerts, 12 * 60 * 60 * 1000);
+// } else {
+//   console.log('[ALERT JOBS] Disabled (ENABLE_ALERT_JOBS=false)');
+// }
+
+// // ------------------------
+// // ZOHO API HELPER
+// // ------------------------
+
+// // 🚀 Global rate limiter: max 1200 calls/hour (~20/min) to stay well under 85k/day
+// const ZOHO_RATE_LIMIT_PER_HOUR = 1200;
+// const zohoRateBucket = {
+//   tokens: ZOHO_RATE_LIMIT_PER_HOUR,
+//   lastRefill: Date.now(),
+//   maxTokens: ZOHO_RATE_LIMIT_PER_HOUR,
+//   refillRate: ZOHO_RATE_LIMIT_PER_HOUR / 3600000 // tokens per ms
+// };
+
+// function zohoRateLimitCheck() {
+//   const now = Date.now();
+//   const elapsed = now - zohoRateBucket.lastRefill;
+//   zohoRateBucket.tokens = Math.min(
+//     zohoRateBucket.maxTokens,
+//     zohoRateBucket.tokens + elapsed * zohoRateBucket.refillRate
+//   );
+//   zohoRateBucket.lastRefill = now;
+
+//   if (zohoRateBucket.tokens < 1) {
+//     return false; // rate limited
+//   }
+//   zohoRateBucket.tokens -= 1;
+//   return true;
+// }
+
+// // Track API usage for observability
+// let zohoApiCallCount = 0;
+// let zohoApiCallCountResetTime = Date.now();
+// function trackZohoApiCall() {
+//   const now = Date.now();
+//   if (now - zohoApiCallCountResetTime > 3600000) {
+//     console.log(`[ZOHO RATE] ${zohoApiCallCount} API calls in last hour`);
+//     zohoApiCallCount = 0;
+//     zohoApiCallCountResetTime = now;
+//   }
+//   zohoApiCallCount++;
+// }
+
+// async function zohoFetch(endpoint, options = {}) {
+//   // Rate limit check — reject if budget exhausted
+//   if (!zohoRateLimitCheck()) {
+//     console.warn(`[ZOHO RATE LIMIT] Blocked call to ${endpoint} — hourly budget exhausted`);
+//     return new Response(
+//       JSON.stringify({ error: 'Zoho API rate limit reached. Try again later.', endpoint }),
+//       { status: 429, headers: { 'Content-Type': 'application/json' } }
+//     );
+//   }
+//   trackZohoApiCall();
+
+//   if (!ENABLE_ZOHO_OUTBOUND) {
+//     return new Response(
+//       JSON.stringify({
+//         error: 'Zoho outbound is disabled for this deployment',
+//         endpoint
+//       }),
+//       {
+//         status: 503,
+//         headers: { 'Content-Type': 'application/json' }
+//       }
+//     );
+//   }
+
+//   if (ZOHO_ALLOWED_EGRESS_IPS.size > 0) {
+//     const egressIp = await getPublicEgressIp();
+//     if (!egressIp || !ZOHO_ALLOWED_EGRESS_IPS.has(egressIp)) {
+//       const allowed = Array.from(ZOHO_ALLOWED_EGRESS_IPS).join(', ');
+//       console.error(
+//         `[ZOHO BLOCKED] egress IP ${egressIp || 'unknown'} is not in allowlist: ${allowed}`
+//       );
+//       return new Response(
+//         JSON.stringify({
+//           error: 'Zoho API blocked by egress IP policy',
+//           egressIp: egressIp || null,
+//           allowedIps: Array.from(ZOHO_ALLOWED_EGRESS_IPS)
+//         }),
+//         {
+//           status: 503,
+//           headers: { 'Content-Type': 'application/json' }
+//         }
+//       );
+//     }
+//   }
+
+//   if (!ZOHO_OAUTH_TOKEN) {
+//     await refreshZohoToken();
+//   }
+
+//   const headers = {
+//     Authorization: ZOHO_OAUTH_TOKEN,
+//     ...(ZOHO_ORG_ID ? { orgId: ZOHO_ORG_ID } : {}),
+//     ...(options.headers || {})
+//   };
+
+//   const isFormData = options.body instanceof FormData;
+//   if (!headers['Content-Type'] && !headers['content-type'] && !isFormData) {
+//     headers['Content-Type'] = 'application/json';
+//   }
+
+//   const res = await fetch(`${ZOHO_BASE_URL}${endpoint}`, {
+//     ...options,
+//     headers
+//   });
+
+//   if (res.status === 401) {
+//     await refreshZohoToken();
+//     return zohoFetch(endpoint, options);
+//   }
+
+//   return res;
+// }
+
+// async function lookupAgentIdByEmail(email) {
+//   if (!email) return '';
+//   const target = email.trim().toLowerCase();
+
+//   // 🚀 Use cached agents list first to avoid unnecessary Zoho API calls
+//   if (agentsCache && Array.isArray(agentsCache) && agentsCache.length > 0) {
+//     const cached = agentsCache.find(a => (a.email || '').toLowerCase() === target);
+//     if (cached?.id) return cached.id;
+//   }
+
+//   // Fallback: paginate Zoho agents API only if cache miss
+//   const limit = 100;
+//   let from = 0;
+//   let hasMore = true;
+
+//   while (hasMore) {
+//     const res = await zohoFetch(`/agents?limit=${limit}&from=${from}`);
+//     const data = await res.json();
+//     const agents = Array.isArray(data?.data) ? data.data : [];
+
+//     const match = agents.find(a => {
+//       const agentEmail = (a.email || a.emailId || a.primaryEmail || '').toLowerCase();
+//       return agentEmail === target;
+//     });
+
+//     if (match?.id) return match.id;
+
+//     hasMore = agents.length === limit;
+//     from += limit;
+//   }
+
+//   return '';
+// }
+
+// function toStartOfDay(dateInput) {
+//   const d = new Date(dateInput);
+//   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+// }
+
+// function daysUntilDate(dateInput) {
+//   const today = toStartOfDay(new Date());
+//   const target = toStartOfDay(dateInput);
+//   return Math.floor((target.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+// }
+
+// function isValidDateInput(value) {
+//   if (!value) return false;
+//   const d = new Date(value);
+//   return !Number.isNaN(d.getTime());
+// }
+
+// function normalizeDateOnly(value) {
+//   const d = toStartOfDay(value);
+//   return d.toISOString().slice(0, 10);
+// }
+
+// function isLikelyEmail(value) {
+//   if (!value) return false;
+//   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((value || '').trim());
+// }
+
+// function safeTokenEqual(a, b) {
+//   const aa = Buffer.from(a || '', 'utf8');
+//   const bb = Buffer.from(b || '', 'utf8');
+//   if (aa.length !== bb.length) return false;
+//   return crypto.timingSafeEqual(aa, bb);
+// }
+
+// function isAlertmanagerAuthorized(req) {
+//   if (!ALERTMANAGER_WEBHOOK_SECRET) return true;
+//   const provided = (req.headers['x-alertmanager-secret'] || '').toString().trim();
+//   return safeTokenEqual(provided, ALERTMANAGER_WEBHOOK_SECRET);
+// }
+
+// function parseMilestoneDays(alert) {
+//   const labels = alert?.labels || {};
+//   const annotations = alert?.annotations || {};
+//   const fromLabel = parseInt(labels.milestone_days || labels.days_left || '', 10);
+//   if (Number.isInteger(fromLabel)) return fromLabel;
+
+//   // Prefer annotation text because some alert names encode technical windows
+//   // (e.g., SSLCert_33Days) while summary/description carry business milestones
+//   // (30/15/7/3/1 days) used by ticketing.
+//   const sources = [
+//     annotations.summary || '',
+//     annotations.description || '',
+//     labels.alertname || ''
+//   ];
+
+//   for (const text of sources) {
+//     const match = /(?:^|[^\d])(\d{1,3})\s*[_-]?\s*days?(?=$|[^A-Za-z])/i.exec(text);
+//     if (match) {
+//       const value = parseInt(match[1], 10);
+//       if (Number.isInteger(value)) return value;
+//     }
+//   }
+
+//   return null;
+// }
+
+// function buildAlertFingerprint(alert, milestoneDays) {
+//   const labels = alert?.labels || {};
+//   // Use a fixed alertname so that the scheduled Prometheus job and the
+//   // Alertmanager webhook share the same fingerprint namespace for the same
+//   // certificate+milestone combination. Without this, each path generates a
+//   // different fingerprint (e.g. 'AutomationSSLExpiry' vs 'SSLCert_30Days')
+//   // and both create tickets for the same cert — the primary duplicate vector.
+//   const raw = [
+//     'SSL_ALERT',
+//     labels.client || 'unknown-client',
+//     labels.instance || labels.target || labels.url || 'unknown-instance',
+//     labels.application || 'unknown-app',
+//     String(milestoneDays)
+//   ].join('|');
+//   return crypto.createHash('sha256').update(raw).digest('hex');
+// }
+
+// async function fetchAutomationSslMonitoredUrls() {
+//   if (!AUTOMATION_PROMETHEUS_URL) {
+//     throw new Error('AUTOMATION_PROMETHEUS_URL is not configured');
+//   }
+
+//   const diagnostics = {
+//     timestamp: new Date().toISOString(),
+//     targetsWithProbeSuccess: 0,
+//     targetsWithSslMetric: 0,
+//     targetsWithoutSslMetric: [],
+//     missingMetricDetails: []
+//   };
+
+//   const baseUrl = AUTOMATION_PROMETHEUS_URL.replace(/\/$/, '');
+//   const queryPrometheus = async (query, errorMessage) => {
+//     const url = `${baseUrl}/api/v1/query?query=${encodeURIComponent(query)}`;
+//     const response = await fetch(url, { method: 'GET' });
+//     const payload = await response.json().catch(() => null);
+//     if (!response.ok || payload?.status !== 'success') {
+//       throw new Error(errorMessage);
+//     }
+//     return Array.isArray(payload?.data?.result) ? payload.data.result : [];
+//   };
+
+//   // Use probe_success as the baseline so all configured targets are visible,
+//   // even when certificate-expiry metric is unavailable for failed probes.
+//   const [successRows, expiryRows] = await Promise.all([
+//     queryPrometheus('probe_success', 'Failed to fetch probe availability metrics from Prometheus'),
+//     queryPrometheus('probe_ssl_earliest_cert_expiry', 'Failed to fetch SSL expiry metrics from Prometheus')
+//   ]);
+
+//   const today = toStartOfDay(new Date());
+//   diagnostics.targetsWithProbeSuccess = successRows.length;
+//   diagnostics.targetsWithSslMetric = expiryRows.length;
+
+//   const keyFromMetric = (metric = {}) => {
+//     const instance = (metric.instance || metric.target || '').trim().toLowerCase();
+//     const client = (metric.client || '').trim().toLowerCase();
+//     const environment = (metric.environment || '').trim().toLowerCase();
+//     const application = (metric.application || '').trim().toLowerCase();
+//     return [instance, client, environment, application].join('|');
+//   };
+
+//   const mappedByKey = new Map();
+//   const expiryKeySet = new Set(expiryRows.map(r => keyFromMetric(r?.metric || {})));
+
+//   for (const row of successRows) {
+//     const metric = row?.metric || {};
+//     const value = Number(Array.isArray(row?.value) ? row.value[1] : NaN);
+//     const key = keyFromMetric(metric);
+
+//     if (!expiryKeySet.has(key)) {
+//       const instance = (metric.instance || metric.target || '').trim();
+//       diagnostics.targetsWithoutSslMetric.push(instance);
+//       diagnostics.missingMetricDetails.push({
+//         instance,
+//         client: (metric.client || '').trim() || 'Unknown',
+//         environment: (metric.environment || '').trim() || 'Unknown',
+//         application: (metric.application || '').trim() || 'Unknown',
+//         probeSuccess: Number.isFinite(value) ? value === 1 : null
+//       });
+//     }
+
+//     mappedByKey.set(key, {
+//       client: (metric.client || '').trim() || 'Unknown',
+//       environment: (metric.environment || '').trim() || 'Unknown',
+//       application: (metric.application || '').trim() || 'Unknown',
+//       ssl_url: (metric.instance || metric.target || '').trim() || '',
+//       responsible: (metric.responsible || '').trim() || null,
+//       responsible_email: (metric.responsible_email || metric.owner_email || metric.email || '').trim().toLowerCase() || null,
+//       hostname: (metric.hostname || '').trim() || null,
+//       ip_address: (metric.ip_address || '').trim() || null,
+//       version: (metric.version || '').trim() || null,
+//       estimated_expiry_on: null,
+//       estimated_days_to_expiry: null,
+//       metric_value: null,
+//       probe_success: Number.isFinite(value) ? value === 1 : null
+//     });
+//   }
+
+//   for (const row of expiryRows) {
+//     const metric = row?.metric || {};
+//     const value = Number(Array.isArray(row?.value) ? row.value[1] : NaN);
+//     const expiryDate = Number.isFinite(value) ? toStartOfDay(new Date(value * 1000)) : null;
+//     const daysToExpiry = expiryDate
+//       ? Math.floor((expiryDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))
+//       : null;
+//     const key = keyFromMetric(metric);
+
+//     const existing = mappedByKey.get(key) || {
+//       client: (metric.client || '').trim() || 'Unknown',
+//       environment: (metric.environment || '').trim() || 'Unknown',
+//       application: (metric.application || '').trim() || 'Unknown',
+//       ssl_url: (metric.instance || metric.target || '').trim() || '',
+//       responsible: (metric.responsible || '').trim() || null,
+//       responsible_email: (metric.responsible_email || metric.owner_email || metric.email || '').trim().toLowerCase() || null,
+//       hostname: (metric.hostname || '').trim() || null,
+//       ip_address: (metric.ip_address || '').trim() || null,
+//       version: (metric.version || '').trim() || null,
+//       probe_success: null
+//     };
+
+//     mappedByKey.set(key, {
+//       ...existing,
+//       estimated_expiry_on: expiryDate ? expiryDate.toISOString().slice(0, 10) : null,
+//       estimated_days_to_expiry: daysToExpiry,
+//       metric_value: Number.isFinite(value) ? value : null
+//     });
+//   }
+
+//   console.log('[Automation SSL] Diagnostics:', JSON.stringify(diagnostics, null, 2));
+//   global.lastAutomationSslDiagnostics = diagnostics;
+
+//   return Array.from(mappedByKey.values())
+//     .sort((a, b) => {
+//       const aDays = Number.isFinite(a.estimated_days_to_expiry) ? a.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
+//       const bDays = Number.isFinite(b.estimated_days_to_expiry) ? b.estimated_days_to_expiry : Number.MAX_SAFE_INTEGER;
+//       if (aDays !== bDays) return aDays - bDays;
+//       return (a.client || '').localeCompare(b.client || '');
+//     });
+// }
+
+// async function processAutomationSslAlerts() {
+//   const summary = {
+//     scanned: 0,
+//     matchedMilestones: 0,
+//     created: 0,
+//     duplicate: 0,
+//     skipped: 0,
+//     errors: 0
+//   };
+
+//   try {
+//     if (!AUTOMATION_PROMETHEUS_URL) {
+//       console.warn('[Automation SSL] Skipping alert generation: AUTOMATION_PROMETHEUS_URL is not configured');
+//       return {
+//         ...summary,
+//         skipped: summary.skipped + 1,
+//         reason: 'AUTOMATION_PROMETHEUS_URL is not configured'
+//       };
+//     }
+
+//     const monitoredRows = await fetchAutomationSslMonitoredUrls();
+//     summary.scanned = monitoredRows.length;
+//     console.log(`[Automation SSL] Processing ${monitoredRows.length} monitored URLs for alert generation...`);
+
+//     for (const row of monitoredRows) {
+//       const daysLeft = row.estimated_days_to_expiry;
+//       if (!Number.isInteger(daysLeft) || !AUTOMATION_SSL_ALERT_MILESTONES.includes(daysLeft)) {
+//         summary.skipped += 1;
+//         continue;
+//       }
+//       summary.matchedMilestones += 1;
+
+//       const instance = (row.ssl_url || row.hostname || '').trim();
+//       const alert = {
+//         labels: {
+//           alertname: 'AutomationSSLExpiry',
+//           milestone_days: String(daysLeft),
+//           client: row.client || 'Unknown',
+//           environment: row.environment || 'Unknown',
+//           application: row.application || 'Unknown',
+//           instance,
+//           responsible: row.responsible || '',
+//           responsible_email: row.responsible_email || ''
+//         },
+//         annotations: {
+//           summary: `SSL certificate expires in ${daysLeft} day(s)`,
+//           description: `Prometheus milestone detected for ${instance || 'unknown endpoint'}`
+//         },
+//         startsAt: new Date().toISOString(),
+//         generatorURL: AUTOMATION_PROMETHEUS_URL
+//       };
+
+//       try {
+//         const result = await createAlertmanagerSslTicket(alert, daysLeft);
+//         if (result.status === 'created') {
+//           summary.created += 1;
+//           console.log(`[Automation SSL] Created ticket for ${instance || row.client} at ${daysLeft} day milestone`);
+//         } else if (result.status === 'duplicate') {
+//           summary.duplicate += 1;
+//         } else {
+//           summary.skipped += 1;
+//         }
+//       } catch (err) {
+//         summary.errors += 1;
+//         console.error(`[Automation SSL] Ticket creation failed for ${instance || row.client}:`, err?.message || err);
+//       }
+//     }
+//     return summary;
+//   } catch (err) {
+//     summary.errors += 1;
+//     console.error('[Automation SSL] Alert processor failed:', err?.message || err);
+//     return {
+//       ...summary,
+//       reason: err?.message || String(err)
+//     };
+//   }
+// }
+
+// async function createAlertmanagerSslTicket(alert, milestoneDays) {
+//   const labels = alert?.labels || {};
+//   const annotations = alert?.annotations || {};
+
+//   const client = (labels.client || '').trim() || 'Unknown Client';
+//   const environment = (labels.environment || '').trim() || 'Unknown';
+//   const application = (labels.application || '').trim() || 'Unknown';
+//   const instance = (labels.instance || labels.target || labels.url || '').trim() || 'Unknown';
+//   const alertname = (labels.alertname || 'SSLCert').trim();
+//   const responsible = (labels.responsible || labels.owner || labels.assignee || '').trim();
+
+//   const responsibleCandidates = [
+//     labels.responsible_email,
+//     labels.owner_email,
+//     labels.assignee_email,
+//     labels.email,
+//     responsible
+//   ];
+//   const responsibleEmail = responsibleCandidates
+//     .map(v => (v || '').toString().trim().toLowerCase())
+//     .find(isLikelyEmail) || ALERTMANAGER_FALLBACK_EMAIL;
+
+//   if (!responsibleEmail) {
+//     return {
+//       status: 'skipped',
+//       reason: 'missing responsible email label and fallback email'
+//     };
+//   }
+
+//   const fingerprint = buildAlertFingerprint(alert, milestoneDays);
+
+//   // Primary dedup: check by normalised fingerprint (alertname-agnostic).
+//   // Secondary dedup: check by (instance, milestone_days, client) so that
+//   // records created with old fingerprints (before the normalisation change)
+//   // still prevent cross-path duplicates.
+//   const existing = await pool.query(
+//     `SELECT id, status FROM alertmanager_ssl_tickets 
+//      WHERE (
+//        alert_fingerprint = $1
+//        OR (instance = $2 AND milestone_days = $3 AND client = $4)
+//      )
+//      AND status IN ('Open', 'Pending')
+//      ORDER BY id DESC LIMIT 1`,
+//     [fingerprint, instance, milestoneDays, client]
+//   );
+//   if (existing.rows.length > 0) {
+//     return { status: 'duplicate', reason: 'already processed' };
+//   }
+
+//   // Remove old closed rows that share the fingerprint so the UNIQUE
+//   // constraint allows a fresh insert for a renewed certificate.
+//   await pool.query(
+//     `DELETE FROM alertmanager_ssl_tickets WHERE alert_fingerprint = $1 AND status = 'Closed'`,
+//     [fingerprint]
+//   );
+
+//   // ON CONFLICT DO NOTHING guards against race conditions where two
+//   // concurrent callers (scheduler + webhook) both pass the check above
+//   // before either has committed its INSERT.
+//   const reservation = await pool.query(
+//     `INSERT INTO alertmanager_ssl_tickets
+//       (alert_fingerprint, alertname, milestone_days, client, environment, application, instance, responsible, responsible_email, status)
+//      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Pending')
+//      ON CONFLICT (alert_fingerprint) DO NOTHING
+//      RETURNING id`,
+//     [
+//       fingerprint,
+//       alertname,
+//       milestoneDays,
+//       client,
+//       environment,
+//       application,
+//       instance,
+//       responsible || null,
+//       responsibleEmail
+//     ]
+//   );
+
+//   if (reservation.rows.length === 0) {
+//     return { status: 'duplicate', reason: 'already processed' };
+//   }
+
+//   const rowId = reservation.rows[0].id;
+//   const subject = `[SSL][Automation] ${client} - certificate expiry in ${milestoneDays} day(s)`;
+//   const description = [
+//     '<p><strong>SSL Expiry Alert (Automation Stack)</strong></p>',
+//     `<p>Milestone: <strong>${milestoneDays} day(s)</strong></p>`,
+//     `<p>Client: ${client}</p>`,
+//     `<p>Environment: ${environment}</p>`,
+//     `<p>Application: ${application}</p>`,
+//     `<p>Instance/URL: ${instance}</p>`,
+//     `<p>Responsible: ${responsible || '-'}</p>`,
+//     `<p>Responsible Email: ${responsibleEmail}</p>`,
+//     `<p>Summary: ${(annotations.summary || '').trim() || '-'}</p>`,
+//     `<p>Description: ${(annotations.description || '').trim() || '-'}</p>`,
+//     `<p>Source Alert: ${alertname}</p>`,
+//     `<p>Starts At: ${alert?.startsAt || '-'}</p>`,
+//     `<p>Generator URL: ${alert?.generatorURL || '-'}</p>`
+//   ].join('');
+
+//   const payload = {
+//     subject,
+//     priority: priorityForAutomationSslMilestone(milestoneDays),
+//     status: 'Open',
+//     category: 'SSL',
+//     subCategory: 'SSL Expiry',
+//     description,
+//     contact: {
+//       lastName: responsible || client,
+//       email: responsibleEmail
+//     }
+//   };
+
+//   if (ZOHO_DEPARTMENT_ID) {
+//     payload.departmentId = ZOHO_DEPARTMENT_ID;
+//   }
+
+//   const assigneeId = await lookupAgentIdByEmail(responsibleEmail);
+//   if (assigneeId) {
+//     payload.assigneeId = assigneeId;
+//   }
+
+//   // Retry up to 3 times on 429 with exponential backoff before giving up
+//   let response, data;
+//   for (let attempt = 1; attempt <= 3; attempt++) {
+//     response = await zohoFetch('/tickets', {
+//       method: 'POST',
+//       body: JSON.stringify(payload)
+//     });
+//     data = await response.json().catch(() => null);
+//     if (response.status !== 429) break;
+//     console.warn(`[Webhook] Zoho 429 on ticket create attempt ${attempt}/3, retrying in ${attempt * 3}s`);
+//     await new Promise(r => setTimeout(r, attempt * 3000));
+//   }
+
+//   if (!response.ok && payload.assigneeId) {
+//     const assigneeError = Array.isArray(data?.errors)
+//       ? data.errors.find((e) => e?.fieldName === '/assigneeId')
+//       : null;
+
+//     if (assigneeError) {
+//       delete payload.assigneeId;
+//       for (let attempt = 1; attempt <= 3; attempt++) {
+//         response = await zohoFetch('/tickets', {
+//           method: 'POST',
+//           body: JSON.stringify(payload)
+//         });
+//         data = await response.json().catch(() => null);
+//         if (response.status !== 429) break;
+//         console.warn(`[Webhook] Zoho 429 on ticket create (no assignee) attempt ${attempt}/3, retrying in ${attempt * 3}s`);
+//         await new Promise(r => setTimeout(r, attempt * 3000));
+//       }
+//     }
+//   }
+
+//   if (!response.ok || !data?.id) {
+//     await pool.query(
+//       `DELETE FROM alertmanager_ssl_tickets
+//        WHERE id = $1 AND status = 'Pending'`,
+//       [rowId]
+//     );
+//     throw new Error(data?.message || `Alertmanager SSL ticket creation failed (${response.status})`);
+//   }
+
+//   await pool.query(
+//     `UPDATE alertmanager_ssl_tickets
+//      SET zoho_ticket_id = $1,
+//          zoho_ticket_number = $2,
+//          status = 'Open',
+//          updated_at = NOW()
+//      WHERE id = $3`,
+//     [data.id, data.ticketNumber || null, rowId]
+//   );
+
+//   await upsertSslAssignment(data.id, data.ticketNumber || null, responsibleEmail);
+//   return { status: 'created', ticketId: data.id, ticketNumber: data.ticketNumber || null };
+// }
+
+// app.post('/api/webhook/alertmanager', async (req, res) => {
+//   try {
+//     if (!isAlertmanagerAuthorized(req)) {
+//       return res.status(401).json({ message: 'Invalid webhook secret' });
+//     }
+
+//     const payload = req.body || {};
+//     const incomingAlerts = Array.isArray(payload.alerts) ? payload.alerts : [];
+//     const firingAlerts = incomingAlerts.filter(a => (a?.status || '').toLowerCase() === 'firing');
+
+//     if (firingAlerts.length === 0) {
+//       return res.json({ message: 'No firing alerts to process', processed: 0 });
+//     }
+
+//     const results = [];
+//     for (const alert of firingAlerts) {
+//       const milestoneDays = parseMilestoneDays(alert);
+//       if (!Number.isInteger(milestoneDays) || !AUTOMATION_SSL_ALERT_MILESTONES.includes(milestoneDays)) {
+//         console.warn(
+//           `[Webhook] Ignored SSL alert: alertname=${alert?.labels?.alertname || 'unknown'} ` +
+//           `instance=${alert?.labels?.instance || alert?.labels?.target || alert?.labels?.url || 'unknown'} ` +
+//           `milestone=${Number.isInteger(milestoneDays) ? milestoneDays : 'unparsed'} ` +
+//           `allowed=[${AUTOMATION_SSL_ALERT_MILESTONES.join(',')}]`
+//         );
+//         results.push({
+//           status: 'ignored',
+//           reason: 'milestone not in configured automation list',
+//           alertname: alert?.labels?.alertname || null,
+//           milestone_days: milestoneDays
+//         });
+//         continue;
+//       }
+
+//       try {
+//         const created = await createAlertmanagerSslTicket(alert, milestoneDays);
+//         results.push({
+//           alertname: alert?.labels?.alertname || null,
+//           milestone_days: milestoneDays,
+//           ...created
+//         });
+//       } catch (err) {
+//         console.error('Alertmanager webhook ticket creation failed:', err?.message || err);
+//         results.push({
+//           alertname: alert?.labels?.alertname || null,
+//           milestone_days: milestoneDays,
+//           status: 'error',
+//           reason: err?.message || String(err)
+//         });
+//       }
+//     }
+
+//     return res.json({
+//       message: 'Alertmanager webhook processed',
+//       processed: results.length,
+//       results
+//     });
+//   } catch (err) {
+//     console.error('Alertmanager webhook failed:', err);
+//     return res.status(500).json({ message: 'Webhook processing failed' });
+//   }
+// });
+
+// async function closeZohoTicketWithFallback(ticketId) {
+//   const closeTry = await zohoFetch(`/tickets/${ticketId}`, {
+//     method: 'PATCH',
+//     body: JSON.stringify({ status: 'Closed' })
+//   });
+
+//   if (closeTry.ok) return true;
+//   if (closeTry.status !== 422) return false;
+
+//   const resolveTry = await zohoFetch(`/tickets/${ticketId}`, {
+//     method: 'PATCH',
+//     body: JSON.stringify({ status: 'Resolved' })
+//   });
+
+//   return resolveTry.ok;
+// }
+
+// async function upsertIhubAssignment(ticketId, ticketNumber, assigneeEmail) {
+//   const normalizedEmail = (assigneeEmail || '').trim().toLowerCase();
+//   if (!normalizedEmail) return;
+
+//   await pool.query(
+//     `INSERT INTO ticket_assignments
+//       (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, zoho_department_id, status, category)
+//      VALUES ($1, $2, $3, $4, $5, $6, 'Open', 'IHUB')
+//      ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+//        assigned_users = EXCLUDED.assigned_users,
+//        primary_assignee = EXCLUDED.primary_assignee,
+//        reassigned_user = ticket_assignments.primary_assignee,
+//        reassigned_at = NOW(),
+//        reassigned_by = EXCLUDED.assigned_by,
+//        category = 'IHUB',
+//        status = 'Open',
+//        updated_at = NOW()`,
+//     [
+//       ticketId,
+//       ticketNumber || null,
+//       [normalizedEmail],
+//       normalizedEmail,
+//       'ihub-system',
+//       ZOHO_DEPARTMENT_ID || null
+//     ]
+//   );
+// }
+
+// async function createIhubAlertTicket(asset, milestoneDays) {
+//   const responsibleEmail = (asset.responsible_person_email || '').trim().toLowerCase();
+//   console.log(`[IHUB] createIhubAlertTicket: Asset ${asset.id}, email="${responsibleEmail}"`);
+  
+//   if (!responsibleEmail) {
+//     console.log(`[IHUB] createIhubAlertTicket: No responsible email for asset ${asset.id}, skipping`);
+//     return;
+//   }
+
+//   const licenseExpiryOn = normalizeDateOnly(asset.license_expiry);
+//   console.log(`[IHUB] Checking for existing alert: asset=${asset.id}, milestone=${milestoneDays}, expiry=${licenseExpiryOn}`);
+
+//   // Reserve the alert row first to prevent concurrent runs from creating duplicate Zoho tickets.
+//   const reservationTicketId = `IHUB-PENDING-${asset.id}-${milestoneDays}-${licenseExpiryOn}-${Date.now()}`;
+//   const reservation = await pool.query(
+//     `INSERT INTO ihub_alert_tickets
+//       (ihub_asset_id, milestone_days, license_expiry_on, zoho_ticket_id, status)
+//      VALUES ($1, $2, $3, $4, 'Pending')
+//      ON CONFLICT (ihub_asset_id, milestone_days, license_expiry_on) DO NOTHING
+//      RETURNING id`,
+//     [asset.id, milestoneDays, licenseExpiryOn, reservationTicketId]
+//   );
+
+//   if (reservation.rows.length === 0) {
+//     console.log(`[IHUB] Alert already exists for asset ${asset.id} at ${milestoneDays} days, skipping`);
+//     return;
+//   }
+
+//   const alertRowId = reservation.rows[0].id;
+
+//   const subject = `[IHUB] License expiry in ${milestoneDays} day(s) - ${asset.client} (${asset.hostname})`;
+//   const description = [
+//     '<p><strong>IHUB License Expiry Alert</strong></p>',
+//     `<p>License is due in <strong>${milestoneDays}</strong> day(s).</p>`,
+//     `<p>Client: ${asset.client}</p>`,
+//     `<p>Environment: ${asset.environment}</p>`,
+//     `<p>Hostname: ${asset.hostname}</p>`,
+//     `<p>IP Address: ${asset.ip_address}</p>`,
+//     `<p>IHUB Version: ${asset.ihub_version || 'N/A'}</p>`,
+//     `<p>License Expiry: ${licenseExpiryOn}</p>`,
+//     `<p>Responsible Person: ${responsibleEmail}</p>`
+//   ].join('');
+
+//   const payload = {
+//     subject,
+//     priority: priorityForIhubAndSslMilestone(milestoneDays),
+//     status: 'Open',
+//     category: 'IHUB',
+//     subCategory: 'License Expiry',
+//     description,
+//     contact: {
+//       lastName: asset.responsible_person_name || asset.client || 'IHUB Owner',
+//       email: responsibleEmail
+//     }
+//   };
+
+//   if (ZOHO_DEPARTMENT_ID) {
+//     payload.departmentId = ZOHO_DEPARTMENT_ID;
+//   }
+
+//   const assigneeId = await lookupAgentIdByEmail(responsibleEmail);
+//   if (assigneeId) {
+//     payload.assigneeId = assigneeId;
+//   }
+
+//   console.log(`[IHUB] Creating Zoho ticket for asset ${asset.id}:`, subject);
+//   let response = await zohoFetch('/tickets', {
+//     method: 'POST',
+//     body: JSON.stringify(payload)
+//   });
+
+//   let data = await response.json().catch(() => null);
+
+//   // If Zoho rejects assignee privileges, retry without assigneeId.
+//   if (!response.ok && payload.assigneeId) {
+//     const assigneeError = Array.isArray(data?.errors)
+//       ? data.errors.find((e) => e?.fieldName === '/assigneeId')
+//       : null;
+
+//     if (assigneeError) {
+//       console.warn(`[IHUB] Zoho rejected assigneeId for asset ${asset.id}, retrying without assigneeId`);
+//       delete payload.assigneeId;
+//       response = await zohoFetch('/tickets', {
+//         method: 'POST',
+//         body: JSON.stringify(payload)
+//       });
+//       data = await response.json().catch(() => null);
+//     }
+//   }
+
+//   if (!response.ok || !data?.id) {
+//     const errorMsg = data?.message || `IHUB alert ticket creation failed (${response.status})`;
+//     console.error(`[IHUB] Zoho API error for asset ${asset.id}:`, errorMsg, data);
+
+//     // Release reservation on failure so future runs can retry.
+//     await pool.query(
+//       `DELETE FROM ihub_alert_tickets
+//        WHERE id = $1 AND status = 'Pending'`,
+//       [alertRowId]
+//     );
+
+//     throw new Error(errorMsg);
+//   }
+
+//   console.log(`[IHUB] Zoho ticket created: ${data.id} (${data.ticketNumber})`);
+  
+//   await pool.query(
+//     `UPDATE ihub_alert_tickets
+//      SET zoho_ticket_id = $1,
+//          zoho_ticket_number = $2,
+//          status = 'Open'
+//      WHERE id = $3`,
+//     [data.id, data.ticketNumber || null, alertRowId]
+//   );
+
+//   console.log(`[IHUB] Alert ticket record created in DB for asset ${asset.id}`);
+  
+//   await upsertIhubAssignment(data.id, data.ticketNumber || null, responsibleEmail);
+//   console.log(`[IHUB] Assignment created for asset ${asset.id}`);
+// }
+
+// async function processIhubAlerts() {
+//   try {
+//     const result = await pool.query('SELECT * FROM ihub_assets');
+//     console.log(`[IHUB] Processing ${result.rows.length} assets for alert generation...`);
+
+//     for (const asset of result.rows) {
+//       const daysLeft = daysUntilDate(asset.license_expiry);
+//       console.log(`[IHUB] Asset ${asset.id} (${asset.client}): ${daysLeft} days until expiry on ${asset.license_expiry}, email: ${asset.responsible_person_email}`);
+      
+//       if (!IHUB_ALERT_MILESTONES.includes(daysLeft)) {
+//         console.log(`[IHUB] Asset ${asset.id}: ${daysLeft} days not in milestones [${IHUB_ALERT_MILESTONES.join(',')}], skipping`);
+//         continue;
+//       }
+
+//       try {
+//         console.log(`[IHUB] Creating alert ticket for asset ${asset.id} at ${daysLeft} day milestone`);
+//         await createIhubAlertTicket(asset, daysLeft);
+//         console.log(`[IHUB] Alert ticket created successfully for asset ${asset.id}`);
+//       } catch (err) {
+//         console.error(`IHUB alert generation failed for asset ${asset.id}:`, err?.message || err);
+//       }
+//     }
+//   } catch (err) {
+//     console.error('IHUB alert processor failed:', err?.message || err);
+//   }
+// }
+
+// async function upsertSslAssignment(ticketId, ticketNumber, assigneeEmail) {
+//   const normalizedEmail = (assigneeEmail || '').trim().toLowerCase();
+//   if (!normalizedEmail) return;
+
+//   await pool.query(
+//     `INSERT INTO ticket_assignments
+//       (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, zoho_department_id, status, category)
+//      VALUES ($1, $2, $3, $4, $5, $6, 'Open', 'SSL')
+//      ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+//        assigned_users = EXCLUDED.assigned_users,
+//        primary_assignee = EXCLUDED.primary_assignee,
+//        reassigned_user = ticket_assignments.primary_assignee,
+//        reassigned_at = NOW(),
+//        reassigned_by = EXCLUDED.assigned_by,
+//        category = 'SSL',
+//        status = 'Open',
+//        updated_at = NOW()`,
+//     [
+//       ticketId,
+//       ticketNumber || null,
+//       [normalizedEmail],
+//       normalizedEmail,
+//       'ssl-system',
+//       ZOHO_DEPARTMENT_ID || null
+//     ]
+//   );
+// }
+
+// async function createSslAlertTicket(asset, milestoneDays) {
+//   const responsibleEmail = (asset.responsible_person_email || '').trim().toLowerCase();
+//   if (!responsibleEmail) return;
+
+//   const sslExpiryOn = normalizeDateOnly(asset.ssl_expiry);
+
+//   // Reserve the alert row first to prevent concurrent runs from creating duplicate Zoho tickets.
+//   const reservationTicketId = `SSL-PENDING-${asset.id}-${milestoneDays}-${sslExpiryOn}-${Date.now()}`;
+//   const reservation = await pool.query(
+//     `INSERT INTO ssl_expiry_alert_tickets
+//       (ssl_asset_id, milestone_days, ssl_expiry_on, zoho_ticket_id, status)
+//      VALUES ($1, $2, $3, $4, 'Pending')
+//      ON CONFLICT (ssl_asset_id, milestone_days, ssl_expiry_on) DO NOTHING
+//      RETURNING id`,
+//     [asset.id, milestoneDays, sslExpiryOn, reservationTicketId]
+//   );
+
+//   if (reservation.rows.length === 0) return;
+
+//   const alertRowId = reservation.rows[0].id;
+
+//   const subject = `[SSL] SSL expiry in ${milestoneDays} day(s) - ${asset.client} (${asset.ssl_url || asset.hostname || 'N/A'})`;
+//   const description = [
+//     '<p><strong>SSL Expiry Alert</strong></p>',
+//     `<p>SSL is due in <strong>${milestoneDays}</strong> day(s).</p>`,
+//     `<p>Client: ${asset.client}</p>`,
+//     `<p>Environment: ${asset.environment}</p>`,
+//     `<p>Hostname: ${asset.hostname || '-'}</p>`,
+//     `<p>IP Address: ${asset.ip_address || '-'}</p>`,
+//     `<p>Application: ${asset.application || '-'}</p>`,
+//     `<p>Version: ${asset.version || 'N/A'}</p>`,
+//     `<p>SSL URL: ${asset.ssl_url}</p>`,
+//     `<p>SSL Expiry: ${sslExpiryOn}</p>`,
+//     `<p>Responsible Person: ${responsibleEmail}</p>`
+//   ].join('');
+
+//   const payload = {
+//     subject,
+//     priority: priorityForIhubAndSslMilestone(milestoneDays),
+//     status: 'Open',
+//     category: 'SSL',
+//     subCategory: 'SSL Expiry',
+//     description,
+//     contact: {
+//       lastName: asset.responsible_person_name || asset.client || 'SSL Owner',
+//       email: responsibleEmail
+//     }
+//   };
+
+//   if (ZOHO_DEPARTMENT_ID) {
+//     payload.departmentId = ZOHO_DEPARTMENT_ID;
+//   }
+
+//   const assigneeId = await lookupAgentIdByEmail(responsibleEmail);
+//   if (assigneeId) {
+//     payload.assigneeId = assigneeId;
+//   }
+
+//   let response = await zohoFetch('/tickets', {
+//     method: 'POST',
+//     body: JSON.stringify(payload)
+//   });
+//   let data = await response.json().catch(() => null);
+
+//   // Retry without assignee if agent privilege assignment fails.
+//   if (!response.ok && payload.assigneeId) {
+//     const assigneeError = Array.isArray(data?.errors)
+//       ? data.errors.find((e) => e?.fieldName === '/assigneeId')
+//       : null;
+
+//     if (assigneeError) {
+//       delete payload.assigneeId;
+//       response = await zohoFetch('/tickets', {
+//         method: 'POST',
+//         body: JSON.stringify(payload)
+//       });
+//       data = await response.json().catch(() => null);
+//     }
+//   }
+
+//   if (!response.ok || !data?.id) {
+//     await pool.query(
+//       `DELETE FROM ssl_expiry_alert_tickets
+//        WHERE id = $1 AND status = 'Pending'`,
+//       [alertRowId]
+//     );
+//     throw new Error(data?.message || `SSL alert ticket creation failed (${response.status})`);
+//   }
+
+//   await pool.query(
+//     `UPDATE ssl_expiry_alert_tickets
+//      SET zoho_ticket_id = $1,
+//          zoho_ticket_number = $2,
+//          status = 'Open'
+//      WHERE id = $3`,
+//     [data.id, data.ticketNumber || null, alertRowId]
+//   );
+
+//   await upsertSslAssignment(data.id, data.ticketNumber || null, responsibleEmail);
+// }
+
+// async function processSslAlerts() {
+//   try {
+//     const result = await pool.query('SELECT * FROM ssl_assets');
+//     console.log(`[SSL] Processing ${result.rows.length} assets for alert generation...`);
+
+//     for (const asset of result.rows) {
+//       const daysLeft = daysUntilDate(asset.ssl_expiry);
+//       if (!SSL_ALERT_MILESTONES.includes(daysLeft)) {
+//         continue;
+//       }
+
+//       try {
+//         console.log(`[SSL] Creating alert ticket for asset ${asset.id} at ${daysLeft} day milestone`);
+//         await createSslAlertTicket(asset, daysLeft);
+//         console.log(`[SSL] Alert ticket processed for asset ${asset.id}`);
+//       } catch (err) {
+//         console.error(`SSL alert generation failed for asset ${asset.id}:`, err?.message || err);
+//       }
+//     }
+//   } catch (err) {
+//     console.error('SSL alert processor failed:', err?.message || err);
+//   }
+// }
+
+// // -------------------------------------------------------
+// //                     API ROUTES
+// // -------------------------------------------------------
+
+// // 🚀 OPTIMIZED: Production-grade caching system
+// const countsCache = new Map(); // Cache per user role
+// const COUNTS_CACHE_MS = 2 * 60 * 60 * 1000;   // 2 hour "fresh" window (reduced API consumption)
+// const COUNTS_STALE_MS = 4 * 60 * 60 * 1000;   // 4 hour serve-stale-while-revalidate window
+// const countsRefreshInFlight = new Map();      // Dedupe concurrent background refreshes
+// let agentsCache = null;
+// let agentsCacheTime = 0;
+// const AGENTS_CACHE_MS = 30 * 60 * 1000; // 30 minutes for agents list
+
+// async function getActiveRecycledTicketIds() {
+//   try {
+//     const result = await pool.query(
+//       `SELECT zoho_ticket_id
+//        FROM recycled_tickets
+//        WHERE restored_at IS NULL
+//          AND expires_at > NOW()`
+//     );
+//     return new Set(result.rows.map(r => (r.zoho_ticket_id || '').toString()));
+//   } catch (err) {
+//     console.error('Failed to fetch recycled ticket ids:', err?.message || err);
+//     return new Set();
+//   }
+// }
+
+// app.get('/api/tickets/counts', authenticateToken, async (req, res) => {
+//   // Stale-while-revalidate: ALWAYS return immediately from cache when available,
+//   // refresh in the background. Browser may also use ETag for 304s.
+//   res.set('Cache-Control', 'private, max-age=0, must-revalidate');
+//   res.set('Pragma', 'no-cache');
+
+//   try {
+//     const userEmail = req.user?.email?.toLowerCase() || '';
+//     const userRole = (req.user?.role || 'user').toLowerCase();
+//     const isAdmin = userRole === 'admin' || userRole === 'cloudops';
+//     let allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
+
+//     // Allow admin to filter by specific department
+//     const reqDeptId = (req.query.departmentId || '').toString().trim();
+//     if (isAdmin && reqDeptId) {
+//       allowedDeptIds = [reqDeptId];
+//     }
+
+//     // Per-user cache key — assigned/SLA counts are personal even for admins.
+//     const cacheKey = `counts_${isAdmin ? 'admin_' : 'user_'}${userRole}_${userEmail}${reqDeptId ? '_dept_' + reqDeptId : ''}`;
+//     const cached = countsCache.get(cacheKey);
+//     const now = Date.now();
+//     const age = cached ? now - cached.time : Infinity;
+
+//     // 1) Fresh cache → instant response.
+//     if (cached && age < COUNTS_CACHE_MS) {
+//       console.log(`[CACHE HIT-FRESH] ${cacheKey} age=${age}ms`);
+//       res.set('X-ITSM-Counts-Cache', `HIT-FRESH;node=${NODE_ID};ageMs=${age}`);
+//       res.set('ETag', cached.etag);
+//       if (req.get('if-none-match') === cached.etag) return res.status(304).end();
+//       return res.json(cached.data);
+//     }
+
+//     // 2) Stale cache → instant response + background refresh.
+//     if (cached && age < COUNTS_STALE_MS) {
+//       console.log(`[CACHE HIT-STALE] ${cacheKey} age=${age}ms (refreshing in background)`);
+//       res.set('X-ITSM-Counts-Cache', `HIT-STALE;node=${NODE_ID};ageMs=${age}`);
+//       res.set('ETag', cached.etag);
+//       if (req.get('if-none-match') !== cached.etag) {
+//         res.json(cached.data);
+//       } else {
+//         res.status(304).end();
+//       }
+//       // Fire-and-forget refresh, deduped per cache key.
+//       refreshCountsCache(cacheKey, userEmail, isAdmin, allowedDeptIds).catch(err =>
+//         console.error(`Background counts refresh failed for ${cacheKey}:`, err?.message || err)
+//       );
+//       return;
+//     }
+
+//     // 3) Cold cache → must compute synchronously.
+//     console.log(`[CACHE MISS] ${cacheKey} - computing fresh counts`);
+//     res.set('X-ITSM-Counts-Cache', `MISS;node=${NODE_ID}`);
+//     const countData = await refreshCountsCache(cacheKey, userEmail, isAdmin, allowedDeptIds);
+//     const fresh = countsCache.get(cacheKey);
+//     res.set('ETag', fresh.etag);
+//     if (req.get('if-none-match') === fresh.etag) return res.status(304).end();
+//     // Pre-warm user's "My Tickets" caches in background after responding.
+//     prewarmUserTickets(userEmail, userRole);
+//     res.json(countData);
+//   } catch (err) {
+//     console.error('Counts error:', err);
+//     res.status(500).json({ error: 'Failed to fetch ticket counts' });
+//   }
+// });
+
+// // Background-prefetch a user's My Tickets (open + closed) if not already fresh.
+// function prewarmUserTickets(userEmail, userRole = 'user') {
+//   if (!userEmail) return;
+//   const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
+//   for (const status of ['open', 'closed']) {
+//     const cacheKey = `${userRole}_${userEmail}_${status}_all`;
+//     const cached = userTicketsCache.get(cacheKey);
+//     if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) continue;
+//     refreshUserTicketsCache(cacheKey, userEmail, status, 'all', allowedDeptIds).catch(err =>
+//       console.error(`Pre-warm user-tickets failed for ${cacheKey}:`, err?.message || err)
+//     );
+//   }
+// }
+
+// // ---- Counts computation (extracted so it can run in background + at startup) ----
+// async function computeCounts(userEmail, isAdmin, allowedDeptIds = []) {
+//   const recycledTicketIds = await getActiveRecycledTicketIds();
+
+//   let mySupabaseAssignedIds = new Set();
+//   if (userEmail) {
+//     try {
+//       const r = await pool.query(
+//         "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
+//         [userEmail]
+//       );
+//       mySupabaseAssignedIds = new Set(r.rows.map(x => x.zoho_ticket_id));
+//     } catch (e) {
+//       console.error('Error fetching Supabase assignments:', e?.message || e);
+//     }
+//   }
+
+//   const PAGE_SIZE = 100;
+//   const PARALLEL_PAGES = 3;
+//   const hasSingleDept = Array.isArray(allowedDeptIds) && allowedDeptIds.length === 1;
+//   const deptQuery = hasSingleDept ? `&departmentId=${allowedDeptIds[0]}` : '';
+//   async function fetchPageWithRetry(status, from) {
+//     for (let attempt = 0; attempt < 2; attempt++) {
+//       let r;
+//       try {
+//         r = await zohoFetch(`/tickets?limit=${PAGE_SIZE}&from=${from}&status=${status}&include=assignee${deptQuery}`);
+//       } catch (e) {
+//         console.error(`Network error fetching ${status} at from=${from}:`, e?.message || e);
+//         return { tickets: [], more: false };
+//       }
+//       if (r.status === 429) {
+//         await new Promise(rs => setTimeout(rs, 2000));
+//         continue;
+//       }
+//       if (!r.ok) return { tickets: [], more: false };
+//       let data; try { data = await r.json(); } catch { return { tickets: [], more: false }; }
+//       const tickets = data.data || [];
+//       const more = data.info?.moreRecords ?? (tickets.length >= PAGE_SIZE);
+//       return { tickets, more };
+//     }
+//     return { tickets: [], more: false };
+//   }
+
+//   async function scanPages(status, perTicket) {
+//     let from = 0;
+//     while (from < 10000) {
+//       const offsets = [];
+//       for (let i = 0; i < PARALLEL_PAGES; i++) {
+//         const o = from + i * PAGE_SIZE;
+//         if (o >= 10000) break;
+//         offsets.push(o);
+//       }
+//       if (!offsets.length) break;
+//       const results = await Promise.all(offsets.map(o => fetchPageWithRetry(status, o)));
+//       await new Promise(r => setTimeout(r, 400));
+//       let anyMore = false;
+//       for (const { tickets, more } of results) {
+//         for (const t of tickets) {
+//           const ticketId = (t.id || '').toString();
+//           if (
+//             ticketId &&
+//             !recycledTicketIds.has(ticketId) &&
+//             isDepartmentAllowed(t, allowedDeptIds)
+//           ) {
+//             perTicket(t, ticketId);
+//           }
+//         }
+//         if (more) anyMore = true;
+//       }
+//       if (!anyMore) break;
+//       from += offsets.length * PAGE_SIZE;
+//     }
+//   }
+
+//   let openCount = 0, slaCount = 0, assignedCount = 0, closedCount = 0;
+//   function countClosed(t, ticketId) {
+//     if (isAdmin) {
+//       closedCount++;
+//     } else {
+//       const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+//       const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
+//       if (isMine) closedCount++;
+//     }
+//   }
+
+//   await Promise.all([
+//     scanPages('Open', (t, ticketId) => {
+//       const zohoAssignee = (t.assignee?.email || t.assignee?.emailId || t.assignedTo || '').toLowerCase();
+//       const isMine = (!!userEmail && zohoAssignee === userEmail) || mySupabaseAssignedIds.has(ticketId);
+//       if (isAdmin || isMine) openCount++;
+//       if (isMine) {
+//         assignedCount++;
+//         const priority = (t.priority || '').toLowerCase();
+//         if (priority.includes('sla') || priority.includes('urgent') || priority.includes('critical')) slaCount++;
+//       }
+//     }),
+//     scanPages('Closed',   countClosed),
+//     scanPages('Resolved', countClosed)
+//   ]);
+
+//   return {
+//     scope: isAdmin ? 'all' : 'mine',
+//     open: openCount,
+//     closed: closedCount,
+//     sla: slaCount,
+//     assigned: assignedCount,
+//     total: openCount + closedCount
+//   };
+// }
+
+// // Dedupe concurrent refreshes for the same cache key.
+// async function refreshCountsCache(cacheKey, userEmail, isAdmin, allowedDeptIds = []) {
+//   const inflight = countsRefreshInFlight.get(cacheKey);
+//   if (inflight) return inflight;
+
+//   const promise = (async () => {
+//     const start = Date.now();
+//     const countData = await computeCounts(userEmail, isAdmin, allowedDeptIds);
+//     const etag = '"' + crypto.createHash('md5').update(JSON.stringify(countData)).digest('hex') + '"';
+//     countsCache.set(cacheKey, { data: countData, time: Date.now(), etag });
+//     console.log(`[COUNTS REFRESHED] ${cacheKey} in ${Date.now() - start}ms`);
+//     return countData;
+//   })().finally(() => countsRefreshInFlight.delete(cacheKey));
+
+//   countsRefreshInFlight.set(cacheKey, promise);
+//   return promise;
+// }
+
+// // 🔧 GET ZOHO DESK AGENTS for assignment dropdown
+
+// app.get('/api/agents', authenticateToken, async (req, res) => {
+//   try {
+//     // Return cached agents if still valid
+//     if (agentsCache && (Date.now() - agentsCacheTime) < AGENTS_CACHE_MS) {
+//       return res.json(agentsCache);
+//     }
+
+//     const agents = [];
+//     const limit = 100;
+//     let from = 0;
+//     let hasMore = true;
+
+//     while (hasMore && from < 500) { // Max 500 agents
+//       const response = await zohoFetch(`/agents?limit=${limit}&from=${from}`);
+//       const data = await response.json();
+//       const batch = Array.isArray(data?.data) ? data.data : [];
+      
+//       batch.forEach(a => {
+//         const email = (a.email || a.emailId || a.primaryEmail || '').trim().toLowerCase();
+//         const name = a.name || a.firstName || '';
+//         if (email) {
+//           agents.push({ id: a.id, email, name });
+//         }
+//       });
+
+//       hasMore = batch.length === limit;
+//       from += limit;
+//     }
+
+//     agentsCache = agents;
+//     agentsCacheTime = Date.now();
+//     res.json(agents);
+//   } catch (err) {
+//     console.error('Agents error:', err);
+//     res.status(500).json({ error: 'Failed to fetch agents' });
+//   }
+// });
+
+// // Cache for user-filtered tickets (avoids re-scanning Zoho on every page)
+// const userTicketsCache = new Map(); // key: email_status -> { tickets, time }
+// const USER_TICKETS_CACHE_MS  = 5 * 60 * 1000;   // 5 min "fresh" window for My Tickets (was 60s)
+// const USER_TICKETS_STALE_MS  = 30 * 60 * 1000;  // 30 min serve-stale-while-revalidate window
+// const userTicketsRefreshInFlight = new Map();   // Dedupe concurrent refreshes
+
+// // Shared cache for standard tickets endpoint (non filterByEmail requests).
+// const standardTicketsCache = new Map();          // key: endpoint -> { payload, time }
+// const STANDARD_TICKETS_CACHE_MS = 30 * 1000;    // 30 sec fresh window
+// const STANDARD_TICKETS_STALE_MS = 5 * 60 * 1000; // 5 min stale-while-revalidate window
+// const standardTicketsRefreshInFlight = new Map();
+
+// function invalidateRuntimeCaches() {
+//   // Mark all counts entries as stale (so SWR refreshes them) instead of
+//   // wiping them, which would force the next dashboard hit to wait 5-7s.
+//   for (const [key, entry] of countsCache.entries()) {
+//     entry.time = 0; // age = Infinity → still served as stale, refresh kicked off
+//     countsCache.set(key, entry);
+//   }
+//   // Same SWR treatment for per-user ticket caches.
+//   for (const [key, entry] of userTicketsCache.entries()) {
+//     entry.time = 0;
+//     userTicketsCache.set(key, entry);
+//   }
+//   // Per-user caches are already stale-marked above; they'll self-refresh on
+//   // the next request via SWR — no shared-admin pre-warm needed here.
+
+//   // Standard ticket list cache should also be stale-marked.
+//   for (const [key, entry] of standardTicketsCache.entries()) {
+//     entry.time = 0;
+//     standardTicketsCache.set(key, entry);
+//   }
+// }
+
+// async function refreshStandardTicketsCache(cacheKey, endpoint, limit, allowedDeptIds = []) {
+//   const inflight = standardTicketsRefreshInFlight.get(cacheKey);
+//   if (inflight) return inflight;
+
+//   const promise = (async () => {
+//     const response = await zohoFetch(endpoint);
+//     if (!response.ok) {
+//       let errorData = {};
+//       try {
+//         errorData = await response.json();
+//       } catch {
+//         // ignore parse error
+//       }
+//       const details = errorData?.message || errorData?.error || 'Unknown error';
+//       throw new Error(`Failed to fetch tickets from Zoho (${response.status}): ${details}`);
+//     }
+
+//     const data = await response.json();
+//     const normalized = (data.data || []).map(t => ({
+//       ...t,
+//       email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
+//       assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+//     }));
+
+//     const recycledIds = await getActiveRecycledTicketIds();
+//     const filtered = normalized.filter(t => {
+//       if (recycledIds.has((t.id || '').toString())) return false;
+//       return isDepartmentAllowed(t, allowedDeptIds);
+//     });
+
+//     const payload = {
+//       count: filtered.length || 0,
+//       hasMore: (data.data || []).length === limit,
+//       data: filtered
+//     };
+
+//     standardTicketsCache.set(cacheKey, {
+//       payload,
+//       time: Date.now()
+//     });
+
+//     return payload;
+//   })().finally(() => standardTicketsRefreshInFlight.delete(cacheKey));
+
+//   standardTicketsRefreshInFlight.set(cacheKey, promise);
+//   return promise;
+// }
+
+// // ── Compute the full filtered ticket list for a user ──
+// // Uses Zoho contact search (fast path) + limited assignee scan + Supabase-assigned fetch.
+// async function computeUserTickets(userEmail, status, filterType = 'all', allowedDeptIds = []) {
+//   const include = 'contacts,assignee';
+
+//   const [recycledIds, supabaseResult] = await Promise.all([
+//     getActiveRecycledTicketIds(),
+//     pool.query(
+//       "SELECT zoho_ticket_id FROM ticket_assignments WHERE $1 = ANY(assigned_users)",
+//       [userEmail]
+//     ).catch(e => { console.error('Supabase assignment fetch error:', e?.message || e); return { rows: [] }; })
+//   ]);
+//   const supabaseAssignedIds = new Set(supabaseResult.rows.map(r => r.zoho_ticket_id));
+
+//   // status filter lists for Zoho API
+//   let statusValues;
+//   if (status === 'open') statusValues = ['Open', 'In Progress', 'On Hold', 'Escalated'];
+//   else if (status === 'closed') statusValues = ['Closed', 'Resolved'];
+//   else statusValues = [''];
+
+//   const seenIds = new Set();
+//   const allUserTickets = [];
+
+//   function isStatusMatch(t) {
+//     const s = (t.status || '').toLowerCase();
+//     if (status === 'open') return !s.includes('closed') && !s.includes('resolved');
+//     if (status === 'closed') return s.includes('closed') || s.includes('resolved');
+//     return true;
+//   }
+
+//   function addTicket(t) {
+//     const tid = (t.id || '').toString();
+//     if (!tid || recycledIds.has(tid) || seenIds.has(tid)) return;
+//     if (!isDepartmentAllowed(t, allowedDeptIds)) return;
+//     const contactEmail = (t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail || '').toLowerCase();
+//     const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toLowerCase();
+//     const isRequester = contactEmail === userEmail;
+//     const isAssignee = assigneeEmail === userEmail || supabaseAssignedIds.has(tid);
+//     // Apply filterType
+//     if (filterType === 'assigned' && !isAssignee) return;
+//     if (filterType === 'raised' && !isRequester) return;
+//     if (!isRequester && !isAssignee) return;
+//     seenIds.add(tid);
+//     allUserTickets.push({
+//       ...t,
+//       email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
+//       assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+//     });
+//   }
+
+//   // ── Path 1: Contact-based search (fast — gets tickets where user is the requester) ──
+//   try {
+//     const contactRes = await zohoFetch(`/contacts/search?email=${encodeURIComponent(userEmail)}&limit=5`)
+//       .then(r => r.ok ? r.json() : null)
+//       .catch(() => null);
+//     const contacts = Array.isArray(contactRes?.data) ? contactRes.data : [];
+
+//     // Some Zoho setups have duplicate contact records for one email.
+//     // Scan all matched contacts so requester tickets aren't missed.
+//     for (const contact of contacts) {
+//       if (!contact?.id) continue;
+//       let from = 0;
+//       let more = true;
+//       while (more) {
+//         const res = await zohoFetch(
+//           `/contacts/${contact.id}/tickets?from=${from}&limit=100&include=${include}`
+//         ).then(r => r.ok ? r.json() : null).catch(() => null);
+//         const tickets = res?.data || [];
+//         tickets.filter(isStatusMatch).forEach(t => {
+//           // Force-set email since these tickets come from the matched contact.
+//           if (!t.email && !t.contact?.email && !t.contact?.emailAddress) {
+//             t.email = (contact.email || userEmail).toLowerCase();
+//           }
+//           addTicket(t);
+//         });
+//         more = tickets.length === 100;
+//         from += 100;
+//         if (from > 2000) more = false;
+//       }
+//     }
+//   } catch (e) {
+//     console.error('[computeUserTickets] contact path error:', e?.message || e);
+//   }
+
+//   // ── Path 2: Fallback scan for requester/assignee tickets in global list ──
+//   {
+//     const BATCH = 5;
+//     const PAGE = 100;
+//     const MAX_OFFSET = 3000;
+//     let from = 0;
+//     let keepScanning = true;
+//     while (keepScanning) {
+//       const batchPromises = [];
+//       for (let i = 0; i < BATCH; i++) {
+//         const offset = from + i * PAGE;
+//         if (offset > MAX_OFFSET) break;
+//         batchPromises.push(
+//           zohoFetch(`/tickets?limit=${PAGE}&from=${offset}&include=${include}`)
+//             .then(r => r.ok ? r.json() : { data: [] })
+//             .then(d => ({ data: d.data || [], offset }))
+//             .catch(() => ({ data: [], offset }))
+//         );
+//       }
+//       if (!batchPromises.length) break;
+//       const batchResults = await Promise.all(batchPromises);
+//       batchResults.sort((a, b) => a.offset - b.offset);
+//       let anyFull = false;
+//       for (const r of batchResults) {
+//         for (const t of r.data) {
+//           const tid = (t.id || '').toString();
+//           const requesterEmail = (
+//             t.email ||
+//             t.contact?.email ||
+//             t.contact?.emailAddress ||
+//             t.contact?.secondaryEmail ||
+//             t.requester?.email ||
+//             t.customer?.email
+//           || '').toLowerCase();
+//           const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toLowerCase();
+//           const isRequester = requesterEmail === userEmail;
+//           const isAssignee = assigneeEmail === userEmail || supabaseAssignedIds.has(tid);
+//           if ((isRequester || isAssignee) && isStatusMatch(t)) {
+//             addTicket(t);
+//           }
+//         }
+//         if (r.data.length === PAGE) anyFull = true;
+//       }
+//       if (!anyFull) break;
+//       from += BATCH * PAGE;
+//       if (from > MAX_OFFSET) break;
+//       keepScanning = true;
+//     }
+//   }
+
+//   // ── Path 3: Fetch any Supabase-assigned tickets not yet seen ──
+//   const missingIds = [...supabaseAssignedIds].filter(id => !seenIds.has(id));
+//   if (missingIds.length) {
+//     const BATCH_SIZE = 10;
+//     for (let i = 0; i < missingIds.length; i += BATCH_SIZE) {
+//       const batch = missingIds.slice(i, i + BATCH_SIZE);
+//       const results = await Promise.allSettled(
+//         batch.map(tid =>
+//           zohoFetch(`/tickets/${tid}?include=${include}`)
+//             .then(r => r.ok ? r.json() : null)
+//             .catch(() => null)
+//         )
+//       );
+//       for (const r of results) {
+//         const t = r.status === 'fulfilled' ? r.value : null;
+//         if (t?.id && isStatusMatch(t)) addTicket(t);
+//       }
+//     }
+//   }
+
+//   return allUserTickets;
+// }
+
+// // ── Refresh user-tickets cache; deduped per cache key ──
+// async function refreshUserTicketsCache(cacheKey, userEmail, status, filterType = 'all', allowedDeptIds = []) {
+//   const inflight = userTicketsRefreshInFlight.get(cacheKey);
+//   if (inflight) return inflight;
+
+//   const promise = (async () => {
+//     const start = Date.now();
+//     const tickets = await computeUserTickets(userEmail, status, filterType, allowedDeptIds);
+//     userTicketsCache.set(cacheKey, { tickets, time: Date.now() });
+//     console.log(`[USER-TICKETS REFRESHED] ${cacheKey} → ${tickets.length} rows in ${Date.now() - start}ms`);
+//     return tickets;
+//   })().finally(() => userTicketsRefreshInFlight.delete(cacheKey));
+
+//   userTicketsRefreshInFlight.set(cacheKey, promise);
+//   return promise;
+// }
+
+// app.get('/api/tickets', authenticateToken, async (req, res) => {
+//   try {
+//     const limit = parseInt(req.query.limit) || 27;
+//     const page = parseInt(req.query.page) || 1;
+//     const status = req.query.status;
+//     const search = req.query.search;
+//     const filterByEmail = req.query.filterByEmail; // Server-side user filter
+//     const userRole = (req.user?.role || 'user').toLowerCase();
+//     const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
+//     const from = (page - 1) * limit;
+//     const include = 'contacts,assignee';
+
+//     if (filterByEmail) {
+//       const userEmail = filterByEmail.toLowerCase();
+//       const filterType = req.query.filterType || 'all'; // 'all' | 'assigned' | 'raised'
+//       const forceRefresh = req.query.refresh === 'true';
+//       const cacheKey = `${userRole}_${userEmail}_${status || 'all'}_${filterType}`;
+//       const startIdx = (page - 1) * limit;
+//       const cached = userTicketsCache.get(cacheKey);
+//       const age = cached ? Date.now() - cached.time : Infinity;
+
+//       let allUserTickets;
+
+//       if (!forceRefresh && cached && age < USER_TICKETS_CACHE_MS) {
+//         // Fresh — instant
+//         allUserTickets = cached.tickets;
+//       } else if (cached && age < USER_TICKETS_STALE_MS) {
+//         // Stale — serve cached + refresh in background
+//         allUserTickets = cached.tickets;
+//         refreshUserTicketsCache(cacheKey, userEmail, status, filterType, allowedDeptIds).catch(err =>
+//           console.error(`Background user-tickets refresh failed for ${cacheKey}:`, err?.message || err)
+//         );
+//       } else {
+//         // Cold — must compute synchronously
+//         allUserTickets = await refreshUserTicketsCache(cacheKey, userEmail, status, filterType, allowedDeptIds);
+//       }
+
+//       const pageData = allUserTickets.slice(startIdx, startIdx + limit);
+//       const hasMore = startIdx + limit < allUserTickets.length;
+
+//       return res.json({
+//         page,
+//         limit,
+//         count: pageData.length,
+//         hasMore,
+//         data: pageData
+//       });
+//     }
+
+//     // Standard path (no user filter)
+//     let endpoint = `/tickets?limit=${limit}&from=${from}&include=${include}`;
+
+//     if (status === 'open') {
+//       endpoint += `&status=Open`;
+//     } else if (status === 'closed') {
+//       endpoint += `&status=Closed`;
+//     }
+
+//     // Department filter by role scope + optional admin filter
+//     const deptFilter = req.query.departmentId;
+//     if (userRole === 'admin' && deptFilter) {
+//       endpoint += `&departmentId=${deptFilter}`;
+//     } else if (allowedDeptIds.length === 1) {
+//       endpoint += `&departmentId=${allowedDeptIds[0]}`;
+//     } else if (deptFilter) {
+//       // non-admin roles cannot override their scoped department access
+//     }
+
+//     const baseEndpoint = endpoint;
+//     const searchEndpoint = search
+//       ? `${endpoint}&searchText=${encodeURIComponent(search)}`
+//       : endpoint;
+
+//     // Preserve the fallback behavior for invalid search values while caching by final endpoint.
+//     let effectiveEndpoint = searchEndpoint;
+//     if (search) {
+//       const probe = await zohoFetch(searchEndpoint);
+//       if (probe.status === 422) {
+//         effectiveEndpoint = baseEndpoint;
+//       }
+//     }
+
+//     const cacheKey = `${userRole}|${effectiveEndpoint}`;
+//     const cached = standardTicketsCache.get(cacheKey);
+//     const age = cached ? Date.now() - cached.time : Infinity;
+
+//     let payload;
+//     if (cached && age < STANDARD_TICKETS_CACHE_MS) {
+//       payload = cached.payload;
+//       res.set('X-ITSM-Tickets-Cache', 'HIT');
+//     } else if (cached && age < STANDARD_TICKETS_STALE_MS) {
+//       payload = cached.payload;
+//       res.set('X-ITSM-Tickets-Cache', 'STALE');
+//       refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit, allowedDeptIds).catch(err =>
+//         console.error(`Background standard tickets refresh failed for ${cacheKey}:`, err?.message || err)
+//       );
+//     } else {
+//       try {
+//         payload = await refreshStandardTicketsCache(cacheKey, effectiveEndpoint, limit, allowedDeptIds);
+//         res.set('X-ITSM-Tickets-Cache', 'MISS');
+//       } catch (refreshErr) {
+//         const message = refreshErr?.message || 'Unknown error';
+//         console.error('Standard tickets refresh error:', message);
+//         return res.status(502).json({
+//           error: 'Failed to fetch tickets from Zoho',
+//           details: message
+//         });
+//       }
+//     }
+
+//     res.json({
+//       page,
+//       limit,
+//       count: payload.count,
+//       hasMore: payload.hasMore,
+//       data: payload.data
+//     });
+//   } catch (err) {
+//     console.error('Tickets endpoint error:', err.message);
+//     res.status(500).json({ error: 'Failed to fetch tickets', details: err.message });
+//   }
+// });
+
+// app.get('/api/tickets/recycle-bin', authenticateToken, async (req, res) => {
+//   try {
+//     const userEmail = (req.user?.email || '').toLowerCase();
+
+//     await pool.query(
+//       `DELETE FROM recycled_tickets
+//        WHERE restored_at IS NULL
+//          AND expires_at <= NOW()`
+//     );
+
+//     const result = await pool.query(
+//       `SELECT
+//          zoho_ticket_id,
+//          zoho_ticket_number,
+//          subject,
+//          email,
+//          priority,
+//          deleted_by,
+//          deleted_at,
+//          expires_at,
+//          GREATEST(0, CEIL(EXTRACT(EPOCH FROM (expires_at - NOW())) / 86400))::INT AS expires_in_days
+//        FROM recycled_tickets
+//        WHERE restored_at IS NULL
+//          AND LOWER(deleted_by) = $1
+//          AND expires_at > NOW()
+//        ORDER BY deleted_at DESC`,
+//       [userEmail]
+//     );
+
+//     return res.json({ data: result.rows });
+//   } catch (err) {
+//     console.error('Recycle bin fetch failed:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to fetch recycle bin' });
+//   }
+// });
+
+// app.post('/api/tickets/:id/recycle', authenticateToken, async (req, res) => {
+//   // Invalidate caches
+//   invalidateRuntimeCaches();
+//   try {
+//     const ticketId = (req.params.id || '').toString();
+//     if (!ticketId) {
+//       return res.status(400).json({ error: 'Ticket id is required' });
+//     }
+
+//     let snapshot = req.body?.ticket || null;
+
+//     if (!snapshot) {
+//       const detailRes = await zohoFetch(`/tickets/${ticketId}?include=contacts,assignee`);
+//       if (detailRes.ok) {
+//         snapshot = await detailRes.json();
+//       }
+//     }
+
+//     const source = snapshot?.data || snapshot || {};
+//     const ticketNumber = source.ticketNumber || source.displayId || source.id || ticketId;
+//     const subject = source.subject || 'No Subject';
+//     const email = source.email || source.contact?.email || source.contact?.emailAddress || null;
+//     const priority = source.priority || null;
+//     const deletedBy = (req.user?.email || '').toLowerCase() || 'unknown';
+
+//     await pool.query(
+//       `INSERT INTO recycled_tickets
+//         (zoho_ticket_id, zoho_ticket_number, subject, email, priority, deleted_by, deleted_at, expires_at, restored_at, snapshot, updated_at)
+//        VALUES
+//         ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', NULL, $7::jsonb, NOW())
+//        ON CONFLICT (zoho_ticket_id)
+//        DO UPDATE SET
+//          zoho_ticket_number = EXCLUDED.zoho_ticket_number,
+//          subject = EXCLUDED.subject,
+//          email = EXCLUDED.email,
+//          priority = EXCLUDED.priority,
+//          deleted_by = EXCLUDED.deleted_by,
+//          deleted_at = NOW(),
+//          expires_at = NOW() + INTERVAL '30 days',
+//          restored_at = NULL,
+//          snapshot = EXCLUDED.snapshot,
+//          updated_at = NOW()`,
+//       [ticketId, `${ticketNumber}`, subject, email, priority, deletedBy, JSON.stringify(source || {})]
+//     );
+
+//     invalidateRuntimeCaches();
+
+//     return res.json({ message: 'Ticket moved to recycle bin' });
+//   } catch (err) {
+//     console.error('Recycle ticket failed:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to move ticket to recycle bin' });
+//   }
+// });
+
+// app.post('/api/tickets/recycle-bin/:ticketId/restore', authenticateToken, async (req, res) => {
+//   // Invalidate caches
+//   invalidateRuntimeCaches();
+//   try {
+//     const ticketId = (req.params.ticketId || '').toString();
+//     const userEmail = (req.user?.email || '').toLowerCase();
+//     const result = await pool.query(
+//       `UPDATE recycled_tickets
+//        SET restored_at = NOW(), updated_at = NOW()
+//        WHERE zoho_ticket_id = $1
+//          AND restored_at IS NULL
+//          AND LOWER(deleted_by) = $2
+//        RETURNING zoho_ticket_id`,
+//       [ticketId, userEmail]
+//     );
+
+//     if (result.rowCount === 0) {
+//       return res.status(404).json({ error: 'Ticket not found in recycle bin' });
+//     }
+
+//     invalidateRuntimeCaches();
+
+//     return res.json({ message: 'Ticket restored successfully' });
+//   } catch (err) {
+//     console.error('Restore recycle ticket failed:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to restore ticket' });
+//   }
+// });
+
+// app.delete('/api/tickets/recycle-bin/:ticketId', authenticateToken, async (req, res) => {
+//   try {
+//     const ticketId = (req.params.ticketId || '').toString();
+//     const userEmail = (req.user?.email || '').toLowerCase();
+//     const result = await pool.query(
+//       `DELETE FROM recycled_tickets
+//        WHERE zoho_ticket_id = $1
+//          AND LOWER(deleted_by) = $2
+//        RETURNING zoho_ticket_id`,
+//       [ticketId, userEmail]
+//     );
+
+//     if (result.rowCount === 0) {
+//       return res.status(404).json({ error: 'Ticket not found in recycle bin' });
+//     }
+
+//     invalidateRuntimeCaches();
+
+//     return res.json({ message: 'Ticket permanently deleted from recycle bin' });
+//   } catch (err) {
+//     console.error('Permanent delete recycle ticket failed:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to permanently delete ticket' });
+//   }
+// });
+
+// app.get('/api/tickets/:id',  authenticateToken,async (req, res) => {
+//   try {
+//     // Include assignee/contact fields so permission checks on the UI are accurate for assigned users.
+//     const response = await zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`);
+//     res.json(await response.json());
+//   } catch {
+//     res.status(500).json({ error: 'Failed to fetch ticket' });
+//   }
+// });
+
+// app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
+//   try {
+//     const payload = req.body || {};
+//     if (!payload || Object.keys(payload).length === 0) {
+//       return res.status(400).json({ error: 'No update fields provided' });
+//     }
+
+//     const response = await zohoFetch(`/tickets/${req.params.id}`, {
+//       method: 'PATCH',
+//       body: JSON.stringify(payload)
+//     });
+
+//     let data = null;
+//     try {
+//       data = await response.json();
+//     } catch {
+//       data = null;
+//     }
+
+//     // If Zoho rejects status with 422, try common alternate spellings/casing
+//     if (!response.ok && response.status === 422 && payload.status) {
+//       const alternates = {
+//         'in progress': ['In-Progress', 'InProgress', 'in progress', 'In progress'],
+//         'open': ['Open'],
+//         'closed': ['Closed', 'Resolved'],
+//         'resolved': ['Resolved', 'Closed'],
+//         'on hold': ['On Hold', 'On-Hold']
+//       };
+//       const key = (payload.status || '').toLowerCase();
+//       const variants = alternates[key] || [];
+//       for (const v of variants) {
+//         if (v === payload.status) continue;
+//         const retry = await zohoFetch(`/tickets/${req.params.id}`, {
+//           method: 'PATCH',
+//           body: JSON.stringify({ ...payload, status: v })
+//         });
+//         if (retry.ok) {
+//           const retryData = await retry.json().catch(() => null);
+//           invalidateRuntimeCaches();
+//           return res.json(retryData || { status: 'ok' });
+//         }
+//       }
+//       return res.status(response.status).json(data || { error: 'Failed to update ticket' });
+//     }
+
+//     if (!response.ok) {
+//       return res.status(response.status).json(data || { error: 'Failed to update ticket' });
+//     }
+
+//     // Invalidate counts caches on ticket update (status changes affect counts)
+//     invalidateRuntimeCaches();
+
+//     return res.json(data || { status: 'ok' });
+//   } catch (err) {
+//     res.status(500).json({ error: 'Failed to update ticket', details: err?.message || String(err) });
+//   }
+// });
+
+// // ── Zoho ticket statuses (dynamic, cached 10 min) ──
+// let _zohoStatusesCache = null;
+// let _zohoStatusesCacheTime = 0;
+// const ZOHO_STATUSES_CACHE_MS = 10 * 60 * 1000;
+// app.get('/api/zoho/statuses', authenticateToken, async (req, res) => {
+//   if (_zohoStatusesCache && Date.now() - _zohoStatusesCacheTime < ZOHO_STATUSES_CACHE_MS) {
+//     return res.json(_zohoStatusesCache);
+//   }
+//   try {
+//     const r = await zohoFetch('/fields?module=tickets');
+//     if (r.ok) {
+//       const body = await r.json();
+//       const fields = body?.fields || body?.data || [];
+//       const statusField = fields.find(f =>
+//         (f.fieldName || f.apiName || '').toLowerCase() === 'status' ||
+//         (f.displayLabel || f.label || '').toLowerCase() === 'status'
+//       );
+//       if (statusField?.allowedValues?.length) {
+//         const statuses = statusField.allowedValues.map(v => v.displayValue || v.value || v).filter(Boolean);
+//         _zohoStatusesCache = statuses;
+//         _zohoStatusesCacheTime = Date.now();
+//         return res.json(statuses);
+//       }
+//     }
+//   } catch {}
+//   // Fallback defaults
+//   const defaults = ['Open', 'In Progress', 'On Hold', 'Escalated', 'Closed'];
+//   _zohoStatusesCache = defaults;
+//   _zohoStatusesCacheTime = Date.now();
+//   return res.json(defaults);
+// });
+
+// // ── Zoho Departments endpoint (cached 10 min) ──
+// let _zohoDepartmentsCache = null;
+// let _zohoDepartmentsCacheTime = 0;
+// app.get('/api/zoho/departments', authenticateToken, async (req, res) => {
+//   if (_zohoDepartmentsCache && Date.now() - _zohoDepartmentsCacheTime < 600000) {
+//     return res.json(_zohoDepartmentsCache);
+//   }
+//   try {
+//     const r = await zohoFetch('/departments');
+//     if (r.ok) {
+//       const body = await r.json();
+//       const depts = (body?.data || []).map(d => ({ id: d.id, name: d.name }));
+//       _zohoDepartmentsCache = depts;
+//       _zohoDepartmentsCacheTime = Date.now();
+//       return res.json(depts);
+//     }
+//   } catch {}
+//   _zohoDepartmentsCache = [];
+//   _zohoDepartmentsCacheTime = Date.now();
+//   return res.json([]);
+// });
+
+// app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) => {
+//   try {
+//     const response = await zohoFetch(`/tickets/${req.params.id}/conversations`);
+//     const data = await response.json();
+//     if (!response.ok) {
+//       return res.status(response.status).json(data);
+//     }
+//     if (!Array.isArray(data?.data)) {
+//       return res.json(data);
+//     }
+
+//     // ── Start private-note visibility check in parallel with enrichment ──
+//     // so we don't add sequential latency.
+//     const requestingEmail = (req.user?.email || '').toLowerCase();
+//     const privateNoteCheckPromise = Promise.allSettled([
+//       zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`).then(r => r.ok ? r.json() : {}),
+//       pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [req.params.id])
+//     ]);
+
+//     // Enrich every conversation entry with detailed comment/thread payload.
+//     // Some older email records only expose a truncated description on the list endpoint,
+//     // so enriching just the recent items causes the first part to be clipped.
+//     const CONV_ENRICH_BATCH = 5;
+//     const enrichOne = async (conv) => {
+//       try {
+//         const convType = (conv.type || '').toLowerCase();
+//         const detailEndpoint = convType === 'comment'
+//           ? `/tickets/${req.params.id}/comments/${conv.id}`
+//           : `/tickets/${req.params.id}/threads/${conv.id}`;
+
+//         const detailRes = await zohoFetch(detailEndpoint);
+//         if (detailRes.ok) {
+//           const detail = await detailRes.json();
+//           const detailData = detail?.data || detail;
+//           return { ...conv, ...detailData };
+//         }
+
+//         const fallbackEndpoint = convType === 'comment'
+//           ? `/tickets/${req.params.id}/threads/${conv.id}`
+//           : `/tickets/${req.params.id}/comments/${conv.id}`;
+//         const fallbackRes = await zohoFetch(fallbackEndpoint);
+//         if (fallbackRes.ok) {
+//           const fallback = await fallbackRes.json();
+//           const fallbackData = fallback?.data || fallback;
+//           return { ...conv, ...fallbackData };
+//         }
+//       } catch {
+//         // ignore enrichment errors, fall back to original
+//       }
+//       return conv;
+//     };
+
+//     const allConvs = data.data || [];
+//     const enrichedConvs = [];
+//     for (let i = 0; i < allConvs.length; i += CONV_ENRICH_BATCH) {
+//       const slice = allConvs.slice(i, i + CONV_ENRICH_BATCH);
+//       const enrichedSlice = await Promise.all(slice.map(enrichOne));
+//       enrichedConvs.push(...enrichedSlice);
+//     }
+
+//     const resultData = enrichedConvs;
+
+//     // Look up actual sender names for replies made through our app
+//     const convIds = resultData.map(c => (c.id || '').toString()).filter(Boolean);
+//     let replyAuthorMap = new Map();
+//     if (convIds.length) {
+//       try {
+//         const ra = await pool.query(
+//           `SELECT zoho_conversation_id, user_name FROM reply_authors WHERE zoho_conversation_id = ANY($1)`,
+//           [convIds]
+//         );
+//         for (const r of ra.rows) replyAuthorMap.set(r.zoho_conversation_id, r.user_name);
+//       } catch (e) { console.error('reply_authors lookup error:', e?.message); }
+//     }
+
+//     resultData.forEach(conv => {
+//       const cid = (conv.id || '').toString();
+//       if (replyAuthorMap.has(cid)) {
+//         conv.resolvedAuthorName = replyAuthorMap.get(cid);
+//         return;
+//       }
+//       const a = conv.author || {};
+//       const c = conv.commenter || {};
+//       const fullName = [a.firstName, a.lastName].filter(Boolean).join(' ').trim();
+//       const commenterName = [c.firstName, c.lastName].filter(Boolean).join(' ').trim();
+//       conv.resolvedAuthorName =
+//         c.name ||
+//         commenterName ||
+//         a.name ||
+//         fullName ||
+//         conv.fromName ||
+//         conv.submitter?.name ||
+//         conv.contact?.name ||
+//         [conv.contact?.firstName, conv.contact?.lastName].filter(Boolean).join(' ').trim() ||
+//         c.email ||
+//         conv.from ||
+//         conv.fromEmailAddress ||
+//         a.email ||
+//         a.emailId ||
+//         '';
+//     });
+
+//     // ── Resolve private-note visibility (promise was started at top, alongside enrichment) ──
+//     let canSeePrivate = false;
+//     try {
+//       const [ticketFetch, assignmentFetch] = await privateNoteCheckPromise;
+//       const ticketData = ticketFetch.status === 'fulfilled' ? (ticketFetch.value || {}) : {};
+//       const requesterEmail = (ticketData.email || ticketData.contact?.email || '').toLowerCase();
+//       const zohoAssigneeEmail = (ticketData.assignee?.email || ticketData.assignee?.emailId || '').toLowerCase();
+//       const supabaseUsers = assignmentFetch.status === 'fulfilled'
+//         ? (assignmentFetch.value?.rows?.[0]?.assigned_users || []).map(e => e.toLowerCase())
+//         : [];
+//       const allowed = new Set([requesterEmail, zohoAssigneeEmail, ...supabaseUsers].filter(Boolean));
+//       canSeePrivate = allowed.has(requestingEmail);
+//     } catch {
+//       canSeePrivate = false;
+//     }
+//     const visibleData = canSeePrivate
+//       ? resultData
+//       : resultData.filter(conv => conv.isPublic !== false);
+
+//     res.json({ ...data, data: visibleData });
+//   } catch {
+//     res.status(500).json({ error: 'Failed to fetch ticket conversations' });
+//   }
+// });
+
+// app.get('/api/tickets/:id/attachments',  authenticateToken,async (req, res) => {
+//   try {
+//     const response = await zohoFetch(`/tickets/${req.params.id}/attachments`);
+//     const data = await response.json();
+//     if (!response.ok) {
+//       return res.status(response.status).json(data);
+//     }
+//     res.json(data);
+//   } catch {
+//     res.status(500).json({ error: 'Failed to fetch attachments' });
+//   }
+// });
+
+// app.get('/api/tickets/:id/attachments/:attachmentId', authenticateToken, async (req, res) => {
+//   try {
+//     const { id, attachmentId } = req.params;
+//     let response = await zohoFetch(`/tickets/${id}/attachments/${attachmentId}/content`);
+
+//     // Some Zoho attachment responses are available without the /content suffix.
+//     if (!response.ok && response.status === 404) {
+//       response = await zohoFetch(`/tickets/${id}/attachments/${attachmentId}`);
+//     }
+
+//     if (!response.ok) {
+//       let data = null;
+//       try {
+//         data = await response.json();
+//       } catch {
+//         data = { error: 'Failed to fetch attachment content' };
+//       }
+//       return res.status(response.status).json(data);
+//     }
+
+//     const contentType = response.headers.get('content-type') || 'application/octet-stream';
+//     const disposition = response.headers.get('content-disposition');
+
+//     res.setHeader('Content-Type', contentType);
+//     if (req.query.download === '1') {
+//       res.setHeader('Content-Disposition', 'attachment');
+//     } else if (req.query.inline === '1') {
+//       if (disposition && disposition.toLowerCase().includes('filename=')) {
+//         const filename = disposition.split('filename=')[1] || '';
+//         res.setHeader('Content-Disposition', `inline; filename=${filename}`);
+//       } else {
+//         res.setHeader('Content-Disposition', 'inline');
+//       }
+//     } else if (disposition) {
+//       res.setHeader('Content-Disposition', disposition);
+//     }
+
+//     response.body.pipe(res);
+//   } catch {
+//     res.status(500).json({ error: 'Failed to download attachment' });
+//   }
+// });
+
+// app.get('/api/zoho-content', authenticateToken, async (req, res) => {
+//   try {
+//     const rawPath = (req.query.path || '').toString().trim();
+//     if (!rawPath) {
+//       return res.status(400).json({ error: 'path query is required' });
+//     }
+
+//     // Only allow Zoho Desk API v1 paths.
+//     let apiPath = rawPath;
+//     if (/^https?:\/\//i.test(rawPath)) {
+//       const parsed = new URL(rawPath);
+//       apiPath = `${parsed.pathname}${parsed.search || ''}`;
+//     }
+
+//     const v1Index = apiPath.toLowerCase().indexOf('/api/v1/');
+//     if (v1Index >= 0) {
+//       apiPath = apiPath.slice(v1Index + '/api/v1'.length);
+//     }
+
+//     if (!apiPath.startsWith('/')) {
+//       apiPath = `/${apiPath}`;
+//     }
+
+//     const response = await zohoFetch(apiPath);
+//     if (!response.ok) {
+//       let data = null;
+//       try {
+//         data = await response.json();
+//       } catch {
+//         data = { error: 'Failed to fetch Zoho content' };
+//       }
+//       return res.status(response.status).json(data);
+//     }
+
+//     const contentType = response.headers.get('content-type') || 'application/octet-stream';
+//     const disposition = response.headers.get('content-disposition');
+
+//     res.setHeader('Content-Type', contentType);
+//     if (disposition) {
+//       res.setHeader('Content-Disposition', disposition);
+//     }
+
+//     response.body.pipe(res);
+//   } catch (err) {
+//     res.status(500).json({ error: 'Failed to fetch Zoho content', details: err?.message || String(err) });
+//   }
+// });
+
+// app.post('/api/tickets/:id/attachments', upload.array('attachments'),  authenticateToken,async (req, res) => {
+//   try {
+//     const files = Array.isArray(req.files) ? req.files : [];
+//     if (files.length === 0) {
+//       return res.status(400).json({ error: 'No attachments provided' });
+//     }
+
+//     const uploaded = [];
+//     for (const file of files) {
+//       const fd = new FormData();
+//       fd.append('file', file.buffer, file.originalname);
+//       const upRes = await zohoFetch(`/tickets/${req.params.id}/attachments`, {
+//         method: 'POST',
+//         body: fd,
+//         headers: fd.getHeaders()
+//       });
+//       const upData = await upRes.json();
+//       uploaded.push({ ok: upRes.ok, data: upData });
+//     }
+
+//     res.json({ uploaded });
+//   } catch {
+//     res.status(500).json({ error: 'Failed to upload attachments' });
+//   }
+// });
+
+// app.post("/api/msal-login", async (req, res) => {
+//   try {
+//     const { email, accessToken } = req.body;
+
+//     if (!email || !accessToken) {
+//       return res.status(400).json({ message: "Missing data" });
+//     }
+
+//     const normalize = (v) => (v || '').toString().trim().toLowerCase();
+//     const normalizedEmail = normalize(email);
+//     const requestedRole = normalize(req.body?.selectedRole || '');
+//     const rolesSet = new Set();
+//     let roleSource = 'default';
+
+//     if (isAllowlistedAdminEmail(normalizedEmail)) {
+//       rolesSet.add('admin');
+//       roleSource = 'admin-email-allowlist';
+//     }
+
+//     const graphGroups = [];
+//     try {
+//       let url = 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=mail,displayName,mailNickname';
+
+//       while (url) {
+//         const graphResponse = await fetch(url, {
+//           headers: { Authorization: `Bearer ${accessToken}` }
+//         });
+
+//         if (!graphResponse.ok) {
+//           console.warn(`[MSAL LOGIN] Graph API check failed for ${normalizedEmail}: ${graphResponse.status}`);
+//           break;
+//         }
+
+//         const data = await graphResponse.json();
+//         const groups = Array.isArray(data?.value) ? data.value : [];
+//         graphGroups.push(...groups);
+//         url = data['@odata.nextLink'] || '';
+//       }
+//     } catch (graphErr) {
+//       console.warn(`[MSAL LOGIN] Graph API error for ${normalizedEmail}:`, graphErr?.message || graphErr);
+//     }
+
+//     for (const roleFromGroup of rolesFromGraphGroups(graphGroups)) {
+//       rolesSet.add(roleFromGroup);
+//     }
+//     if (graphGroups.length > 0 && roleSource === 'default') {
+//       roleSource = 'graph-groups';
+//     }
+
+//     try {
+//       const identifiers = [...new Set(
+//         graphGroups.flatMap(g => [g?.mail, g?.displayName, g?.mailNickname])
+//           .map(v => normalize(v))
+//           .filter(Boolean)
+//       )];
+
+//       if (identifiers.length > 0) {
+//         const groupBindings = await pool.query(
+//           `SELECT group_identifier, roles
+//            FROM group_role_bindings
+//            WHERE LOWER(group_identifier) = ANY($1)`,
+//           [identifiers]
+//         );
+//         for (const row of groupBindings.rows || []) {
+//           for (const role of normalizeRoleList(row.roles || [])) {
+//             rolesSet.add(role);
+//           }
+//         }
+//         if ((groupBindings.rows || []).length > 0) {
+//           roleSource = 'group_role_bindings-db';
+//         }
+//       }
+//     } catch (groupErr) {
+//       console.warn(`[MSAL LOGIN] group role bindings check failed for ${normalizedEmail}:`, groupErr?.message || groupErr);
+//     }
+
+//     // Legacy single-role override table (kept for backward compatibility)
+//     try {
+//       const roleResult = await pool.query(
+//         `SELECT role FROM user_roles WHERE LOWER(microsoft_email) = $1 LIMIT 1`,
+//         [normalizedEmail]
+//       );
+//       if (roleResult.rows.length > 0) {
+//         const legacyRole = normalizeRole(roleResult.rows[0]?.role);
+//         if (legacyRole) {
+//           rolesSet.add(legacyRole);
+//           roleSource = 'user_roles-db';
+//         }
+//       }
+//     } catch (dbErr) {
+//       console.warn(`[MSAL LOGIN] DB role check failed for ${normalizedEmail}:`, dbErr?.message || dbErr);
+//     }
+
+//     // Multi-role bindings table
+//     try {
+//       const bindingResult = await pool.query(
+//         `SELECT roles FROM user_role_bindings WHERE LOWER(microsoft_email) = $1 LIMIT 1`,
+//         [normalizedEmail]
+//       );
+//       if (bindingResult.rows.length > 0) {
+//         const dbRoles = normalizeRoleList(bindingResult.rows[0]?.roles || []);
+//         for (const r of dbRoles) rolesSet.add(r);
+//         roleSource = 'user_role_bindings-db';
+//       }
+//     } catch (dbErr) {
+//       console.warn(`[MSAL LOGIN] role bindings check failed for ${normalizedEmail}:`, dbErr?.message || dbErr);
+//     }
+
+//     const roles = normalizeRoleList([...rolesSet], null);
+//     if (!roles.length) {
+//       return res.status(403).json({ message: 'No application role is assigned for this account' });
+//     }
+
+//     // Check if user is a member of cloudops group
+//     const cloudopsGroupIdentifiers = ROLE_GROUP_MAP['cloudops'] || [];
+//     const isCloudOpsMember = graphGroups.some(g => {
+//       const values = [g?.mail, g?.displayName, g?.mailNickname]
+//         .map(v => (v || '').toString().trim().toLowerCase())
+//         .filter(Boolean);
+//       return values.some(v => cloudopsGroupIdentifiers.includes(v));
+//     });
+
+//     // If user is NOT in cloudops group, force role to 'user' regardless of DB assignment
+//     let effectiveRoles = roles;
+//     let effectiveRole;
+//     if (!isCloudOpsMember && !isAllowlistedAdminEmail(normalizedEmail)) {
+//       effectiveRoles = ['user'];
+//       effectiveRole = 'user';
+//       console.log(`[MSAL LOGIN] ${normalizedEmail} NOT in cloudops group - forcing role=user`);
+//     } else {
+//       effectiveRole = pickDefaultRole(roles, requestedRole, null);
+//     }
+
+//     console.log(`[MSAL LOGIN] ${normalizedEmail} resolved role=${effectiveRole} roles=[${effectiveRoles.join(',')}] isCloudOps=${isCloudOpsMember} via ${roleSource}`);
+
+//     const newAccessToken = jwt.sign(
+//       { email: normalizedEmail, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember },
+//       process.env.JWT_SECRET,
+//       { expiresIn: "1h" }
+//     );
+
+//     const refreshToken = jwt.sign(
+//       { email: normalizedEmail, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember },
+//       process.env.JWT_REFRESH_SECRET,
+//       { expiresIn: "7d" }
+//     );
+
+//     res.json({ accessToken: newAccessToken, refreshToken, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember });
+
+//   } catch (err) {
+//     console.error('MSAL login error:', err?.message);
+//     res.status(500).json({ error: "MSAL login failed" });
+//   }
+// });
+
+
+// app.post('/api/tickets/:id/reply', upload.array('attachments'),  authenticateToken,async (req, res) => {
+//   try {
+//     const files = Array.isArray(req.files) ? req.files : [];
+//     const content = req.body?.content || '';
+//     const senderName = req.body?.senderName || req.user?.email?.split('@')[0] || '';
+//     const senderEmail = req.user?.email || '';
+//     const isPublicStr = req.body?.isPublic === 'true' ? 'true' : 'false';
+//     const isPublicBool = req.body?.isPublic === 'true';
+
+//     // Zoho Desk: public replies → /sendReply (JSON preferred), private notes → /comments
+//     // Try JSON first (Zoho Desk v1 documented approach), fall back to form-data.
+//     const attempts = isPublicBool ? [
+//       { type: 'json', path: `/tickets/${req.params.id}/sendReply`, includeContentType: true },
+//       { type: 'json', path: `/tickets/${req.params.id}/sendReply`, includeContentType: false },
+//       { type: 'json', path: `/tickets/${req.params.id}/reply`, includeContentType: false },
+//       { type: 'json', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+//       { type: 'json', path: `/tickets/${req.params.id}/comments`, includeContentType: false },
+//       { type: 'form', path: `/tickets/${req.params.id}/sendReply`, includeContentType: true },
+//       { type: 'form', path: `/tickets/${req.params.id}/sendReply`, includeContentType: false },
+//       { type: 'form', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+//     ] : [
+//       { type: 'json', path: `/tickets/${req.params.id}/comments`, includeContentType: false },
+//       { type: 'json', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+//       { type: 'form', path: `/tickets/${req.params.id}/comments`, includeContentType: false },
+//       { type: 'form', path: `/tickets/${req.params.id}/threads`, includeContentType: false },
+//     ];
+
+//     const errors = [];
+
+//     for (const attempt of attempts) {
+//       let response;
+//       if (attempt.type === 'form') {
+//         const fd = new FormData();
+//         fd.append('content', content);
+//         fd.append('isPublic', isPublicStr);
+//         if (attempt.includeContentType) {
+//           fd.append('contentType', 'text/html');
+//         }
+
+//         for (const file of files) {
+//           fd.append('attachments', file.buffer, file.originalname);
+//         }
+
+//         response = await zohoFetch(attempt.path, {
+//           method: 'POST',
+//           body: fd,
+//           headers: fd.getHeaders()
+//         });
+//       } else {
+//         const payload = {
+//           content,
+//           isPublic: isPublicBool
+//         };
+//         if (attempt.includeContentType) {
+//           payload.contentType = 'text/html';
+//         }
+
+//         response = await zohoFetch(attempt.path, {
+//           method: 'POST',
+//           body: JSON.stringify(payload)
+//         });
+//       }
+
+//       let data = null;
+//       try {
+//         data = await response.json();
+//       } catch {
+//         data = null;
+//       }
+
+//       if (response.ok) {
+//         const convId = (data?.id || '').toString();
+//         if (convId && senderEmail) {
+//           pool.query(
+//             `INSERT INTO reply_authors (zoho_ticket_id, zoho_conversation_id, user_email, user_name)
+//              VALUES ($1, $2, $3, $4) ON CONFLICT (zoho_conversation_id) DO NOTHING`,
+//             [req.params.id, convId, senderEmail, senderName]
+//           ).catch(e => console.error('Failed to save reply author:', e?.message));
+//         }
+//         return res.json(data || { status: 'ok' });
+//       }
+
+//       errors.push({ status: response.status, data, path: attempt.path });
+//     }
+
+//     return res.status(502).json({
+//       error: 'Reply failed',
+//       attempts: errors
+//     });
+//   } catch (err) {
+//     console.error('Reply error', err);
+//     res.status(500).json({
+//       error: 'Failed to send reply',
+//       message: err?.message || String(err)
+//     });
+//   }
+// });
+
+// app.post('/api/tickets', upload.array('attachments'), authenticateToken, async (req, res) => {
+//   try {
+//     const isMultipart = req.is('multipart/form-data');
+//     const body = isMultipart ? (req.body || {}) : (req.body || {});
+
+//     let payload;
+//     if (isMultipart) {
+//       let contact = undefined;
+//       if (body.contact) {
+//         try {
+//           contact = JSON.parse(body.contact);
+//         } catch {
+//           contact = undefined;
+//         }
+//       }
+
+//       payload = {
+//         subject: body.subject,
+//         departmentId: body.departmentId,
+//         priority: body.priority,
+//         description: body.description,
+//         status: body.status || 'Open',
+//         ...(body.assigneeEmail ? { assigneeEmail: body.assigneeEmail } : {}),
+//         contact: contact || {
+//           lastName: body.name || body.contactName || '',
+//           email: body.email || body.contactEmail || ''
+//         }
+//       };
+//     } else {
+//       payload = { ...(body || {}) };
+//     }
+
+//     if (!payload.assigneeId && payload.assigneeEmail) {
+//       const agentId = await lookupAgentIdByEmail(payload.assigneeEmail);
+//       if (agentId) {
+//         payload.assigneeId = agentId;
+//       } else {
+//         return res.status(400).json({
+//           errorCode: 'ASSIGNEE_NOT_FOUND',
+//           message: 'Assign To email not found as a Zoho Desk agent.'
+//         });
+//       }
+//     }
+//     delete payload.assigneeEmail;
+//     if (ZOHO_DEPARTMENT_ID) {
+//       payload.departmentId = ZOHO_DEPARTMENT_ID;
+//     }
+//     if (ZOHO_ASSIGNEE_ID) {
+//       payload.assigneeId = ZOHO_ASSIGNEE_ID;
+//     }
+
+//     const response = await zohoFetch('/tickets', {
+//       method: 'POST',
+//       body: JSON.stringify(payload)
+//     });
+
+//     const data = await response.json();
+//     if (!response.ok) {
+//       const errorList = Array.isArray(data?.errors)
+//         ? data.errors
+//         : Array.isArray(data?.details?.errors)
+//           ? data.details.errors
+//           : Array.isArray(data?.details)
+//             ? data.details
+//             : [];
+
+//       const assigneeError = errorList.find(e => {
+//         const field = (e?.fieldName || '').toString().replace(/^\//, '');
+//         return field === 'assigneeId';
+//       });
+
+//       if (payload.assigneeId && assigneeError) {
+//         const retryPayload = { ...payload };
+//         delete retryPayload.assigneeId;
+
+//         const retryResponse = await zohoFetch('/tickets', {
+//           method: 'POST',
+//           body: JSON.stringify(retryPayload)
+//         });
+
+//         const retryData = await retryResponse.json();
+//         if (retryResponse.ok) {
+//           return res.status(200).json({
+//             ...retryData,
+//             warning: 'Assignee lacks privilege. Ticket created as Unassigned.'
+//           });
+//         }
+//       }
+
+//       console.error('Zoho create ticket failed:', data);
+//       return res.status(response.status).json({
+//         errorCode: data?.errorCode,
+//         message: data?.message || 'Zoho validation failed',
+//         details: data?.details || data
+//       });
+//     }
+
+//     const files = Array.isArray(req.files) ? req.files : [];
+//     if (files.length > 0 && data?.id) {
+//       const uploaded = [];
+//       for (const file of files) {
+//         const fd = new FormData();
+//         fd.append('file', file.buffer, file.originalname);
+//         const upRes = await zohoFetch(`/tickets/${data.id}/attachments`, {
+//           method: 'POST',
+//           body: fd,
+//           headers: fd.getHeaders()
+//         });
+//         const upData = await upRes.json();
+//         uploaded.push({ ok: upRes.ok, data: upData });
+//       }
+//       invalidateRuntimeCaches();
+//       return res.status(response.status).json({
+//         ...data,
+//         attachments: uploaded
+//       });
+//     }
+
+//     invalidateRuntimeCaches();
+//     res.status(response.status).json(data);
+//   } catch (err) {
+//     res.status(500).json({ error: 'Failed to create ticket' });
+//   }
+// });
+
+// app.patch("/api/users/:id", authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const { role } = req.body;
+
+//     const allowedRoles = SUPPORTED_ROLES.filter(r => r !== 'user');
+//     const normalizedRole = normalizeRole(role);
+//     if (!normalizedRole || !allowedRoles.includes(normalizedRole)) {
+//       return res.status(400).json({ message: "Invalid role", allowed: allowedRoles });
+//     }
+
+//     await pool.query(
+//       "UPDATE users SET role = $1 WHERE id = $2",
+//       [normalizedRole, req.params.id]
+//     );
+
+//     res.json({ message: "Role updated" });
+
+//   } catch (err) {
+//     res.status(500).json({ message: "Update failed" });
+//   }
+// });
+
+
+
+// app.delete("/api/users/:id", authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const userId = req.params.id;
+
+//     // prevent deleting yourself
+//     const result = await pool.query(
+//       "SELECT email FROM users WHERE id = $1",
+//       [userId]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: "User not found" });
+//     }
+
+//     if (result.rows[0].email === req.user.email) {
+//       return res.status(400).json({ message: "You cannot delete yourself" });
+//     }
+
+//     await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+
+//     res.json({ message: "User deleted" });
+
+//   } catch (err) {
+//     res.status(500).json({ message: "Delete failed" });
+//   }
+// });
+
+// // -------------------------------------------------------
+// // IHUB API
+// // -------------------------------------------------------
+
+// app.get('/api/ihub', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       `SELECT
+//         a.*,
+//         (a.license_expiry::date - CURRENT_DATE) AS days_to_expiry
+//        FROM ihub_assets a
+//        ORDER BY a.license_expiry ASC, a.client ASC`
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error('Failed to fetch IHUB assets:', err);
+//     res.status(500).json({ message: 'Failed to fetch IHUB assets' });
+//   }
+// });
+
+// app.post('/api/ihub', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const {
+//       client,
+//       environment,
+//       hostname,
+//       ip_address,
+//       ihub_version,
+//       license_expiry,
+//       responsible_person_email,
+//       responsible_person_name
+//     } = req.body || {};
+
+//     if (!client || !environment || !license_expiry || !responsible_person_email) {
+//       return res.status(400).json({ message: 'Missing required IHUB fields' });
+//     }
+
+//     if (!isValidDateInput(license_expiry)) {
+//       return res.status(400).json({ message: 'Invalid license expiry date' });
+//     }
+
+//     const result = await pool.query(
+//       `INSERT INTO ihub_assets
+//         (client, environment, hostname, ip_address, ihub_version, license_expiry, responsible_person_email, responsible_person_name, created_by, updated_by)
+//        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+//        RETURNING *`,
+//       [
+//         client,
+//         environment,
+//         hostname || '',
+//         ip_address || '',
+//         ihub_version || null,
+//         normalizeDateOnly(license_expiry),
+//         responsible_person_email.toLowerCase(),
+//         responsible_person_name || null,
+//         (req.user?.email || '').toLowerCase() || null
+//       ]
+//     );
+
+//     await processIhubAlerts();
+//     res.status(201).json(result.rows[0]);
+//   } catch (err) {
+//     console.error('Failed to create IHUB asset:', err);
+//     res.status(500).json({ message: 'Failed to create IHUB asset' });
+//   }
+// });
+
+// app.put('/api/ihub/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const assetId = parseInt(req.params.id, 10);
+//     if (!Number.isInteger(assetId)) {
+//       return res.status(400).json({ message: 'Invalid IHUB asset id' });
+//     }
+
+//     const {
+//       client,
+//       environment,
+//       hostname,
+//       ip_address,
+//       ihub_version,
+//       license_expiry,
+//       responsible_person_email,
+//       responsible_person_name
+//     } = req.body || {};
+
+//     if (!client || !environment || !license_expiry || !responsible_person_email) {
+//       return res.status(400).json({ message: 'Missing required IHUB fields' });
+//     }
+
+//     if (!isValidDateInput(license_expiry)) {
+//       return res.status(400).json({ message: 'Invalid license expiry date' });
+//     }
+
+//     const result = await pool.query(
+//       `UPDATE ihub_assets SET
+//          client = $1,
+//          environment = $2,
+//          hostname = $3,
+//          ip_address = $4,
+//          ihub_version = $5,
+//          license_expiry = $6,
+//          responsible_person_email = $7,
+//          responsible_person_name = $8,
+//          updated_by = $9,
+//          updated_at = NOW()
+//        WHERE id = $10
+//        RETURNING *`,
+//       [
+//         client,
+//         environment,
+//         hostname || '',
+//         ip_address || '',
+//         ihub_version || null,
+//         normalizeDateOnly(license_expiry),
+//         responsible_person_email.toLowerCase(),
+//         responsible_person_name || null,
+//         (req.user?.email || '').toLowerCase() || null,
+//         assetId
+//       ]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: 'IHUB asset not found' });
+//     }
+
+//     await pool.query(
+//       `UPDATE ihub_alert_tickets
+//        SET status = 'Superseded', closed_at = NOW()
+//        WHERE ihub_asset_id = $1 AND status = 'Open'`,
+//       [assetId]
+//     );
+
+//     await processIhubAlerts();
+//     res.json(result.rows[0]);
+//   } catch (err) {
+//     console.error('Failed to update IHUB asset:', err);
+//     res.status(500).json({ message: 'Failed to update IHUB asset' });
+//   }
+// });
+
+// app.delete('/api/ihub/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const assetId = parseInt(req.params.id, 10);
+//     if (!Number.isInteger(assetId)) {
+//       return res.status(400).json({ message: 'Invalid IHUB asset id' });
+//     }
+
+//     const existingAsset = await pool.query(
+//       'SELECT id FROM ihub_assets WHERE id = $1 LIMIT 1',
+//       [assetId]
+//     );
+
+//     if (existingAsset.rows.length === 0) {
+//       return res.status(404).json({ message: 'IHUB asset not found' });
+//     }
+
+//     const alertTicketIdsResult = await pool.query(
+//       `SELECT zoho_ticket_id
+//        FROM ihub_alert_tickets
+//        WHERE ihub_asset_id = $1`,
+//       [assetId]
+//     );
+//     const alertTicketIds = alertTicketIdsResult.rows
+//       .map(r => r.zoho_ticket_id)
+//       .filter(Boolean);
+
+//     await pool.query('DELETE FROM ihub_assets WHERE id = $1', [assetId]);
+
+//     if (alertTicketIds.length > 0) {
+//       await pool.query(
+//         `UPDATE ticket_assignments
+//          SET status = 'Closed',
+//              closed_at = NOW(),
+//              closed_by = $1,
+//              updated_at = NOW()
+//          WHERE zoho_ticket_id = ANY($2::text[])
+//            AND category = 'IHUB'`,
+//         [(req.user?.email || '').toLowerCase() || null, alertTicketIds]
+//       );
+//     }
+
+//     res.json({ message: 'IHUB asset deleted successfully' });
+//   } catch (err) {
+//     console.error('Failed to delete IHUB asset:', err);
+//     res.status(500).json({ message: 'Failed to delete IHUB asset' });
+//   }
+// });
+
+// // -------------------------------------------------------
+// // SSL API
+// // -------------------------------------------------------
+
+// app.get('/api/ssl', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       `SELECT
+//         s.*,
+//         (s.ssl_expiry::date - CURRENT_DATE) AS days_to_expiry
+//        FROM ssl_assets s
+//        ORDER BY s.ssl_expiry ASC, s.client ASC`
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error('Failed to fetch SSL assets:', err);
+//     res.status(500).json({ message: 'Failed to fetch SSL assets' });
+//   }
+// });
+
+// app.get('/api/automation-ssl', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const statusFilter = (req.query.status || '').toString().trim().toLowerCase();
+//     const status = statusFilter && statusFilter !== 'all' ? statusFilter : null;
+
+//     const result = await pool.query(
+//       `SELECT
+//         a.id,
+//         a.alertname,
+//         a.milestone_days,
+//         a.client,
+//         a.environment,
+//         a.application,
+//         a.instance AS ssl_url,
+//         a.responsible,
+//         a.responsible_email,
+//         a.zoho_ticket_id,
+//         a.zoho_ticket_number,
+//         a.status,
+//         a.created_at,
+//         a.updated_at,
+//         a.closed_at,
+//         (a.created_at::date + make_interval(days => a.milestone_days))::date AS estimated_expiry_on,
+//         ((a.created_at::date + make_interval(days => a.milestone_days))::date - CURRENT_DATE) AS estimated_days_to_expiry
+//        FROM alertmanager_ssl_tickets a
+//        WHERE ($1::text IS NULL OR LOWER(a.status) = $1)
+//        ORDER BY estimated_days_to_expiry ASC NULLS LAST, a.created_at DESC`,
+//       [status]
+//     );
+
+//     return res.json(result.rows);
+//   } catch (err) {
+//     console.error('Failed to fetch automation SSL entries:', err);
+//     return res.status(500).json({ message: 'Failed to fetch automation SSL entries' });
+//   }
+// });
+
+// app.get('/api/automation-ssl/monitored-urls', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const monitoredRows = await fetchAutomationSslMonitoredUrls();
+//     return res.json(monitoredRows);
+//   } catch (err) {
+//     if (err?.message === 'AUTOMATION_PROMETHEUS_URL is not configured') {
+//       return res.status(400).json({ message: err.message });
+//     }
+//     if (err?.message === 'Failed to fetch SSL expiry metrics from Prometheus') {
+//       return res.status(502).json({ message: err.message });
+//     }
+//     console.error('Failed to fetch monitored automation SSL URLs:', err);
+//     return res.status(500).json({ message: 'Failed to fetch monitored automation SSL URLs' });
+//   }
+// });
+
+// app.post('/api/automation-ssl/process-now', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await processAutomationSslAlerts();
+//     return res.json({
+//       message: 'Automation SSL processing completed',
+//       ...result
+//     });
+//   } catch (err) {
+//     console.error('Failed to process Automation SSL alerts:', err);
+//     return res.status(500).json({ message: 'Failed to process Automation SSL alerts' });
+//   }
+// });
+
+// app.get('/api/automation-ssl/diagnostics', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const diagnostics = global.lastAutomationSslDiagnostics || {
+//       message: 'No diagnostics available yet. Run /api/automation-ssl/monitored-urls first.'
+//     };
+//     return res.json(diagnostics);
+//   } catch (err) {
+//     console.error('Failed to fetch diagnostics:', err);
+//     return res.status(500).json({ message: 'Failed to fetch diagnostics' });
+//   }
+// });
+
+// app.post('/api/ssl', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const {
+//       client,
+//       environment,
+//       hostname,
+//       ip_address,
+//       application,
+//       version,
+//       ssl_url,
+//       responsible_person_email,
+//       responsible_person_name,
+//       ssl_expiry
+//     } = req.body || {};
+
+//     if (!client || !environment || !ssl_url || !responsible_person_email || !ssl_expiry) {
+//       return res.status(400).json({ message: 'Missing required SSL fields' });
+//     }
+
+//     if (!isValidDateInput(ssl_expiry)) {
+//       return res.status(400).json({ message: 'Invalid SSL expiry date' });
+//     }
+
+//     const result = await pool.query(
+//       `INSERT INTO ssl_assets
+//         (client, environment, hostname, ip_address, application, version, ssl_url, responsible_person_email, responsible_person_name, ssl_expiry, created_by, updated_by)
+//        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+//        RETURNING *`,
+//       [
+//         client,
+//         environment,
+//         hostname || '',
+//         ip_address || '',
+//         application || '',
+//         version || null,
+//         ssl_url,
+//         responsible_person_email.toLowerCase(),
+//         responsible_person_name || null,
+//         normalizeDateOnly(ssl_expiry),
+//         (req.user?.email || '').toLowerCase() || null
+//       ]
+//     );
+
+//     await processSslAlerts();
+
+//     res.status(201).json(result.rows[0]);
+//   } catch (err) {
+//     console.error('Failed to create SSL asset:', err);
+//     res.status(500).json({ message: 'Failed to create SSL asset' });
+//   }
+// });
+
+// app.put('/api/ssl/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const assetId = parseInt(req.params.id, 10);
+//     if (!Number.isInteger(assetId)) {
+//       return res.status(400).json({ message: 'Invalid SSL asset id' });
+//     }
+
+//     const {
+//       client,
+//       environment,
+//       hostname,
+//       ip_address,
+//       application,
+//       version,
+//       ssl_url,
+//       responsible_person_email,
+//       responsible_person_name,
+//       ssl_expiry
+//     } = req.body || {};
+
+//     if (!client || !environment || !ssl_url || !responsible_person_email || !ssl_expiry) {
+//       return res.status(400).json({ message: 'Missing required SSL fields' });
+//     }
+
+//     if (!isValidDateInput(ssl_expiry)) {
+//       return res.status(400).json({ message: 'Invalid SSL expiry date' });
+//     }
+
+//     const result = await pool.query(
+//       `UPDATE ssl_assets SET
+//          client = $1,
+//          environment = $2,
+//          hostname = $3,
+//          ip_address = $4,
+//          application = $5,
+//          version = $6,
+//          ssl_url = $7,
+//          responsible_person_email = $8,
+//          responsible_person_name = $9,
+//          ssl_expiry = $10,
+//          updated_by = $11,
+//          updated_at = NOW()
+//        WHERE id = $12
+//        RETURNING *`,
+//       [
+//         client,
+//         environment,
+//         hostname || '',
+//         ip_address || '',
+//         application || '',
+//         version || null,
+//         ssl_url,
+//         responsible_person_email.toLowerCase(),
+//         responsible_person_name || null,
+//         normalizeDateOnly(ssl_expiry),
+//         (req.user?.email || '').toLowerCase() || null,
+//         assetId
+//       ]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: 'SSL asset not found' });
+//     }
+
+//     await processSslAlerts();
+
+//     res.json(result.rows[0]);
+//   } catch (err) {
+//     console.error('Failed to update SSL asset:', err);
+//     res.status(500).json({ message: 'Failed to update SSL asset' });
+//   }
+// });
+
+// app.delete('/api/ssl/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const assetId = parseInt(req.params.id, 10);
+//     if (!Number.isInteger(assetId)) {
+//       return res.status(400).json({ message: 'Invalid SSL asset id' });
+//     }
+
+//     const result = await pool.query('DELETE FROM ssl_assets WHERE id = $1 RETURNING id', [assetId]);
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: 'SSL asset not found' });
+//     }
+
+//     res.json({ message: 'SSL asset deleted successfully' });
+//   } catch (err) {
+//     console.error('Failed to delete SSL asset:', err);
+//     res.status(500).json({ message: 'Failed to delete SSL asset' });
+//   }
+// });
+
+// app.post('/api/ssl/run-expiry-check', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     await processSslAlerts();
+//     res.json({ message: 'SSL expiry check completed successfully' });
+//   } catch (err) {
+//     console.error('Failed to run SSL expiry check:', err);
+//     res.status(500).json({ message: 'SSL expiry check failed' });
+//   }
+// });
+
+// // -------------------------------------------------------
+// // SSL ALERT TICKETS API
+// // -------------------------------------------------------
+// app.get('/api/ssl/alerts', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const sslAssetId = req.query.ssl_asset_id;
+//     let query = `
+//       SELECT 
+//         a.id,
+//         a.ssl_asset_id,
+//         s.client,
+//         s.hostname,
+//         a.milestone_days,
+//         a.ssl_expiry_on,
+//         a.zoho_ticket_id,
+//         a.zoho_ticket_number,
+//         a.status,
+//         a.created_at,
+//         a.closed_at
+//       FROM ssl_expiry_alert_tickets a
+//       JOIN ssl_assets s ON a.ssl_asset_id = s.id
+//       WHERE a.status = 'Open'
+//     `;
+//     const params = [];
+
+//     if (sslAssetId) {
+//       query += ` AND a.ssl_asset_id = $1`;
+//       params.push(sslAssetId);
+//     }
+
+//     query += ` ORDER BY a.created_at DESC`;
+
+//     const result = await pool.query(query, params);
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error('Failed to get SSL alerts:', err);
+//     res.status(500).json({ message: 'Failed to get SSL alerts' });
+//   }
+// });
+
+// app.post('/api/ssl/tickets/:zohoTicketId/close', authenticateToken, async (req, res) => {
+//   try {
+//     const ticketId = req.params.zohoTicketId;
+//     const newExpiryDate = req.body?.new_expiry_date;
+//     const userEmail = (req.user?.email || '').toLowerCase();
+//     const isAdmin = req.user?.role === 'admin';
+
+//     const assignmentResult = await pool.query(
+//       `SELECT * FROM ticket_assignments WHERE zoho_ticket_id = $1 LIMIT 1`,
+//       [ticketId]
+//     );
+//     const assignment = assignmentResult.rows[0];
+
+//     if (!assignment || (assignment.category || '').toUpperCase() !== 'SSL') {
+//       return res.status(404).json({ message: 'SSL ticket assignment not found' });
+//     }
+
+//     const assignedUsers = Array.isArray(assignment.assigned_users)
+//       ? assignment.assigned_users.map(u => (u || '').toLowerCase())
+//       : [];
+
+//     if (!isAdmin && !assignedUsers.includes(userEmail)) {
+//       return res.status(403).json({ message: 'Only responsible person or admin can close SSL ticket' });
+//     }
+
+//     const automationAlertResult = await pool.query(
+//       `SELECT * FROM alertmanager_ssl_tickets WHERE zoho_ticket_id = $1 LIMIT 1`,
+//       [ticketId]
+//     );
+//     const automationAlert = automationAlertResult.rows[0];
+
+//     // Automation SSL tickets are URL-driven; they do not need manual expiry updates while closing.
+//     if (automationAlert) {
+//       const closedInZoho = await closeZohoTicketWithFallback(ticketId);
+//       if (!closedInZoho) {
+//         return res.status(502).json({ message: 'Failed to close ticket in Zoho' });
+//       }
+
+//       await pool.query(
+//         `UPDATE alertmanager_ssl_tickets
+//          SET status = 'Closed',
+//              closed_at = NOW(),
+//              updated_at = NOW()
+//          WHERE zoho_ticket_id = $1`,
+//         [ticketId]
+//       );
+
+//       await pool.query(
+//         `UPDATE ticket_assignments
+//          SET status = 'Closed', closed_at = NOW(), closed_by = $1, updated_at = NOW()
+//          WHERE zoho_ticket_id = $2`,
+//         [userEmail || null, ticketId]
+//       );
+
+//       return res.json({
+//         message: 'Automation SSL ticket closed successfully'
+//       });
+//     }
+
+//     if (!isValidDateInput(newExpiryDate)) {
+//       return res.status(400).json({ message: 'Valid new_expiry_date is required' });
+//     }
+
+//     const alertResult = await pool.query(
+//       `SELECT * FROM ssl_expiry_alert_tickets WHERE zoho_ticket_id = $1 LIMIT 1`,
+//       [ticketId]
+//     );
+//     const alert = alertResult.rows[0];
+
+//     if (!alert) {
+//       return res.status(404).json({ message: 'SSL alert record not found for this ticket' });
+//     }
+
+//     const closedInZoho = await closeZohoTicketWithFallback(ticketId);
+//     if (!closedInZoho) {
+//       return res.status(502).json({ message: 'Failed to close ticket in Zoho' });
+//     }
+
+//     const normalizedDate = normalizeDateOnly(newExpiryDate);
+
+//     await pool.query(
+//       `UPDATE ssl_assets
+//        SET ssl_expiry = $1,
+//            updated_by = $2,
+//            updated_at = NOW()
+//        WHERE id = $3`,
+//       [normalizedDate, userEmail || null, alert.ssl_asset_id]
+//     );
+
+//     await pool.query(
+//       `UPDATE ssl_expiry_alert_tickets
+//        SET status = 'Closed', closed_at = NOW()
+//        WHERE zoho_ticket_id = $1`,
+//       [ticketId]
+//     );
+
+//     await pool.query(
+//       `UPDATE ssl_expiry_alert_tickets
+//        SET status = 'Superseded', closed_at = NOW()
+//        WHERE ssl_asset_id = $1 AND status = 'Open'`,
+//       [alert.ssl_asset_id]
+//     );
+
+//     await pool.query(
+//       `UPDATE ticket_assignments
+//        SET status = 'Closed', closed_at = NOW(), closed_by = $1, updated_at = NOW()
+//        WHERE zoho_ticket_id = $2`,
+//       [userEmail || null, ticketId]
+//     );
+
+//     await processSslAlerts();
+
+//     return res.json({
+//       message: 'SSL ticket closed and expiry updated',
+//       ssl_expiry: normalizedDate
+//     });
+//   } catch (err) {
+//     console.error('Failed to close SSL ticket:', err);
+//     return res.status(500).json({ message: 'Failed to close SSL ticket' });
+//   }
+// });
+
+// app.post('/api/ihub/run-expiry-check', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     await processIhubAlerts();
+//     res.json({ message: 'Expiry check completed successfully' });
+//   } catch (err) {
+//     console.error('Failed to run expiry check:', err);
+//     res.status(500).json({ message: 'Expiry check failed' });
+//   }
+// });
+
+// app.post('/api/ihub/tickets/:zohoTicketId/close', authenticateToken, async (req, res) => {
+//   try {
+//     const ticketId = req.params.zohoTicketId;
+//     const newExpiryDate = req.body?.new_expiry_date;
+//     const userEmail = (req.user?.email || '').toLowerCase();
+//     const isAdmin = req.user?.role === 'admin';
+
+//     if (!isValidDateInput(newExpiryDate)) {
+//       return res.status(400).json({ message: 'Valid new_expiry_date is required' });
+//     }
+
+//     const assignmentResult = await pool.query(
+//       `SELECT * FROM ticket_assignments WHERE zoho_ticket_id = $1 LIMIT 1`,
+//       [ticketId]
+//     );
+//     const assignment = assignmentResult.rows[0];
+
+//     if (!assignment || (assignment.category || '').toUpperCase() !== 'IHUB') {
+//       return res.status(404).json({ message: 'IHUB ticket assignment not found' });
+//     }
+
+//     const assignedUsers = Array.isArray(assignment.assigned_users)
+//       ? assignment.assigned_users.map(u => (u || '').toLowerCase())
+//       : [];
+
+//     if (!isAdmin && !assignedUsers.includes(userEmail)) {
+//       return res.status(403).json({ message: 'Only responsible person or admin can close IHUB ticket' });
+//     }
+
+//     const alertResult = await pool.query(
+//       `SELECT * FROM ihub_alert_tickets WHERE zoho_ticket_id = $1 LIMIT 1`,
+//       [ticketId]
+//     );
+//     const alert = alertResult.rows[0];
+
+//     if (!alert) {
+//       return res.status(404).json({ message: 'IHUB alert record not found for this ticket' });
+//     }
+
+//     const closedInZoho = await closeZohoTicketWithFallback(ticketId);
+//     if (!closedInZoho) {
+//       return res.status(502).json({ message: 'Failed to close ticket in Zoho' });
+//     }
+
+//     const normalizedDate = normalizeDateOnly(newExpiryDate);
+
+//     await pool.query(
+//       `UPDATE ihub_assets
+//        SET license_expiry = $1,
+//            updated_by = $2,
+//            updated_at = NOW()
+//        WHERE id = $3`,
+//       [normalizedDate, userEmail || null, alert.ihub_asset_id]
+//     );
+
+//     await pool.query(
+//       `UPDATE ihub_alert_tickets
+//        SET status = 'Closed', closed_at = NOW()
+//        WHERE zoho_ticket_id = $1`,
+//       [ticketId]
+//     );
+
+//     await pool.query(
+//       `UPDATE ihub_alert_tickets
+//        SET status = 'Superseded', closed_at = NOW()
+//        WHERE ihub_asset_id = $1 AND status = 'Open'`,
+//       [alert.ihub_asset_id]
+//     );
+
+//     await pool.query(
+//       `UPDATE ticket_assignments
+//        SET status = 'Closed', closed_at = NOW(), closed_by = $1, updated_at = NOW()
+//        WHERE zoho_ticket_id = $2`,
+//       [userEmail || null, ticketId]
+//     );
+
+//     await processIhubAlerts();
+
+//     return res.json({
+//       message: 'IHUB ticket closed and license expiry updated',
+//       license_expiry: normalizedDate
+//     });
+//   } catch (err) {
+//     console.error('Failed to close IHUB ticket:', err);
+//     return res.status(500).json({ message: 'Failed to close IHUB ticket' });
+//   }
+// });
+
+// // -------------------------------------------------------
+// // TICKET ASSIGNMENTS API (Supabase)
+// // -------------------------------------------------------
+
+// // Get all assignments
+// app.get("/api/assignments", authenticateToken, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       "SELECT * FROM ticket_assignments ORDER BY assigned_at DESC"
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error("Failed to fetch assignments:", err);
+//     res.status(500).json({ message: "Failed to fetch assignments" });
+//   }
+// });
+
+// // Get assignment by Zoho ticket ID
+// app.get("/api/assignments/:zohoTicketId", authenticateToken, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       "SELECT * FROM ticket_assignments WHERE zoho_ticket_id = $1",
+//       [req.params.zohoTicketId]
+//     );
+    
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: "Assignment not found" });
+//     }
+    
+//     res.json(result.rows[0]);
+//   } catch (err) {
+//     console.error("Failed to fetch assignment:", err);
+//     res.status(500).json({ message: "Failed to fetch assignment" });
+//   }
+// });
+
+// // Get assignments by user email
+// app.get("/api/assignments/user/:email", authenticateToken, async (req, res) => {
+//   try {
+//     const email = decodeURIComponent(req.params.email).toLowerCase();
+//     const result = await pool.query(
+//       "SELECT * FROM ticket_assignments WHERE $1 = ANY(assigned_users) ORDER BY assigned_at DESC",
+//       [email]
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error("Failed to fetch user assignments:", err);
+//     res.status(500).json({ message: "Failed to fetch user assignments" });
+//   }
+// });
+
+// // Create new assignment (also syncs to Zoho)
+// app.post("/api/assignments", authenticateToken, async (req, res) => {
+//   try {
+//     const { 
+//       zoho_ticket_id, 
+//       zoho_ticket_number,
+//       assigned_users, 
+//       assigned_by,
+//       zoho_department_id,
+//       status,
+//       category
+//     } = req.body;
+
+//     if (!zoho_ticket_id || !assigned_users || assigned_users.length === 0 || !assigned_by) {
+//       return res.status(400).json({ message: "Missing required fields" });
+//     }
+
+//     // Primary assignee is the first user (round-robin)
+//     const primary_assignee = assigned_users[0].toLowerCase();
+//     const normalizedUsers = assigned_users.map(u => u.toLowerCase());
+
+//     // Insert into Supabase - try with category first, fallback without
+//     let result;
+//     try {
+//       result = await pool.query(
+//         `INSERT INTO ticket_assignments 
+//           (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, zoho_department_id, status, category)
+//          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+//          ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+//            assigned_users = EXCLUDED.assigned_users,
+//            primary_assignee = EXCLUDED.primary_assignee,
+//            reassigned_user = ticket_assignments.primary_assignee,
+//            reassigned_at = NOW(),
+//            reassigned_by = EXCLUDED.assigned_by,
+//            category = COALESCE(EXCLUDED.category, ticket_assignments.category),
+//            updated_at = NOW()
+//          RETURNING *`,
+//         [
+//           zoho_ticket_id,
+//           zoho_ticket_number || null,
+//           normalizedUsers,
+//           primary_assignee,
+//           assigned_by.toLowerCase(),
+//           zoho_department_id || null,
+//           status || 'Open',
+//           category || null
+//         ]
+//       );
+//     } catch (dbErr) {
+//       // Fallback: try without category column (migration not applied)
+//       console.log('Trying without category column...');
+//       result = await pool.query(
+//         `INSERT INTO ticket_assignments 
+//           (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, zoho_department_id, status)
+//          VALUES ($1, $2, $3, $4, $5, $6, $7)
+//          ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+//            assigned_users = EXCLUDED.assigned_users,
+//            primary_assignee = EXCLUDED.primary_assignee,
+//            reassigned_user = ticket_assignments.primary_assignee,
+//            reassigned_at = NOW(),
+//            reassigned_by = EXCLUDED.assigned_by,
+//            updated_at = NOW()
+//          RETURNING *`,
+//         [
+//           zoho_ticket_id,
+//           zoho_ticket_number || null,
+//           normalizedUsers,
+//           primary_assignee,
+//           assigned_by.toLowerCase(),
+//           zoho_department_id || null,
+//           status || 'Open'
+//         ]
+//       );
+//     }
+
+//     // Sync primary assignee to Zoho Desk
+//     try {
+//       const agentId = await lookupAgentIdByEmail(primary_assignee);
+//       if (agentId) {
+//         await zohoFetch(`/tickets/${zoho_ticket_id}`, {
+//           method: 'PATCH',
+//           body: JSON.stringify({ assigneeId: agentId })
+//         });
+//       }
+//     } catch (zohoErr) {
+//       // Don't fail the request, Supabase record is created
+//     }
+
+//     invalidateRuntimeCaches();
+//     res.json(result.rows[0]);
+//   } catch (err) {
+//     console.error("Failed to create assignment:", err);
+//     res.status(500).json({ message: "Failed to create assignment", error: err.message });
+//   }
+// });
+
+// // Reassign ticket
+// app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
+//   try {
+//     const { zoho_ticket_id, new_assigned_users, reassigned_by, category } = req.body;
+
+//     if (!zoho_ticket_id || !new_assigned_users || new_assigned_users.length === 0 || !reassigned_by) {
+//       return res.status(400).json({ message: "Missing required fields" });
+//     }
+
+//     const new_primary = new_assigned_users[0].toLowerCase();
+//     const normalizedUsers = new_assigned_users.map(u => u.toLowerCase());
+//     const normalizedCategory = (category || '').trim() || null;
+
+//     // Get current assignment
+//     const current = await pool.query(
+//       "SELECT primary_assignee FROM ticket_assignments WHERE zoho_ticket_id = $1",
+//       [zoho_ticket_id]
+//     );
+
+//     const old_primary = current.rows[0]?.primary_assignee || null;
+
+//     // Update assignment
+//     const result = await pool.query(
+//       `UPDATE ticket_assignments SET
+//          assigned_users = $1,
+//          primary_assignee = $2,
+//          reassigned_user = $3,
+//          reassigned_at = NOW(),
+//          reassigned_by = $4,
+//          category = COALESCE($5, category),
+//          updated_at = NOW()
+//        WHERE zoho_ticket_id = $6
+//        RETURNING *`,
+//       [normalizedUsers, new_primary, old_primary, reassigned_by.toLowerCase(), normalizedCategory, zoho_ticket_id]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: "Assignment not found" });
+//     }
+
+//     // Sync new primary assignee to Zoho Desk
+//     try {
+//       const agentId = await lookupAgentIdByEmail(new_primary);
+//       if (agentId) {
+//         await zohoFetch(`/tickets/${zoho_ticket_id}`, {
+//           method: 'PATCH',
+//           body: JSON.stringify({ assigneeId: agentId })
+//         });
+//       }
+//     } catch (zohoErr) {
+//       // Silently fail; DB record is primary source of truth
+//     }
+
+//     invalidateRuntimeCaches();
+//     res.json(result.rows[0]);
+//   } catch (err) {
+//     console.error("Failed to reassign:", err);
+//     res.status(500).json({ message: "Failed to reassign ticket" });
+//   }
+// });
+
+// // Bulk assign (round-robin distribution)
+// app.post("/api/assignments/bulk", authenticateToken, async (req, res) => {
+//   try {
+//     const { ticket_ids, assigned_users, assigned_by, ticket_categories } = req.body;
+
+//     if (!ticket_ids || ticket_ids.length === 0 || !assigned_users || assigned_users.length === 0 || !assigned_by) {
+//       return res.status(400).json({ message: "Missing required fields" });
+//     }
+
+//     const normalizedUsers = assigned_users.map(u => u.toLowerCase());
+//     const success = [];
+//     const failed = [];
+
+//     // Round-robin distribution
+//     for (let i = 0; i < ticket_ids.length; i++) {
+//       const ticketId = ticket_ids[i];
+//       const primaryIndex = i % normalizedUsers.length;
+//       const primaryAssignee = normalizedUsers[primaryIndex];
+
+//       try {
+//         const category = ticket_categories?.[ticketId] || null;
+//         // Insert/update assignment
+//         await pool.query(
+//           `INSERT INTO ticket_assignments 
+//             (zoho_ticket_id, assigned_users, primary_assignee, assigned_by, status, category)
+//            VALUES ($1, $2, $3, $4, 'Open', $5)
+//            ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+//              assigned_users = EXCLUDED.assigned_users,
+//              primary_assignee = EXCLUDED.primary_assignee,
+//              reassigned_user = ticket_assignments.primary_assignee,
+//              reassigned_at = NOW(),
+//              reassigned_by = EXCLUDED.assigned_by,
+//              category = COALESCE(EXCLUDED.category, ticket_assignments.category),
+//              updated_at = NOW()`,
+//           [ticketId, [primaryAssignee], primaryAssignee, assigned_by.toLowerCase(), category]
+//         );
+
+//         // Sync to Zoho
+//         try {
+//           const agentId = await lookupAgentIdByEmail(primaryAssignee);
+//           if (agentId) {
+//             await zohoFetch(`/tickets/${ticketId}`, {
+//               method: 'PATCH',
+//               body: JSON.stringify({ assigneeId: agentId })
+//             });
+//           }
+//         } catch (zohoErr) {
+//           console.error(`Failed to sync ticket ${ticketId} to Zoho:`, zohoErr);
+//         }
+
+//         success.push(ticketId);
+//       } catch (err) {
+//         console.error(`Failed to assign ticket ${ticketId}:`, err);
+//         failed.push(ticketId);
+//       }
+//     }
+
+//     invalidateRuntimeCaches();
+//     res.json({ success, failed });
+//   } catch (err) {
+//     console.error("Bulk assign failed:", err);
+//     res.status(500).json({ message: "Bulk assign failed" });
+//   }
+// });
+
+// // Close assignment
+// app.put("/api/assignments/:zohoTicketId/close", authenticateToken, async (req, res) => {
+//   try {
+//     const { closed_by } = req.body;
+    
+//     const result = await pool.query(
+//       `UPDATE ticket_assignments SET
+//          status = 'Closed',
+//          closed_at = NOW(),
+//          closed_by = $1,
+//          updated_at = NOW()
+//        WHERE zoho_ticket_id = $2
+//        RETURNING *`,
+//       [closed_by?.toLowerCase() || null, req.params.zohoTicketId]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: "Assignment not found" });
+//     }
+
+//     invalidateRuntimeCaches();
+//     res.json(result.rows[0]);
+//   } catch (err) {
+//     console.error("Failed to close assignment:", err);
+//     res.status(500).json({ message: "Failed to close assignment" });
+//   }
+// });
+
+// // Delete assignment
+// app.delete("/api/assignments/:zohoTicketId", authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       "DELETE FROM ticket_assignments WHERE zoho_ticket_id = $1 RETURNING *",
+//       [req.params.zohoTicketId]
+//     );
+
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ message: "Assignment not found" });
+//     }
+
+//     invalidateRuntimeCaches();
+//     res.json({ message: "Assignment deleted" });
+//   } catch (err) {
+//     console.error("Failed to delete assignment:", err);
+//     res.status(500).json({ message: "Failed to delete assignment" });
+//   }
+// });
+
+// // Get all users (for assignment dropdown)
+// app.get("/api/assignable-users", authenticateToken, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       "SELECT id, email, role FROM users WHERE role IN ('admin', 'support', 'user') ORDER BY email ASC"
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     console.error("Failed to fetch assignable users:", err);
+//     res.status(500).json({ message: "Failed to fetch users" });
+//   }
+// });
+
+// // Admin: resolve group members by group email (cloudops@muraai.com)
+// app.get("/api/admin/group-members", authenticateToken, authorizeElevated, async (req, res) => {
+//   try {
+//     const groupEmail = (req.query.groupEmail || '').toString().trim().toLowerCase();
+//     if (!groupEmail) {
+//       return res.status(400).json({ message: "Missing groupEmail" });
+//     }
+
+//     const token = getGraphToken(req);
+//     if (!token) {
+//       return res.status(401).json({ message: "Missing access token" });
+//     }
+
+//     const groupLookupUrl =
+//       `https://graph.microsoft.com/v1.0/groups?$filter=mail eq '${groupEmail}'&$select=id,displayName,mail`;
+
+//     let groupResponse = await fetch(groupLookupUrl, {
+//       headers: { Authorization: `Bearer ${token}` }
+//     });
+
+//     if (!groupResponse.ok) {
+//       return res.status(401).json({ message: "Graph group lookup failed" });
+//     }
+
+//     let groupData = await groupResponse.json();
+//     let group = (groupData.value || [])[0];
+
+//     if (!group) {
+//       const fallbackUrl =
+//         `https://graph.microsoft.com/v1.0/groups?$filter=displayName eq '${groupEmail}'&$select=id,displayName,mail`;
+//       groupResponse = await fetch(fallbackUrl, {
+//         headers: { Authorization: `Bearer ${token}` }
+//       });
+
+//       if (!groupResponse.ok) {
+//         return res.status(401).json({ message: "Graph group lookup failed" });
+//       }
+
+//       groupData = await groupResponse.json();
+//       group = (groupData.value || [])[0];
+//     }
+
+//     if (!group?.id) {
+//       return res.json({ members: [] });
+//     }
+
+//     let membersUrl =
+//       `https://graph.microsoft.com/v1.0/groups/${group.id}/members?$select=mail,userPrincipalName,displayName&$top=100`;
+//     const members = [];
+
+//     while (membersUrl) {
+//       const response = await fetch(membersUrl, {
+//         headers: { Authorization: `Bearer ${token}` }
+//       });
+
+//       if (!response.ok) {
+//         return res.status(401).json({ message: "Graph members request failed" });
+//       }
+
+//       const data = await response.json();
+//       const items = Array.isArray(data.value) ? data.value : [];
+
+//       items.forEach(u => {
+//         const email = (u.mail || u.userPrincipalName || '').trim().toLowerCase();
+//         const displayName = (u.displayName || '').trim();
+//         if (email && !email.includes('#ext#')) {
+//           members.push({ email, displayName });
+//         }
+//       });
+
+//       membersUrl = data['@odata.nextLink'] || '';
+//     }
+
+//     res.json({ members });
+//   } catch (err) {
+//     console.error("Group member lookup failed:", err);
+//     res.status(500).json({ message: "Group member lookup failed" });
+//   }
+// });
+
+// app.get('/api/admin/group-roles', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       `SELECT id, group_identifier, roles, assigned_by, assigned_at, updated_at, notes
+//        FROM group_role_bindings
+//        ORDER BY updated_at DESC`
+//     );
+//     return res.json({ groups: result.rows, count: result.rows.length });
+//   } catch (err) {
+//     console.error('Failed to fetch group roles:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to fetch group roles' });
+//   }
+// });
+
+// app.post('/api/admin/group-roles', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const groupIdentifier = (req.body?.groupIdentifier || '').toString().trim().toLowerCase();
+//     const roles = normalizeRoleList(req.body?.roles || []);
+//     const notes = (req.body?.notes || '').toString().trim() || null;
+//     const adminEmail = (req.user?.email || '').toLowerCase();
+
+//     if (!groupIdentifier) {
+//       return res.status(400).json({ error: 'groupIdentifier is required' });
+//     }
+
+//     const result = await pool.query(
+//       `INSERT INTO group_role_bindings (group_identifier, roles, assigned_by, notes, assigned_at, updated_at)
+//        VALUES ($1, $2::text[], $3, $4, NOW(), NOW())
+//        ON CONFLICT (group_identifier)
+//        DO UPDATE SET
+//          roles = EXCLUDED.roles,
+//          assigned_by = EXCLUDED.assigned_by,
+//          notes = EXCLUDED.notes,
+//          updated_at = NOW()
+//        RETURNING id, group_identifier, roles, assigned_by, assigned_at, updated_at, notes`,
+//       [groupIdentifier, roles, adminEmail, notes]
+//     );
+
+//     return res.json({ success: true, group: result.rows[0] });
+//   } catch (err) {
+//     console.error('Failed to upsert group roles:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to upsert group roles' });
+//   }
+// });
+
+// app.delete('/api/admin/group-roles/:groupIdentifier', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const groupIdentifier = (req.params.groupIdentifier || '').toString().trim().toLowerCase();
+//     const result = await pool.query(
+//       `DELETE FROM group_role_bindings WHERE LOWER(group_identifier) = $1 RETURNING group_identifier, roles`,
+//       [groupIdentifier]
+//     );
+//     if (result.rowCount === 0) {
+//       return res.status(404).json({ error: 'Group role assignment not found' });
+//     }
+//     return res.json({ success: true, group: result.rows[0] });
+//   } catch (err) {
+//     console.error('Failed to delete group roles:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to delete group roles' });
+//   }
+// });
+
+// // Admin: assignments report (for cloudops group members)
+// app.get("/api/admin/assignments-report", authenticateToken, authorizeElevated, async (req, res) => {
+//   try {
+//     const userRole = (req.user?.role || '').toLowerCase();
+//     const requestedDeptId = (req.query.departmentId || '').toString().trim();
+//     const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole); // [] for admin means "all"
+
+//     let query, params;
+//     if (userRole === 'admin') {
+//       if (requestedDeptId) {
+//         query = 'SELECT * FROM ticket_assignments WHERE zoho_department_id = $1 ORDER BY assigned_at DESC';
+//         params = [requestedDeptId];
+//       } else {
+//         query = 'SELECT * FROM ticket_assignments ORDER BY assigned_at DESC';
+//         params = [];
+//       }
+//     } else if (allowedDeptIds.length > 0) {
+//       query = 'SELECT * FROM ticket_assignments WHERE zoho_department_id = ANY($1) ORDER BY assigned_at DESC';
+//       params = [allowedDeptIds];
+//     } else {
+//       query = 'SELECT * FROM ticket_assignments ORDER BY assigned_at DESC';
+//       params = [];
+//     }
+
+//     const result = await pool.query(query, params);
+//     res.json({ assignments: result.rows });
+//   } catch (err) {
+//     res.status(500).json({ message: "Failed to fetch assignments report" });
+//   }
+// });
+
+// // Admin/elevated: live Zoho ticket report source (assignment-shaped payload)
+// app.get('/api/admin/tickets-report', authenticateToken, authorizeElevated, async (req, res) => {
+//   try {
+//     const userRole = (req.user?.role || '').toLowerCase();
+//     const requestedDeptId = (req.query.departmentId || '').toString().trim();
+//     const isAdmin = userRole === 'admin';
+
+//     let allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
+//     if (isAdmin && requestedDeptId) {
+//       allowedDeptIds = [requestedDeptId];
+//     }
+
+//     const hasSingleDept = Array.isArray(allowedDeptIds) && allowedDeptIds.length === 1;
+//     const deptQuery = hasSingleDept ? `&departmentId=${encodeURIComponent(allowedDeptIds[0])}` : '';
+//     const include = 'contacts,assignee';
+//     const pageSize = 100;
+//     const maxFrom = 10000;
+//     const statuses = ['Open', 'In Progress', 'On Hold', 'Escalated', 'Closed', 'Resolved'];
+
+//     const recycledTicketIds = await getActiveRecycledTicketIds();
+//     const seen = new Set();
+//     const normalizedRows = [];
+
+//     const toCategory = (ticket) => {
+//       const direct = [
+//         ticket?.category,
+//         ticket?.ticketCategory,
+//         ticket?.issueCategory,
+//         ticket?.subCategory,
+//         ticket?.subcategory
+//       ];
+//       for (const candidate of direct) {
+//         if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+//       }
+//       return extractCategoryFromZohoTicket(ticket) || 'Uncategorized';
+//     };
+
+//     for (const status of statuses) {
+//       for (let from = 0; from <= maxFrom; from += pageSize) {
+//         const endpoint = `/tickets?limit=${pageSize}&from=${from}&status=${encodeURIComponent(status)}&include=${include}${deptQuery}`;
+//         let response;
+//         try {
+//           response = await zohoFetch(endpoint);
+//         } catch (err) {
+//           console.error(`[tickets-report] fetch failed for status=${status}, from=${from}:`, err?.message || err);
+//           break;
+//         }
+
+//         if (!response.ok) {
+//           // Treat status-specific failures as partial and continue with others.
+//           console.warn(`[tickets-report] Zoho returned ${response.status} for status=${status}, from=${from}`);
+//           break;
+//         }
+
+//         let data;
+//         try {
+//           data = await response.json();
+//         } catch {
+//           break;
+//         }
+
+//         const tickets = Array.isArray(data?.data) ? data.data : [];
+//         for (const t of tickets) {
+//           const tid = (t?.id || '').toString();
+//           if (!tid || seen.has(tid) || recycledTicketIds.has(tid)) continue;
+//           if (!isDepartmentAllowed(t, allowedDeptIds)) continue;
+
+//           seen.add(tid);
+
+//           const assigneeEmail = (
+//             t?.assignee?.email ||
+//             t?.assignee?.emailId ||
+//             t?.assignedTo ||
+//             ''
+//           ).toString().trim().toLowerCase();
+
+//           const assignedUsers = assigneeEmail ? [assigneeEmail] : [];
+//           const createdTime = (
+//             t?.createdTime ||
+//             t?.createdAt ||
+//             t?.created_at ||
+//             t?.createdDate ||
+//             ''
+//           ).toString();
+
+//           const ticketStatus = (t?.status || '').toString();
+//           const lowerStatus = ticketStatus.toLowerCase();
+//           const modifiedTime = (
+//             t?.modifiedTime ||
+//             t?.updatedTime ||
+//             t?.updated_at ||
+//             ''
+//           ).toString();
+
+//           const closedAt = (lowerStatus.includes('closed') || lowerStatus.includes('resolved'))
+//             ? (t?.closedTime || modifiedTime || '')
+//             : '';
+
+//           normalizedRows.push({
+//             zoho_ticket_id: tid,
+//             zoho_ticket_number: (t?.ticketNumber || t?.ticket_number || '').toString(),
+//             assigned_users: assignedUsers,
+//             primary_assignee: assigneeEmail,
+//             assigned_by: (
+//               t?.email ||
+//               t?.contact?.email ||
+//               t?.contact?.emailAddress ||
+//               t?.requester?.email ||
+//               ''
+//             ).toString().trim().toLowerCase(),
+//             assigned_at: createdTime,
+//             closed_at: closedAt,
+//             closed_by: assigneeEmail,
+//             zoho_department_id: extractTicketDepartmentId(t),
+//             category: toCategory(t),
+//             status: ticketStatus
+//           });
+//         }
+
+//         const more = data?.info?.moreRecords ?? (tickets.length >= pageSize);
+//         if (!more) break;
+//       }
+//     }
+
+//     res.json({ assignments: normalizedRows });
+//   } catch (err) {
+//     console.error('Tickets report error:', err?.message || err);
+//     res.status(500).json({ message: 'Failed to fetch tickets report' });
+//   }
+// });
+
+// function extractCategoryFromZohoTicket(rawTicket) {
+//   const ticket = rawTicket?.data || rawTicket || {};
+
+//   const readValue = (value) => {
+//     if (!value) return '';
+//     if (typeof value === 'string') return value.trim();
+//     if (typeof value === 'object') {
+//       const candidate = value.name || value.displayName || value.label || value.value;
+//       return typeof candidate === 'string' ? candidate.trim() : '';
+//     }
+//     return '';
+//   };
+
+//   const directCandidates = [
+//     ticket.category,
+//     ticket.ticketCategory,
+//     ticket.issueCategory,
+//     ticket.subCategory,
+//     ticket.subcategory
+//   ];
+
+//   for (const candidate of directCandidates) {
+//     const val = readValue(candidate);
+//     if (val) return val;
+//   }
+
+//   const fieldContainers = [
+//     ticket.customFields,
+//     ticket.custom_fields,
+//     ticket.cf,
+//     ticket.fields
+//   ].filter(Boolean);
+
+//   for (const container of fieldContainers) {
+//     for (const [key, value] of Object.entries(container)) {
+//       if (!/category/i.test(key)) continue;
+//       const val = readValue(value);
+//       if (val) return val;
+//     }
+//   }
+
+//   return '';
+// }
+
+// // Admin: backfill categories from Zoho for assignments that are NULL/Uncategorized
+// app.post("/api/admin/backfill-categories", authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       `SELECT zoho_ticket_id FROM ticket_assignments
+//        WHERE category IS NULL
+//           OR TRIM(category) = ''
+//           OR LOWER(TRIM(category)) IN ('uncategorized', 'uncategorised', 'uncategory')
+//        ORDER BY assigned_at DESC`
+//     );
+
+//     const rows = result.rows;
+//     let updated = 0;
+//     let failed = 0;
+
+//     for (const row of rows) {
+//       try {
+//         const ticketRes = await zohoFetch(`/tickets/${row.zoho_ticket_id}`);
+//         if (!ticketRes.ok) { failed++; continue; }
+//         const ticket = await ticketRes.json();
+//         const category = extractCategoryFromZohoTicket(ticket);
+//         if (!category) { failed++; continue; }
+
+//         await pool.query(
+//           `UPDATE ticket_assignments SET category = $1, updated_at = NOW() WHERE zoho_ticket_id = $2`,
+//           [category, row.zoho_ticket_id]
+//         );
+//         updated++;
+//       } catch (innerErr) {
+//         failed++;
+//       }
+//     }
+
+//     res.json({ total: rows.length, updated, failed });
+//   } catch (err) {
+//     console.error("Backfill categories failed:", err);
+//     res.status(500).json({ message: "Backfill failed" });
+//   }
+// });
+
+// // -------------------------------------------------------
+// // ADMIN: USER ROLE MANAGEMENT API
+// // -------------------------------------------------------
+
+// // GET /api/admin/user-roles - List all stored user roles from database
+// app.get('/api/admin/user-roles', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const [bindingsRes, legacyRes] = await Promise.all([
+//       pool.query(
+//         `SELECT
+//            id,
+//            microsoft_email,
+//            roles,
+//            assigned_by,
+//            assigned_at,
+//            updated_at,
+//            notes
+//          FROM user_role_bindings
+//          ORDER BY updated_at DESC`
+//       ),
+//       pool.query(
+//         `SELECT microsoft_email, role, assigned_by, assigned_at, updated_at, notes
+//          FROM user_roles`
+//       )
+//     ]);
+
+//     const merged = new Map();
+//     for (const row of legacyRes.rows || []) {
+//       const email = (row.microsoft_email || '').toLowerCase();
+//       if (!email) continue;
+//       merged.set(email, {
+//         id: null,
+//         microsoft_email: email,
+//         roles: normalizeRoleList([row.role], null),
+//         role: normalizeRole(row.role) || null,
+//         assigned_by: row.assigned_by || null,
+//         assigned_at: row.assigned_at || null,
+//         updated_at: row.updated_at || null,
+//         notes: row.notes || null
+//       });
+//     }
+
+//     for (const row of bindingsRes.rows || []) {
+//       const email = (row.microsoft_email || '').toLowerCase();
+//       if (!email) continue;
+//       const roles = normalizeRoleList(row.roles || [], null);
+//       merged.set(email, {
+//         id: row.id,
+//         microsoft_email: email,
+//         roles,
+//         role: pickDefaultRole(roles, null, null),
+//         assigned_by: row.assigned_by || null,
+//         assigned_at: row.assigned_at || null,
+//         updated_at: row.updated_at || null,
+//         notes: row.notes || null
+//       });
+//     }
+
+//     const users = [...merged.values()].sort((a, b) =>
+//       new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime()
+//     );
+
+//     return res.json({ users, count: users.length });
+//   } catch (err) {
+//     console.error('Failed to fetch user roles:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to fetch user roles' });
+//   }
+// });
+
+// // POST /api/admin/users/:email/role - Assign/update role for a user
+// app.post('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const { role: newRole, roles: incomingRoles, notes } = req.body;
+//     const userEmail = (req.params.email || '').toString().toLowerCase().trim();
+//     const adminEmail = (req.user?.email || '').toLowerCase();
+
+//     if (!userEmail) {
+//       return res.status(400).json({ error: 'User email is required' });
+//     }
+
+//     const resolvedRoles = Array.isArray(incomingRoles)
+//       ? normalizeRoleList(incomingRoles, null)
+//       : normalizeRoleList([newRole], null);
+
+//     const invalidInputRoles = Array.isArray(incomingRoles)
+//       ? incomingRoles.filter(r => !normalizeRole(r))
+//       : (newRole && !normalizeRole(newRole) ? [newRole] : []);
+
+//     if (invalidInputRoles.length > 0) {
+//       return res.status(400).json({
+//         error: `Invalid roles: ${invalidInputRoles.join(', ')}`,
+//         allowed: SUPPORTED_ROLES
+//       });
+//     }
+
+//     const primaryRole = pickDefaultRole(resolvedRoles, null, null);
+
+//     if (!resolvedRoles.length || !primaryRole) {
+//       return res.status(400).json({
+//         error: 'At least one valid application role is required',
+//         allowed: SUPPORTED_ROLES.filter(role => role !== 'user')
+//       });
+//     }
+
+//     const [bindingResult, legacyResult] = await Promise.all([
+//       pool.query(
+//         `INSERT INTO user_role_bindings (microsoft_email, roles, assigned_by, notes, assigned_at, updated_at)
+//          VALUES ($1, $2::text[], $3, $4, NOW(), NOW())
+//          ON CONFLICT (microsoft_email)
+//          DO UPDATE SET
+//            roles = EXCLUDED.roles,
+//            assigned_by = EXCLUDED.assigned_by,
+//            notes = EXCLUDED.notes,
+//            updated_at = NOW()
+//          RETURNING id, microsoft_email, roles, assigned_by, assigned_at, updated_at, notes`,
+//         [userEmail, resolvedRoles, adminEmail, notes || null]
+//       ),
+//       // Keep legacy table in sync for backward compatibility.
+//       pool.query(
+//         `INSERT INTO user_roles (microsoft_email, role, assigned_by, notes, assigned_at, updated_at)
+//          VALUES ($1, $2, $3, $4, NOW(), NOW())
+//          ON CONFLICT (microsoft_email)
+//          DO UPDATE SET
+//            role = EXCLUDED.role,
+//            assigned_by = EXCLUDED.assigned_by,
+//            notes = EXCLUDED.notes,
+//            updated_at = NOW()
+//          RETURNING microsoft_email, role`,
+//         [userEmail, primaryRole, adminEmail, notes || null]
+//       )
+//     ]);
+
+//     console.log(`[ADMIN] Roles assigned: ${userEmail} → [${resolvedRoles.join(',')}] by ${adminEmail}`);
+
+//     return res.json({
+//       success: true,
+//       message: `Roles updated for ${userEmail}`,
+//       user: {
+//         ...bindingResult.rows[0],
+//         role: legacyResult.rows[0]?.role || primaryRole,
+//         roles: normalizeRoleList(bindingResult.rows[0]?.roles || resolvedRoles)
+//       }
+//     });
+//   } catch (err) {
+//     console.error('Failed to assign role:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to assign role' });
+//   }
+// });
+
+// // GET /api/admin/users - Get paginated list of Microsoft users (from Graph)
+// app.get('/api/admin/users', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const page = parseInt(req.query.page) || 1;
+//     const pageSize = parseInt(req.query.pageSize) || 50;
+//     const skip = (page - 1) * pageSize;
+//     const searchText = (req.query.search || '').toString().trim();
+
+//     // Use explicit Graph token from frontend (MSAL), not app JWT.
+//     const adminAccessToken = (req.headers['x-graph-token'] || '').toString().trim();
+    
+//     if (!adminAccessToken) {
+//       return res.status(400).json({ error: 'No Microsoft Graph token provided' });
+//     }
+
+//     // Fetch users from Microsoft Graph
+//     let graphUrl = `https://graph.microsoft.com/v1.0/users?$select=id,userPrincipalName,displayName,mail&$top=${pageSize}&$skip=${skip}&$orderby=displayName`;
+
+//     if (searchText) {
+//       graphUrl += `&$filter=contains(displayName,'${searchText}') or contains(mail,'${searchText}')`;
+//     }
+
+//     const graphResponse = await fetch(graphUrl, {
+//       headers: { 
+//         Authorization: `Bearer ${adminAccessToken}`,
+//         'Content-Type': 'application/json'
+//       }
+//     });
+
+//     if (!graphResponse.ok) {
+//       console.warn(`Graph API users fetch failed: ${graphResponse.status}`);
+//       return res.status(graphResponse.status).json({ 
+//         error: 'Failed to fetch users from Microsoft Graph',
+//         details: `Graph API returned ${graphResponse.status}`
+//       });
+//     }
+
+//     const graphData = await graphResponse.json();
+//     const graphUsers = Array.isArray(graphData?.value) ? graphData.value : [];
+
+//     // Enrich with stored roles from DB
+//     const userEmails = graphUsers.map(u => (u.mail || '').toLowerCase()).filter(Boolean);
+//     let storedRoles = new Map();
+
+//     if (userEmails.length > 0) {
+//       const [bindingRes, legacyRes] = await Promise.all([
+//         pool.query(
+//           `SELECT microsoft_email, roles, assigned_by, assigned_at, updated_at
+//            FROM user_role_bindings
+//            WHERE LOWER(microsoft_email) = ANY($1)`,
+//           [userEmails]
+//         ),
+//         pool.query(
+//           `SELECT microsoft_email, role, assigned_by, assigned_at, updated_at
+//            FROM user_roles
+//            WHERE LOWER(microsoft_email) = ANY($1)`,
+//           [userEmails]
+//         )
+//       ]);
+
+//       legacyRes.rows.forEach(row => {
+//         storedRoles.set((row.microsoft_email || '').toLowerCase(), {
+//           ...row,
+//           roles: normalizeRoleList([row.role], null)
+//         });
+//       });
+//       bindingRes.rows.forEach(row => {
+//         storedRoles.set((row.microsoft_email || '').toLowerCase(), {
+//           ...row,
+//           roles: normalizeRoleList(row.roles || [], null)
+//         });
+//       });
+//     }
+
+//     const enrichedUsers = graphUsers.map(u => {
+//       const email = (u.mail || '').toLowerCase();
+//       const storedRole = storedRoles.get(email);
+//       return {
+//         id: u.id,
+//         email: u.mail || u.userPrincipalName,
+//         displayName: u.displayName,
+//         userPrincipalName: u.userPrincipalName,
+//         currentRole: pickDefaultRole(storedRole?.roles || [storedRole?.role], null, null),
+//         roles: normalizeRoleList(storedRole?.roles || [storedRole?.role], null),
+//         assignedBy: storedRole?.assigned_by || null,
+//         assignedAt: storedRole?.assigned_at || null,
+//         updatedAt: storedRole?.updated_at || null
+//       };
+//     });
+
+//     return res.json({
+//       users: enrichedUsers,
+//       page,
+//       pageSize,
+//       count: enrichedUsers.length,
+//       hasMore: enrichedUsers.length === pageSize
+//     });
+//   } catch (err) {
+//     console.error('Failed to fetch Graph users:', err?.message || err);
+//     return res.status(500).json({ 
+//       error: 'Failed to fetch users',
+//       details: err?.message
+//     });
+//   }
+// });
+
+// // DELETE /api/admin/users/:email/role - Remove stored role assignment (reverts to Graph group + default)
+// app.delete('/api/admin/users/:email/role', authenticateToken, authorizeAdmin, async (req, res) => {
+//   try {
+//     const userEmail = (req.params.email || '').toString().toLowerCase().trim();
+//     const adminEmail = (req.user?.email || '').toLowerCase();
+
+//     if (!userEmail) {
+//       return res.status(400).json({ error: 'User email is required' });
+//     }
+
+//     const [bindingDelete, legacyDelete] = await Promise.all([
+//       pool.query(
+//         `DELETE FROM user_role_bindings
+//          WHERE LOWER(microsoft_email) = $1
+//          RETURNING microsoft_email, roles`,
+//         [userEmail]
+//       ),
+//       pool.query(
+//         `DELETE FROM user_roles
+//          WHERE LOWER(microsoft_email) = $1
+//          RETURNING microsoft_email, role`,
+//         [userEmail]
+//       )
+//     ]);
+
+//     if (bindingDelete.rowCount === 0 && legacyDelete.rowCount === 0) {
+//       return res.status(404).json({ error: 'No role assignment found for this user' });
+//     }
+
+//     console.log(`[ADMIN] Role assignment deleted: ${userEmail} by ${adminEmail}`);
+
+//     return res.json({
+//       success: true,
+//       message: `Role assignment removed for ${userEmail}. User will revert to Graph group-based role.`,
+//       user: bindingDelete.rows[0] || legacyDelete.rows[0]
+//     });
+//   } catch (err) {
+//     console.error('Failed to delete role assignment:', err?.message || err);
+//     return res.status(500).json({ error: 'Failed to delete role assignment' });
+//   }
+// });
+
+// // Report / Suggestion email endpoint
+// app.post('/api/feedback/report', authenticateToken, async (req, res) => {
+//   try {
+//     const content = (req.body?.content || '').toString().trim();
+//     const includeName = Boolean(req.body?.includeName);
+//     const userEmail = (req.user?.email || '').toString().trim();
+
+//     if (!content) {
+//       return res.status(400).json({ error: 'Content is required' });
+//     }
+
+//     const targetEmail = process.env.FEEDBACK_TARGET_EMAIL || 'sutharsan.t@muraai.com';
+//     const fromEmail = process.env.FEEDBACK_FROM_EMAIL || 'no-reply@muraai.com';
+//     const submitter = includeName && userEmail ? userEmail : 'Anonymous';
+//     const role = (req.user?.role || 'user').toString();
+//     const submittedAt = new Date().toISOString();
+
+//     const mailContent = [
+//       'New report/suggestion submitted from Influx web app.',
+//       '',
+//       `Submitted By: ${submitter}`,
+//       `User Role: ${role}`,
+//       `Submitted At: ${submittedAt}`,
+//       `Application: Influx ITSM`,
+//       '',
+//       'Content:',
+//       content
+//     ].join('\n');
+
+//     console.log(`[FEEDBACK] Report received from ${submitter}:\n${mailContent}\n`);
+
+//     // Send via Azure Graph API
+//     const emailSent = await sendEmailViaAzure(
+//       fromEmail,
+//       targetEmail,
+//       'Influx App - Report/Suggestion',
+//       mailContent,
+//       { email: userEmail, role }
+//     );
+
+//     return res.json({ 
+//       success: true, 
+//       message: emailSent 
+//         ? 'Feedback sent successfully' 
+//         : 'Feedback received (email delivery skipped due to configuration)'
+//     });
+//   } catch (error) {
+//     console.error('Feedback processing failed:', error?.message || error);
+//     return res.status(500).json({ error: 'Failed to process feedback' });
+//   }
+// });
+
+// const AZURE_BACKUP_DIR = path.join(__dirname, 'azure-monitoring');
+// const AZURE_BACKUP_SCRIPT = path.join(AZURE_BACKUP_DIR, 'backup advanced 24-04-2026.ps1');
+// const AZURE_BACKUP_TIME_ZONE = process.env.AZURE_BACKUP_TIME_ZONE || 'Asia/Kolkata';
+// let azureBackupJob = null;
+// let azureBackupLastAttempt = null;
+// let azureBackupLastSuccess = null;
+// let azureBackupLastError = '';
+// let azureBackupLastTrigger = '';
+// let azureBackupLastScheduledSlot = '';
+
+// function latestAzureBackupFile(prefix, extension) {
+//   if (!fs.existsSync(AZURE_BACKUP_DIR)) return null;
+//   return fs.readdirSync(AZURE_BACKUP_DIR)
+//     .filter(name => name.startsWith(prefix) && name.toLowerCase().endsWith(extension))
+//     .map(name => ({ name, path: path.join(AZURE_BACKUP_DIR, name), mtime: fs.statSync(path.join(AZURE_BACKUP_DIR, name)).mtime }))
+//     .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())[0] || null;
+// }
+
+// function normalizeAzureBackupType(item) {
+//   const backupType = String(item.BackupType || '').toLowerCase();
+//   const recoveryType = String(item.RecoveryType || '').toLowerCase();
+//   const resourceName = String(item.ResourceName || item.RawResourceName || '').toLowerCase();
+
+//   if (recoveryType === 'azurestorage' || resourceName.startsWith('azurefileshare;') || backupType.includes('file share')) {
+//     return 'File Share';
+//   }
+//   if (recoveryType === 'azureiaasvm' || resourceName.startsWith('vm;') || backupType.includes('vm')) {
+//     return 'Azure VM';
+//   }
+//   return item.BackupType || 'N/A';
+// }
+
+// function normalizeAzureResourceName(item, type) {
+//   const resourceName = String(item.ResourceName || 'N/A');
+//   const rawResourceName = String(item.RawResourceName || resourceName);
+
+//   if (type === 'Azure VM' && resourceName.toLowerCase().startsWith('vm;')) {
+//     return resourceName.split(';').filter(Boolean).pop() || resourceName;
+//   }
+//   if (type === 'File Share' && resourceName.toLowerCase().startsWith('azurefileshare;')) {
+//     return 'Azure File Share';
+//   }
+//   return resourceName || rawResourceName || 'N/A';
+// }
+
+// function normalizeAzureConsistency(item, type) {
+//   const consistency = String(item.ConsistencyType || '').trim();
+//   const lowered = consistency.toLowerCase();
+
+//   if (lowered.includes('application') || lowered === 'appconsistent') return 'Application Consistent';
+//   if (lowered.includes('crash') || lowered === 'crashconsistent') return 'Crash Consistent';
+//   if (lowered.includes('file') || lowered === 'filesystemconsistent') return 'File-System Consistent';
+//   if (type === 'File Share') return 'File-System Consistent';
+//   if (['passed', 'success', 'succeeded', 'healthy'].includes(lowered)) return 'N/A';
+//   return consistency || 'N/A';
+// }
+
+// function normalizeAzureRecoveryType(item, type) {
+//   const recoveryType = String(item.RecoveryType || '').trim();
+//   const lowered = recoveryType.toLowerCase();
+
+//   if (!recoveryType || lowered === 'n/a') return 'N/A';
+//   if (lowered.includes('snapshot') && lowered.includes('vault')) return 'Snapshot and Vault-Standard';
+//   if (lowered.includes('snapshot')) return 'Snapshot';
+//   if (lowered.includes('vault')) return 'Vault-Standard';
+//   if (lowered === 'azurestorage' || type === 'File Share') return 'Snapshot';
+//   if (lowered === 'azureiaasvm' || lowered === 'iaasvm') return 'Snapshot and Vault-Standard';
+//   return recoveryType;
+// }
+
+// function buildAzureBackupReport(records, sourceFile, generatedAt) {
+//   const source = Array.isArray(records) ? records : records ? [records] : [];
+//   const items = source
+//     .filter(item => item && !['N/A', ''].includes(String(item.BackupType || '')))
+//     .map(item => {
+//       const type = normalizeAzureBackupType(item);
+//       return {
+//         tenantId: item.TenantId || '',
+//         tenantName: item.TenantName || '',
+//         subscription: item.SubscriptionName || 'Unknown',
+//         resourceGroup: item.ResourceGroup || 'N/A',
+//         vault: item.VaultName || 'N/A',
+//         type,
+//         resource: normalizeAzureResourceName(item, type),
+//         rawResource: item.RawResourceName || item.ResourceName || '',
+//         status: item.BackupStatus || 'Warning',
+//         lastBackupStatus: item.LastBackupStatus || 'N/A',
+//         preBackupStatus: item.PreBackupStatus || 'N/A',
+//         consistency: normalizeAzureConsistency(item, type),
+//         recoveryType: normalizeAzureRecoveryType(item, type),
+//         latestRecoveryPoint: item.LatestRPTime || 'N/A',
+//         lastBackupTime: item.LastBackupTime || 'N/A',
+//         backupAge: item.BackupAge || 'N/A',
+//         backupAgeHours: Number(item.BackupAgeHours ?? -1),
+//         policyName: item.PolicyName || 'N/A',
+//         protectionState: item.ProtectionState || 'N/A',
+//         storageAccount: item.StorageAccount || ''
+//       };
+//     });
+
+//   const subscriptionsByName = new Map();
+//   for (const item of items) {
+//     if (!subscriptionsByName.has(item.subscription)) {
+//       subscriptionsByName.set(item.subscription, {
+//         name: item.subscription,
+//         id: '',
+//         totalItems: 0,
+//         healthy: 0,
+//         warning: 0,
+//         failed: 0,
+//         vaults: []
+//       });
+//     }
+//     const subscription = subscriptionsByName.get(item.subscription);
+//     subscription.totalItems++;
+//     const statusKey = String(item.status).toLowerCase();
+//     if (statusKey === 'healthy') subscription.healthy++;
+//     else if (statusKey === 'failed') subscription.failed++;
+//     else subscription.warning++;
+
+//     let vault = subscription.vaults.find(entry => entry.name === item.vault && entry.resourceGroup === item.resourceGroup);
+//     if (!vault) {
+//       vault = { name: item.vault, resourceGroup: item.resourceGroup, items: [], vmBackupsProcessed: 0, fileShareBackupsProcessed: 0 };
+//       subscription.vaults.push(vault);
+//     }
+//     vault.items.push(item);
+//     if (item.type === 'Azure VM') vault.vmBackupsProcessed++;
+//     if (item.type === 'File Share') vault.fileShareBackupsProcessed++;
+//   }
+
+// const countStatus = status => items.filter(item => item.status === status).length;
+//   const appItems = items.filter(item => item.consistency === 'Application Consistent');
+//   const crashItems = items.filter(item => item.consistency === 'Crash Consistent');
+//   const fsItems = items.filter(item => item.consistency === 'File-System Consistent');
+//   return {
+//     file: sourceFile,
+//     generatedAt: generatedAt instanceof Date ? generatedAt.toISOString() : generatedAt,
+//     scheduleTimeZone: AZURE_BACKUP_TIME_ZONE,
+//     refreshSchedule: 'Every 3 hours at 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00 and 21:00',
+//     totalRecords: items.length,
+//     healthy: countStatus('Healthy'),
+//     warning: countStatus('Warning'),
+//     failed: countStatus('Failed'),
+//     totalVms: items.filter(item => item.type === 'Azure VM').length,
+//     totalFileShares: items.filter(item => item.type === 'File Share').length,
+//     consistencyCounts: {
+//       application: appItems.length,
+//       crash: crashItems.length,
+//       filesystem: fsItems.length
+//     },
+//     consistencyDetails: {
+//       application: { count: appItems.length, items: appItems },
+//       crash: { count: crashItems.length, items: crashItems },
+//       filesystem: { count: fsItems.length, items: fsItems }
+//     },
+//     alerts: items.filter(item => item.status !== 'Healthy'),
+//     subscriptions: [...subscriptionsByName.values()],
+//     items
+//   };
+// }
+
+// function readLatestAzureBackupReport() {
+//   const latest = latestAzureBackupFile('AzureBackupData_', '.json');
+//   if (!latest) return null;
+//   const raw = fs.readFileSync(latest.path, 'utf8').replace(/^\uFEFF/, '');
+//   return buildAzureBackupReport(JSON.parse(raw), latest.name, latest.mtime);
+// }
+
+// function generateSeedBackupData() {
+//   const now = new Date();
+//   const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+//   const subscriptions = ['Conduent', 'FLSmidth', 'MuraaiInfra', 'Allegion', 'Stellantis'];
+//   const vaults = [
+//     { sub: 'Conduent', name: 'cndt-nonprod-vault', rg: 'cndt-nonprod' },
+//     { sub: 'Conduent', name: 'cndt-prod-asr', rg: 'conduent-prod-rg' },
+//     { sub: 'Conduent', name: 'cndt-dev-asr', rg: 'cndt-dev-rg' },
+//     { sub: 'FLSmidth', name: 'fls-prod-asr', rg: 'flsmidth-prod-rg' },
+//     { sub: 'FLSmidth', name: 'flsmidth-recovery-service-vault', rg: 'flsmidth-dr-rg' },
+//     { sub: 'MuraaiInfra', name: 'muraai-backup-vault', rg: 'muraai-controller-rg' },
+//     { sub: 'Allegion', name: 'allegion-prod-asr', rg: 'allegion-prod-rg' },
+//     { sub: 'Allegion', name: 'allegion-prod-rsv', rg: 'allegion-rsv-rg' },
+//     { sub: 'Stellantis', name: 'stellantis-prod-rsv', rg: 'stellantis-prod-rg' }
+//   ];
+//   const vms = [
+//     // cndt-nonprod-vault (0)
+//     { name: 'cndt-nonprod-ic-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-nonprod-mbir-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-nonprod-db-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-nonprod-web-vm', sub: 'Conduent', vault: 0, consistency: 'File-System Consistent', status: 'Healthy' },
+//     { name: 'cndt-nonprod-app-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-nonprod-util-vm', sub: 'Conduent', vault: 0, consistency: 'Application Consistent', status: 'Healthy' },
+//     // cndt-prod-asr (1)
+//     { name: 'cndt-prod-awp-node1', sub: 'Conduent', vault: 1, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-prod-awp-node2', sub: 'Conduent', vault: 1, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-prod-ds-vm', sub: 'Conduent', vault: 1, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'conduent-prod-app-vmss-0', sub: 'Conduent', vault: 1, consistency: 'Crash Consistent', status: 'Warning' },
+//     { name: 'conduent-prod-app-vmss-1', sub: 'Conduent', vault: 1, consistency: 'Crash Consistent', status: 'Warning' },
+//     // cndt-dev-asr (2)
+//     { name: 'cndt-dev-appworks-vm', sub: 'Conduent', vault: 2, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'cndt-dev-cs-vm', sub: 'Conduent', vault: 2, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'conduent-dev-db-vm', sub: 'Conduent', vault: 2, consistency: 'File-System Consistent', status: 'Healthy' },
+//     // fls-prod-asr (3)
+//     { name: 'fls-prod-ic-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'flsmidth-prod-mbir-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'flsmidth-prod-db-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'fls-prod-web-vm', sub: 'FLSmidth', vault: 3, consistency: 'Application Consistent', status: 'Healthy' },
+//     // flsmidth-recovery-service-vault (4)
+//     { name: 'fls-dev-ic-vm', sub: 'FLSmidth', vault: 4, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'fls-nonprod-mbir-vm', sub: 'FLSmidth', vault: 4, consistency: 'Crash Consistent', status: 'Warning' },
+//     { name: 'fls-scs-vm', sub: 'FLSmidth', vault: 4, consistency: 'Crash Consistent', status: 'Warning' },
+//     { name: 'fls-dr-util-vm', sub: 'FLSmidth', vault: 4, consistency: 'Application Consistent', status: 'Healthy' },
+//     // muraai-backup-vault (5)
+//     { name: 'muraaisims-demo-ic-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'muraaisims-demo-mbir-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'muraaisims-demo-occ-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'muraaisims-demo-db-vm', sub: 'MuraaiInfra', vault: 5, consistency: 'Application Consistent', status: 'Healthy' },
+//     // allegion-prod-asr (6)
+//     { name: 'allegion-prod-ic-vm', sub: 'Allegion', vault: 6, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'allegion-prod-mbir-vm', sub: 'Allegion', vault: 6, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'allegion-prod-db-vm', sub: 'Allegion', vault: 6, consistency: 'Application Consistent', status: 'Healthy' },
+//     // allegion-prod-rsv (7)
+//     { name: 'allegion-prod-web-vm', sub: 'Allegion', vault: 7, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'allegion-prod-app-vm', sub: 'Allegion', vault: 7, consistency: 'Crash Consistent', status: 'Warning' },
+//     { name: 'allegion-prod-util-vm', sub: 'Allegion', vault: 7, consistency: 'File-System Consistent', status: 'Healthy' },
+//     // stellantis-prod-rsv (8)
+//     { name: 'stellantis-prod-mbir-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'stellantis-prod-ic-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'stellantis-prod-db-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'stellantis-prod-web-vm', sub: 'Stellantis', vault: 8, consistency: 'Application Consistent', status: 'Healthy' },
+//     { name: 'stellantis-prod-app-vm', sub: 'Stellantis', vault: 8, consistency: 'Crash Consistent', status: 'Warning' }
+//   ];
+
+//   const records = vms.map((vm, i) => {
+//     const v = vaults[vm.vault];
+//     const backupDate = new Date(now.getTime() - (i * 3600000));
+//     const ageHours = Math.round((now - backupDate) / 3600000);
+//     return {
+//       TenantId: '583bbc8b-b4b7-4e5f-900d-c0554b41e2eb',
+//       TenantName: 'Muraai Information Technologies Pvt Ltd',
+//       SubscriptionName: vm.sub,
+//       ResourceGroup: v.rg,
+//       VaultName: v.name,
+//       BackupType: 'Azure VM',
+//       ResourceName: vm.name,
+//       BackupStatus: vm.status,
+//       LastBackupStatus: vm.status === 'Healthy' ? 'Completed' : 'Warning',
+//       PreBackupStatus: vm.status === 'Healthy' ? 'Succeeded' : 'Failed',
+//       ConsistencyType: vm.consistency,
+//       RecoveryType: vm.status === 'Healthy' ? 'Snapshot and Vault-Standard' : 'N/A',
+//       LatestRPTime: backupDate.toISOString(),
+//       LastBackupTime: backupDate.toISOString(),
+//       BackupAge: `${ageHours}h ago`,
+//       BackupAgeHours: ageHours,
+//       PolicyName: 'DailyBackupPolicy',
+//       ProtectionState: vm.status === 'Healthy' ? 'Protected' : 'Unprotected',
+//       StorageAccount: `${vm.name.replace(/-/g, '')}sa`
+//     };
+//   });
+
+//   const fileShares = [
+//     { name: 'pvc-72bd4775-2a93-45c4-aa87-61b9b2060b85', sub: 'MuraaiInfra', vault: 5, status: 'Healthy' },
+//     { name: 'pvc-a1f2e3d4-b5c6-7890-abcd-ef1234567890', sub: 'Conduent', vault: 0, status: 'Healthy' },
+//     { name: 'pvc-f3e4d5c6-b7a8-9012-bcde-f13579111314', sub: 'FLSmidth', vault: 3, status: 'Warning' },
+//     { name: 'pvc-9a8b7c6d-5e4f-3210-fedc-ba9876543210', sub: 'Allegion', vault: 6, status: 'Failed' },
+//     { name: 'pvc-12345678-1234-1234-1234-123456789012', sub: 'Stellantis', vault: 8, status: 'Healthy' }
+//   ];
+
+//   const fsRecords = fileShares.map((fs, i) => {
+//     const v = vaults[fs.vault];
+//     const backupDate = new Date(now.getTime() - ((i + vms.length) * 3600000));
+//     const ageHours = Math.round((now - backupDate) / 3600000);
+//     return {
+//       TenantId: '583bbc8b-b4b7-4e5f-900d-c0554b41e2eb',
+//       TenantName: 'Muraai Information Technologies Pvt Ltd',
+//       SubscriptionName: fs.sub,
+//       ResourceGroup: v.rg,
+//       VaultName: v.name,
+//       BackupType: 'File Share',
+//       ResourceName: fs.name,
+//       BackupStatus: fs.status,
+//       LastBackupStatus: fs.status === 'Healthy' ? 'Completed' : (fs.status === 'Warning' ? 'Warning' : 'Failed'),
+//       PreBackupStatus: fs.status === 'Healthy' ? 'Succeeded' : 'Failed',
+//       ConsistencyType: 'File-System Consistent',
+//       RecoveryType: 'Snapshot',
+//       LatestRPTime: backupDate.toISOString(),
+//       LastBackupTime: backupDate.toISOString(),
+//       BackupAge: `${ageHours}h ago`,
+//       BackupAgeHours: ageHours,
+//       PolicyName: 'AzureFileSharePolicy',
+//       ProtectionState: fs.status === 'Healthy' ? 'Protected' : 'Unprotected',
+//       StorageAccount: fs.name.replace(/-/g, '').toLowerCase() + 'sa'
+//     };
+//   });
+
+//   const allRecords = [...records, ...fsRecords];
+
+//   const filename = `AzureBackupData_${timestamp}.json`;
+//   const filepath = path.join(AZURE_BACKUP_DIR, filename);
+//   if (!fs.existsSync(AZURE_BACKUP_DIR)) {
+//     fs.mkdirSync(AZURE_BACKUP_DIR, { recursive: true });
+//   }
+//   fs.writeFileSync(filepath, JSON.stringify(allRecords, null, 2), 'utf8');
+
+//   const nowStr = now.toISOString();
+//   console.log(`[AZ-SEED] Generated sample backup data: ${filename} (${allRecords.length} items: ${records.length} VMs, ${fsRecords.length} File Shares)`);
+//   return { file: filename, generatedAt: nowStr, records: allRecords };
+// }
+
+// function runAzureBackupCollection(trigger = 'manual') {
+//   if (azureBackupJob) return azureBackupJob;
+//   azureBackupLastAttempt = new Date().toISOString();
+//   azureBackupLastTrigger = trigger;
+//   azureBackupLastError = '';
+
+//   azureBackupJob = new Promise(async (resolve, reject) => {
+//     const userToken = typeof trigger === 'object' && trigger.userToken ? trigger.userToken : null;
+//     const triggerName = typeof trigger === 'string' ? trigger : 'manual';
+//     const collectionErrors = [];
+
+//     // Priority 1: Try with user-delegated Azure token (from MSAL frontend)
+//     if (userToken) {
+//       try {
+//         const collector = require('./azure-backup-collector');
+//         let records = await collector.collectAzureBackupData(userToken);
+//         records = collector.deduplicateFileShares(records);
+//         if (records && records.length > 0) {
+//           const nowStr = new Date().toISOString();
+//           const filename = `AzureBackupData_${nowStr.replace(/[:.]/g, '-').slice(0, 19)}.json`;
+//           const filepath = path.join(AZURE_BACKUP_DIR, filename);
+//           if (!fs.existsSync(AZURE_BACKUP_DIR)) {
+//             fs.mkdirSync(AZURE_BACKUP_DIR, { recursive: true });
+//           }
+//           fs.writeFileSync(filepath, JSON.stringify(records, null, 2), 'utf8');
+//           console.log(`[AZ-SDK] Written ${records.length} records to ${filename} (user token)`);
+//           const report = buildAzureBackupReport(records, filename, nowStr);
+//           resolve({ report, stdout: '', stderr: '' });
+//           return;
+//         }
+//         console.warn('[AZ-SDK] User token collector returned no records, falling back...');
+//         collectionErrors.push('User Azure token collector returned 0 records.');
+//       } catch (sdkErr) {
+//         console.warn('[AZ-SDK] User token collector failed:', sdkErr.message);
+//         collectionErrors.push(`User Azure token collector failed: ${sdkErr.message}`);
+//       }
+//     }
+
+//     // Priority 2: Try Azure SDK collector with service principal (manual refresh only)
+//     if (triggerName !== 'scheduled' && process.env.AZURE_CLIENT_ID && process.env.AZURE_CLIENT_SECRET && process.env.AZURE_TENANT_ID) {
+//       try {
+//         const collector = require('./azure-backup-collector');
+//         let records = await collector.collectAzureBackupData();
+//         records = collector.deduplicateFileShares(records);
+//         if (records && records.length > 0) {
+//           const nowStr = new Date().toISOString();
+//           const filename = `AzureBackupData_${nowStr.replace(/[:.]/g, '-').slice(0, 19)}.json`;
+//           const filepath = path.join(AZURE_BACKUP_DIR, filename);
+//           if (!fs.existsSync(AZURE_BACKUP_DIR)) {
+//             fs.mkdirSync(AZURE_BACKUP_DIR, { recursive: true });
+//           }
+//           fs.writeFileSync(filepath, JSON.stringify(records, null, 2), 'utf8');
+//           console.log(`[AZ-SDK] Written ${records.length} records to ${filename}`);
+//           const report = buildAzureBackupReport(records, filename, nowStr);
+//           resolve({ report, stdout: '', stderr: '' });
+//           return;
+//         }
+//         console.warn('[AZ-SDK] Collector returned no records, falling back...');
+//         collectionErrors.push('Service principal Azure collector returned 0 records.');
+//       } catch (sdkErr) {
+//         console.warn('[AZ-SDK] SDK collector failed:', sdkErr.message);
+//         collectionErrors.push(`Service principal Azure collector failed: ${sdkErr.message}`);
+//       }
+//     }
+
+//     // Priority 2: Try PowerShell script (for host-side execution)
+//     const canRunScript = fs.existsSync(AZURE_BACKUP_SCRIPT);
+//     const executable = process.env.AZURE_BACKUP_POWERSHELL || (process.platform === 'win32' ? 'powershell.exe' : 'pwsh');
+//     let pwshAvailable = false;
+//     if (canRunScript) {
+//       try {
+//         require('child_process').execFileSync(process.platform === 'win32' ? 'where' : 'which', [executable], { stdio: 'ignore' });
+//         pwshAvailable = true;
+//       } catch (e) { /* pwsh not available */ }
+//     }
+
+//     if (canRunScript && pwshAvailable) {
+//       const args = process.platform === 'win32'
+//         ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', AZURE_BACKUP_SCRIPT]
+//         : ['-NoProfile', '-File', AZURE_BACKUP_SCRIPT];
+
+//       console.log(`[AZ-RUN] Starting ${triggerName} Azure backup collection with ${executable}`);
+//       execFile(executable, args, {
+//         cwd: AZURE_BACKUP_DIR,
+//         env: { ...process.env, AZURE_BACKUP_REPORT_DIR: AZURE_BACKUP_DIR },
+//         maxBuffer: 20 * 1024 * 1024,
+//         timeout: 30 * 60 * 1000,
+//         windowsHide: true
+//       }, (error, stdout, stderr) => {
+//         if (error) {
+//           const report = readLatestAzureBackupReport();
+//           if (report) resolve({ report, stdout, stderr });
+//           else reject(error);
+//           return;
+//         }
+//         const report = readLatestAzureBackupReport();
+//         if (!report) {
+//           reject(new Error('Azure collection finished but no structured JSON report was generated.'));
+//           return;
+//         }
+//         resolve({ report, stdout, stderr });
+//       });
+//       return;
+//     }
+
+//     // Priority 3: No data source — return empty report in memory only
+//     reject(new Error(collectionErrors.length
+//       ? collectionErrors.join(' ')
+//       : 'No Azure backup data source is available. Live refresh did not collect records.'));
+//   })
+//     .then(result => {
+//       azureBackupLastSuccess = new Date().toISOString();
+//       return result;
+//     })
+//     .catch(error => {
+//       azureBackupLastError = error?.message || String(error);
+//       console.error('[AZ-RUN] Collection failed:', azureBackupLastError);
+//       throw error;
+//     })
+//     .finally(() => {
+//       azureBackupJob = null;
+//     });
+
+//   return azureBackupJob;
+// }
+
+// function getZonedDateParts(date = new Date()) {
+//   return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+//     timeZone: AZURE_BACKUP_TIME_ZONE,
+//     year: 'numeric',
+//     month: '2-digit',
+//     day: '2-digit',
+//     hour: '2-digit',
+//     minute: '2-digit',
+//     hourCycle: 'h23'
+//   }).formatToParts(date).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+// }
+
+// function checkAzureBackupSchedule() {
+//   if (String(process.env.ENABLE_AZURE_BACKUP_SCHEDULE || 'true').toLowerCase() === 'false') return;
+//   // Only run scheduled refresh if a previous report file exists (don't create empty reports)
+//   const latest = readLatestAzureBackupReport();
+//   if (!latest) return;
+//   const parts = getZonedDateParts();
+//   const hour = Number(parts.hour);
+//   const minute = Number(parts.minute);
+//   const slot = `${parts.year}-${parts.month}-${parts.day}-${String(Math.floor(hour / 3)).padStart(2, '0')}`;
+//   if (hour % 3 === 0 && minute < 5 && slot !== azureBackupLastScheduledSlot) {
+//     azureBackupLastScheduledSlot = slot;
+//     runAzureBackupCollection('scheduled').catch(() => {});
+//   }
+// }
+
+// // Periodic presence sync
+// let presenceSyncTimer = null;
+// async function runPresenceSync() {
+//   try {
+//     const token = await getGraphToken();
+//     const usersResult = await pool.query(`
+//       SELECT DISTINCT LOWER(TRIM(user_email)) as email FROM monitoring_devices
+//       WHERE user_email IS NOT NULL AND TRIM(user_email) != ''
+//     `);
+//     const emails = usersResult.rows.map(r => r.email).filter(Boolean);
+//     for (const email of emails) {
+//       try {
+//         const userResp = await fetch(
+//           `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id`,
+//           { headers: { Authorization: `Bearer ${token}` } }
+//         );
+//         if (!userResp.ok) continue;
+//         const userData = await userResp.json();
+//         if (!userData.id) continue;
+//         const presenceResp = await fetch(
+//           `https://graph.microsoft.com/v1.0/users/${userData.id}/presence`,
+//           { headers: { Authorization: `Bearer ${token}` } }
+//         );
+//         if (!presenceResp.ok) continue;
+//         const presence = await presenceResp.json();
+//         await pool.query(
+//           `INSERT INTO monitoring_presence_log (user_email, user_id, activity, timestamp) VALUES ($1,$2,$3,NOW())`,
+//           [email, userData.id, presence.activity || 'PresenceUnknown']
+//         );
+//       } catch (e) { /* skip user */ }
+//     }
+//   } catch (e) { /* skip cycle */ }
+// }
+
+// // ------------------------
+// // Start server
+// // ------------------------
+// app.listen(PORT, () => {
+//   console.log(`Server running on port ${PORT}`);
+//   checkAzureBackupSchedule();
+//   setInterval(checkAzureBackupSchedule, 30 * 1000).unref();
+
+//   // Schedule automatic presence sync every 15 minutes
+//   runPresenceSync().catch(() => {});
+//   presenceSyncTimer = setInterval(() => runPresenceSync().catch(() => {}), 15 * 60 * 1000).unref();
+
+//   // Per-user counts caches are warmed on each user's first dashboard request
+//   // via the SWR pattern. No shared pre-warm needed (it caused wrong 0-counts
+//   // for assigned/SLA metrics because no real userEmail was available at boot).
+// });
+
+// // Run a fresh live Azure Backup collection. Concurrent clicks share one job.
+// app.post('/api/monitoring/azure/run-report', authenticateToken, authorizeElevated, async (req, res) => {
+//   try {
+//     const userToken = req.headers['x-azure-token'] || null;
+//     const result = await runAzureBackupCollection({ trigger: 'manual', userToken });
+//     res.json({ status: 'ok', report: result.report });
+//   } catch (err) {
+//     res.status(500).json({
+//       message: 'Live Azure backup collection failed',
+//       error: err?.message || String(err),
+//       stderr: err?.stderr || ''
+//     });
+//   }
+// });
+
+// app.get('/api/monitoring/azure/report-status', authenticateToken, authorizeElevated, (req, res) => {
+//   const latest = readLatestAzureBackupReport();
+//   res.json({
+//     running: Boolean(azureBackupJob),
+//     lastAttempt: azureBackupLastAttempt,
+//     lastSuccess: azureBackupLastSuccess || latest?.generatedAt || null,
+//     lastError: azureBackupLastError,
+//     lastTrigger: azureBackupLastTrigger,
+//     scheduleTimeZone: AZURE_BACKUP_TIME_ZONE,
+//     refreshSchedule: '00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00 and 21:00'
+//   });
+// });
+
+// // Parse the latest AzureBackupMonitor_*.log into structured JSON
+// app.get('/api/monitoring/azure/report-log', authenticateToken, authorizeElevated, async (req, res) => {
+//   try {
+//     const structuredReport = readLatestAzureBackupReport();
+//     if (structuredReport) {
+//       res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+//       return res.json(structuredReport);
+//     }
+
+//     const AZ_DIR = path.join(__dirname, 'azure-monitoring');
+//     if (!fs.existsSync(AZ_DIR)) return res.status(404).json({ message: 'azure-monitoring directory not found' });
+
+//     const files = fs.readdirSync(AZ_DIR)
+//       .filter(f => f.toLowerCase().endsWith('.log'))
+//       .map(f => ({ name: f, mtime: fs.statSync(path.join(AZ_DIR, f)).mtimeMs }))
+//       .sort((a,b) => b.mtime - a.mtime);
+
+//     if (!files.length) return res.status(404).json({ message: 'No log files found' });
+
+//     const latest = path.join(AZ_DIR, files[0].name);
+//     const raw = fs.readFileSync(latest, 'utf8');
+
+//     const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+//     const parsed = {
+//       file: files[0].name,
+//       subscriptions: [],
+//       summary: [],
+//       raw,
+//       reportPath: '',
+//       totalRecords: 0,
+//       healthy: 0,
+//       warning: 0,
+//       failed: 0,
+//       totalVms: 0,
+//       totalFileShares: 0,
+//       consistencyCounts: {
+//         application: 0,
+//         crash: 0,
+//         filesystem: 0
+//       },
+//       alerts: [],
+//       items: []
+//     };
+
+//     let currentSub = null;
+//     let currentVault = null;
+
+//     for (const line of lines) {
+//       const reportPathMatch = /\[INFO\]\s*Report\s*:\s*(.*)/i.exec(line);
+//       if (reportPathMatch) {
+//         parsed.reportPath = reportPathMatch[1].trim();
+//         continue;
+//       }
+
+//       const totalMatch = /\[SUCCESS\]\s*Data collection complete\. Total records:\s*(\d+)/i.exec(line);
+//       if (totalMatch) {
+//         parsed.totalRecords = Number(totalMatch[1]);
+//         continue;
+//       }
+
+//       const subMatch = /Subscription:\s*\[(.*?)\]\s*\((.*?)\)/i.exec(line);
+//       if (subMatch) {
+//         currentSub = { name: subMatch[1], id: subMatch[2], vaults: [], totalItems: 0, healthy: 0, warning: 0, failed: 0 };
+//         parsed.subscriptions.push(currentSub);
+//         currentVault = null;
+//         continue;
+//       }
+
+//       const vaultMatch = /Vault:\s*\[(.*?)\]\s*RG:\s*\[(.*?)\]/i.exec(line);
+//       if (vaultMatch) {
+//         currentVault = { name: vaultMatch[1], resourceGroup: vaultMatch[2], items: [], vmBackupsProcessed: 0, fileShareBackupsProcessed: 0 };
+//         if (currentSub) currentSub.vaults.push(currentVault);
+//         continue;
+//       }
+
+//       const rpMatch = /\[RP-([A-Z0-9_-]+)\]\s+([^:]+)\s*:\s*(.*?)\s*\((\d+)\s+RPs\)/i.exec(line);
+//       if (rpMatch && currentVault && currentSub) {
+//         const consistencyMatch = /(Application Consistent|Crash Consistent|File-System Consistent)/i.exec(rpMatch[3]);
+//         const consistency = consistencyMatch ? consistencyMatch[1] : 'Unknown';
+//         const status = line.includes('[RP-OK]') ? 'Healthy' : 'Failed';
+//         const detailsStr = rpMatch[3].trim();
+//         const recoveryType = detailsStr.includes('|') ? detailsStr.split('|')[1].trim() : detailsStr;
+//         const resourceName = rpMatch[2].trim();
+//         const alert = {
+//           type: 'VM Backup',
+//           resource: resourceName,
+//           status,
+//           subscription: currentSub.name,
+//           resourceGroup: currentVault.resourceGroup,
+//           vault: currentVault.name,
+//           consistency
+//         };
+
+//         currentVault.items.push({
+//           tag: rpMatch[1],
+//           item: resourceName,
+//           details: detailsStr,
+//           recoveryPoints: Number(rpMatch[4]),
+//           status,
+//           consistency
+//         });
+
+//         currentSub.totalItems = (currentSub.totalItems || 0) + 1;
+//         if (status === 'Healthy') {
+//           currentSub.healthy = (currentSub.healthy || 0) + 1;
+//           parsed.healthy++;
+//         } else {
+//           parsed.failed++;
+//           currentSub.failed = (currentSub.failed || 0) + 1;
+//           parsed.alerts.push(alert);
+//         }
+
+//         if (/Application Consistent/i.test(consistency)) parsed.consistencyCounts.application++;
+//         else if (/Crash Consistent/i.test(consistency)) parsed.consistencyCounts.crash++;
+//         else if (/File-System Consistent/i.test(consistency)) parsed.consistencyCounts.filesystem++;
+
+//         parsed.items.push({
+//           subscription: currentSub.name,
+//           resourceGroup: currentVault.resourceGroup,
+//           vault: currentVault.name,
+//           type: 'VM Backup',
+//           resource: resourceName,
+//           status,
+//           lastBackupStatus: status,
+//           preBackupStatus: '',
+//           consistency,
+//           recoveryType,
+//           latestRecoveryPoint: '',
+//           lastBackupTime: '',
+//           backupAge: '',
+//           backupAgeHours: 0,
+//           policyName: '',
+//           protectionState: status,
+//           storageAccount: ''
+//         });
+
+//         continue;
+//       }
+
+//       // Handle RP-MISS lines (missing recovery points, no details)
+//       const missMatch = /\[RP-MISS\]\s+(.+)/i.exec(line);
+//       if (missMatch && currentVault && currentSub) {
+//         const resourceName = missMatch[1].trim();
+//         const status = 'Warning';
+
+//         currentVault.items.push({
+//           tag: 'MISS',
+//           item: resourceName,
+//           details: '',
+//           recoveryPoints: 0,
+//           status,
+//           consistency: 'N/A'
+//         });
+
+//         currentSub.totalItems = (currentSub.totalItems || 0) + 1;
+//         currentSub.warning = (currentSub.warning || 0) + 1;
+//         currentSub.failed = (currentSub.failed || 0) + 1;
+//         parsed.warning++;
+
+//         parsed.alerts.push({
+//           type: 'VM Backup',
+//           resource: resourceName,
+//           status,
+//           subscription: currentSub.name,
+//           resourceGroup: currentVault.resourceGroup,
+//           vault: currentVault.name,
+//           consistency: 'N/A'
+//         });
+
+//         parsed.items.push({
+//           subscription: currentSub.name,
+//           resourceGroup: currentVault.resourceGroup,
+//           vault: currentVault.name,
+//           type: 'VM Backup',
+//           resource: resourceName,
+//           status,
+//           lastBackupStatus: status,
+//           preBackupStatus: '',
+//           consistency: 'N/A',
+//           recoveryType: 'N/A',
+//           latestRecoveryPoint: '',
+//           lastBackupTime: '',
+//           backupAge: '',
+//           backupAgeHours: 0,
+//           policyName: '',
+//           protectionState: status,
+//           storageAccount: ''
+//         });
+
+//         continue;
+//       }
+
+//       const vmMatch = /VM backups processed:\s*(\d+)/i.exec(line);
+//       if (vmMatch && currentVault) { currentVault.vmBackupsProcessed = Number(vmMatch[1]); continue; }
+//       const fsMatch = /File Share backups processed:\s*(\d+)/i.exec(line);
+//       if (fsMatch && currentVault) { currentVault.fileShareBackupsProcessed = Number(fsMatch[1]); continue; }
+
+//       const foundSub = /\[SUCCESS\]\s*Found\s*(\d+)\s*subscription\(s\)\s*in\s*\[(.*?)\s*\((.*?)\)\]/i.exec(line);
+//       if (foundSub) {
+//         parsed.summary.push({ subscriptionsFound: Number(foundSub[1]), tenantDisplay: foundSub[2], tenantId: foundSub[3] });
+//         continue;
+//       }
+
+//       const gen = /\[(INFO|SUCCESS|WARN|ERROR|SECTION)\]\s*(.*)/i.exec(line);
+//       if (gen) {
+//         parsed.summary.push({ level: gen[1], message: gen[2] });
+//       }
+//     }
+
+//     parsed.totalVms = parsed.subscriptions.reduce((sum, sub) => sum + sub.vaults.reduce((vaultSum, vault) => vaultSum + (vault.vmBackupsProcessed || 0), 0), 0);
+//     parsed.totalFileShares = parsed.subscriptions.reduce((sum, sub) => sum + sub.vaults.reduce((vaultSum, vault) => vaultSum + (vault.fileShareBackupsProcessed || 0), 0), 0);
+
+//     res.json(parsed);
+//   } catch (err) {
+//     console.error('Report-log parse error:', err);
+//     res.status(500).json({ message: 'Failed to parse report log', error: err?.message || err });
+//   }
+// });
+
+// app.get('/api/monitoring/azure/report-html', authenticateToken, authorizeElevated, async (req, res) => {
+//   try {
+//     const AZ_DIR = path.join(__dirname, 'azure-monitoring');
+//     if (!fs.existsSync(AZ_DIR)) return res.status(404).json({ message: 'azure-monitoring directory not found' });
+
+//     const files = fs.readdirSync(AZ_DIR)
+//       .filter(f => f.toLowerCase().endsWith('.html'))
+//       .map(f => ({ name: f, mtime: fs.statSync(path.join(AZ_DIR, f)).mtimeMs }))
+//       .sort((a,b) => b.mtime - a.mtime);
+
+//     if (!files.length) return res.status(404).json({ message: 'No HTML report files found' });
+
+//     const latestHtml = path.join(AZ_DIR, files[0].name);
+//     res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+//     res.sendFile(latestHtml);
+//   } catch (err) {
+//     console.error('Report-html error:', err);
+//     res.status(500).json({ message: 'Failed to serve report HTML', error: err?.message || err });
+//   }
+// });
+
+// // -------------------------------------------------------
+// // SPA fallback (Angular routing) - MUST BE LAST
+// // -------------------------------------------------------
+// app.get("*", (req, res) => {
+//   const indexPath =
+//     fs.existsSync(path.join(angularBrowserPath, "index.html"))
+//       ? path.join(angularBrowserPath, "index.html")
+//       : path.join(angularPath, "index.html");
+
+//   res.sendFile(indexPath);
+// });

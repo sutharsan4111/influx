@@ -1,7 +1,7 @@
 services:
   web:
     container_name: itsm-muraai-tst
-    image: node:18
+    build: .
     working_dir: /usr/src/app
     ports:
       - "3000:3000"
@@ -18,4 +18,4 @@ services:
     # Production deployment: build once, then serve. Avoids `ng watch` overhead
     # and ships the optimized/minified Angular bundle to clients.
     command: sh -c "npm install --include=dev --legacy-peer-deps && npm run build:prod && npm start"
-    restart: unless-stopped
+    restart: unless-stopped 

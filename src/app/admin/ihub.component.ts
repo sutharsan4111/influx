@@ -518,8 +518,10 @@ export class IhubComponent implements OnInit {
       return;
     }
 
-    await this.loadResponsiblePeople();
-    await this.loadAssets();
+    await Promise.all([
+      this.loadAssets(),
+      this.loadResponsiblePeople()
+    ]);
   }
 
   async loadAssets(): Promise<void> {
@@ -554,34 +556,22 @@ export class IhubComponent implements OnInit {
         );
         return;
       }
+    } catch {
+      // Graph lookup failed - fall through to fallback below
+    }
 
+    try {
       const fallbackUsers = await firstValueFrom(this.ihubService.getAssignableUsersFallback());
       this.responsiblePeople = (fallbackUsers || []).map(u => ({
         email: u.email,
         displayName: u.email
       }));
-
-      if (this.responsiblePeople.length > 0) {
-        this.messageService.error('CloudOps group has no members in Graph. Showing app users as fallback.');
-      } else {
-        this.messageService.error('No responsible users found.');
-      }
     } catch {
-      try {
-        const fallbackUsers = await firstValueFrom(this.ihubService.getAssignableUsersFallback());
-        this.responsiblePeople = (fallbackUsers || []).map(u => ({
-          email: u.email,
-          displayName: u.email
-        }));
-        if (this.responsiblePeople.length > 0) {
-          this.messageService.error('Graph group lookup failed. Showing app users as fallback.');
-        } else {
-          this.messageService.error('Failed to load responsible users.');
-        }
-      } catch {
-        this.responsiblePeople = [];
-        this.messageService.error('Failed to load responsible users.');
-      }
+      this.responsiblePeople = [];
+    }
+
+    if (this.responsiblePeople.length === 0) {
+      this.messageService.error('No responsible users found.');
     }
   }
 
