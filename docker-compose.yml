@@ -1,6 +1,6 @@
 services:
   web:
-    container_name: itsm-muraai-tst
+    container_name: itsm-muraAI-tst
     build: .
     working_dir: /usr/src/app
     ports:
