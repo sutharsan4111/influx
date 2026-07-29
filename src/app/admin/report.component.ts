@@ -1,4 +1,4 @@
-import { Component, OnInit, ViewChild, ElementRef, AfterViewInit, Input } from '@angular/core';
+import { Component, OnInit, ViewChild, ElementRef, AfterViewInit, Input, Output, EventEmitter } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { firstValueFrom } from 'rxjs';
@@ -1214,6 +1214,11 @@ export class ReportComponent implements OnInit, AfterViewInit {
   @Input() departmentFilter = '';
   @Input() overrideGroupEmail = '';
 
+  // Notifies an OnPush parent (e.g. the embedding dashboard) that bound data
+  // changed as a result of this component's own async work, so it can
+  // markForCheck() itself — the parent has no other way to know.
+  @Output() reportDataChanged = new EventEmitter<void>();
+
   groupEmail = 'cloudops@muraai.com';
   startDate = '';
   endDate = '';
@@ -1360,6 +1365,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
     this.applyPresetDateRange(this.selectedPeriod);
     if (this.rawAssignments.length > 0 && this.groupMembers.length > 0) {
       this.buildReport(this.rawAssignments);
+      this.reportDataChanged.emit();
       setTimeout(() => {
         this.drawPieChart();
         this.drawBarChart();
@@ -1384,6 +1390,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
     if (!this.isAdmin) return;
 
     if (!forceRefresh && this.loadReportFromCache()) {
+      this.reportDataChanged.emit();
       return;
     }
 
@@ -1425,6 +1432,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
       this.detailRows = [];
     } finally {
       this.loading = false;
+      this.reportDataChanged.emit();
     }
   }
 
@@ -1841,11 +1849,14 @@ export class ReportComponent implements OnInit, AfterViewInit {
     if (period === 'monthly') {
       start.setDate(1);
     } else if (period === 'quarterly') {
-      const quarterStartMonth = Math.floor(now.getMonth() / 3) * 3;
-      start.setMonth(quarterStartMonth, 1);
+      // Rolling trailing window (last 3 calendar months, inclusive of the
+      // current one) rather than "start of the current calendar quarter" —
+      // the latter collapses to the same range as Monthly whenever today
+      // falls in a quarter's first month (Jan/Apr/Jul/Oct).
+      start.setMonth(now.getMonth() - 2, 1);
     } else if (period === 'halfyearly') {
-      const halfStartMonth = now.getMonth() < 6 ? 0 : 6;
-      start.setMonth(halfStartMonth, 1);
+      // Rolling trailing window (last 6 calendar months) for the same reason.
+      start.setMonth(now.getMonth() - 5, 1);
     } else {
       start.setMonth(0, 1);
     }

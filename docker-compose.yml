@@ -19,3 +19,4 @@ services:
     # and ships the optimized/minified Angular bundle to clients.
     command: sh -c "npm install --include=dev --legacy-peer-deps && npm run build:prod && npm start"
     restart: unless-stopped 
+    

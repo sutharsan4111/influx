@@ -14,15 +14,15 @@ import { MsalService } from '../services/msal.service';
 
       <!-- MENU -->
       <ul class="menu">
-        <li class="menu-item" routerLink="/dashboard" [class.active]="isActive('/dashboard')">
+        <li *ngIf="isCloudops()" class="menu-item" routerLink="/dashboard" [class.active]="isActive('/dashboard')">
           <i class="fas fa-home"></i>
           <span>Dashboard</span>
         </li>
-        <li *ngIf="isCloudOpsMember()" class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')">
+        <li *ngIf="isAdmin() || isCloudops()" class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')" [queryParams]="isAdmin() ? {tab: 'overview'} : null">
           <i class="fas fa-ticket-alt"></i>
           <span>View Tickets</span>
         </li>
-        <li *ngIf="!isCloudOpsMember()" class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')" [queryParams]="{tab: 'my'}">
+        <li *ngIf="!isAdmin() && !isCloudops()" class="menu-item" routerLink="/tickets" [class.active]="isActive('/tickets')" [queryParams]="{tab: 'my'}">
           <i class="fas fa-ticket-alt"></i>
           <span>My Tickets</span>
         </li>
@@ -39,7 +39,7 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-cog"></i>
           <span>Admin Panel</span>
         </li>
-        <li *ngIf="isCloudOpsMember()"
+        <li *ngIf="isCloudops()"
             class="menu-item"
             routerLink="/azure-backup"
             [class.active]="isActive('/azure-backup')">
@@ -764,9 +764,10 @@ export class SidebarComponent implements OnInit {
       product: 'Product',
       hr: 'HR',
       support: 'Support',
-      muraai: 'Muraai'
+      muraai: 'Muraai',
+      user: 'User'
     };
-    return map[(role || '').toLowerCase()] || 'Unassigned';
+    return map[(role || '').toLowerCase()] || 'User';
   }
 
   switchRole() {
@@ -886,5 +887,4 @@ export class SidebarComponent implements OnInit {
   isAdmin() { return this.role === 'admin'; }
   isCloudops() { return this.role === 'cloudops' || this.role === 'itsm'; }
   isUser() { return this.role === 'user'; }
-  isCloudOpsMember() { return sessionStorage.getItem('isCloudOps') === 'true' || this.isAdmin() || this.isCloudops(); }
 }

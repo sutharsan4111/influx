@@ -2,29 +2,14 @@ import { Component, OnInit } from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { Router } from '@angular/router';
 import { CommonModule } from '@angular/common';
-import { HttpClient } from '@angular/common/http';
-import { firstValueFrom } from 'rxjs';
 import { MsalService } from '../services/msal.service';
-import { ReportSuggestionModalComponent } from '../header/report-suggestion-modal.component';
 
 @Component({
   selector: 'app-login',
   standalone: true,
-  imports: [CommonModule, ReactiveFormsModule, ReportSuggestionModalComponent],
+  imports: [CommonModule, ReactiveFormsModule],
   template: `
     <div class="login-page">
-      <button
-        class="support-fab"
-        type="button"
-        (click)="openReportModal()"
-        title="Support / Report Issue"
-        aria-label="Support or report issue"
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-        </svg>
-      </button>
-
       <div class="login-shell">
         <section class="hero-panel" aria-label="Application introduction">
           <img src="assets/MuraaiLogo.png" class="logo" alt="Muraai Logo" />
@@ -96,11 +81,6 @@ import { ReportSuggestionModalComponent } from '../header/report-suggestion-moda
           </div>
         </section>
       </div>
-
-      <app-report-suggestion-modal *ngIf="showReportModal"
-        (submitted)="handleReportSubmit($event)"
-        (closed)="closeReportModal()">
-      </app-report-suggestion-modal>
     </div>
   `,
   styles: [`
@@ -117,36 +97,6 @@ import { ReportSuggestionModalComponent } from '../header/report-suggestion-moda
         linear-gradient(180deg, #f8fafc 0%, #f3f6fb 100%);
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
       padding: 24px;
-    }
-
-    .support-fab {
-      position: fixed;
-      right: 24px;
-      bottom: 24px;
-      width: 48px;
-      height: 48px;
-      border-radius: 50%;
-      border: 1px solid #bfdbfe;
-      background: linear-gradient(145deg, #eff6ff 0%, #dbeafe 100%);
-      color: #1e3a8a;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      z-index: 1100;
-      box-shadow: 0 10px 20px rgba(30, 58, 138, 0.22);
-      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
-    }
-
-    .support-fab svg {
-      width: 20px;
-      height: 20px;
-    }
-
-    .support-fab:hover {
-      transform: translateY(-2px);
-      border-color: #93c5fd;
-      box-shadow: 0 14px 24px rgba(30, 58, 138, 0.28);
     }
 
     .login-shell {
@@ -414,13 +364,6 @@ import { ReportSuggestionModalComponent } from '../header/report-suggestion-moda
     }
 
     @media (max-width: 520px) {
-      .support-fab {
-        right: 16px;
-        bottom: 16px;
-        width: 44px;
-        height: 44px;
-      }
-
       .login-card {
         padding: 20px;
       }
@@ -446,7 +389,6 @@ export class LoginComponent implements OnInit {
   error = '';
   msalReady = false;
   showLocalLogin = false;
-  showReportModal = false;
 
   loginForm = this.fb.group({
     username: ['', [Validators.required, Validators.email]],
@@ -456,8 +398,7 @@ export class LoginComponent implements OnInit {
   constructor(
     private fb: FormBuilder,
     private router: Router,
-    private msalService: MsalService,
-    private http: HttpClient
+    private msalService: MsalService
   ) {}
 
   async ngOnInit() {
@@ -474,26 +415,14 @@ export class LoginComponent implements OnInit {
     this.error = '';
   }
 
-  openReportModal(): void {
-    this.showReportModal = true;
-  }
-
-  closeReportModal(): void {
-    this.showReportModal = false;
-  }
-
-  async handleReportSubmit(event: { content: string; includeName: boolean }): Promise<void> {
-    try {
-      await firstValueFrom(this.http.post('/api/feedback/report', {
-        content: event.content,
-        includeName: event.includeName
-      }));
-
-      alert('Thank you. Your report/suggestion has been sent.');
-      this.closeReportModal();
-    } catch (submitError) {
-      console.error('Failed to send report/suggestion:', submitError);
-      alert('Unable to send report right now. Please try again.');
+  private navigateByRole(role: string): void {
+    const normalized = (role || '').toLowerCase();
+    if (normalized === 'cloudops' || normalized === 'itsm') {
+      this.router.navigate(['/dashboard']);
+    } else if (normalized === 'admin') {
+      this.router.navigate(['/tickets'], { queryParams: { tab: 'overview' } });
+    } else {
+      this.router.navigate(['/tickets'], { queryParams: { tab: 'my' } });
     }
   }
 
@@ -528,7 +457,7 @@ export class LoginComponent implements OnInit {
       sessionStorage.setItem('username', data.email);
       sessionStorage.setItem('isCloudOps', data.isCloudOps ? 'true' : 'false');
 
-      this.router.navigate(['/dashboard']);
+      this.navigateByRole(data.role);
     } else {
       this.error = data.message || data.error || 'Login failed';
     }
@@ -588,7 +517,7 @@ async loginWithMicrosoft() {
       sessionStorage.setItem('username', email);
       sessionStorage.setItem('displayName', displayName);
 
-      this.router.navigate(['/dashboard']);
+      this.navigateByRole(data.role);
     } else {
       this.error = data.message || 'Backend authentication failed';
     }

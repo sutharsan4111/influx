@@ -1783,7 +1783,7 @@ export class TicketsComponent implements OnInit, OnDestroy, AfterViewInit {
   currentUserName = '';
   allowedRequesterEmails: string[] = [];
   userRole: 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user' = 'user';
-  private readonly elevatedRoles = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
+  private readonly elevatedRoles = new Set(['admin', 'cloudops', 'itsm']);
   isCloudOpsMember = false;
 
   get isAdmin(): boolean {
@@ -1803,10 +1803,10 @@ export class TicketsComponent implements OnInit, OnDestroy, AfterViewInit {
 
   departments: { id: string; name: string; disabled?: boolean }[] = [
     { id: '132475000009937630', name: 'ITSM', disabled: false },
-    { id: '132475000009925079', name: 'HR', disabled: true },
-    { id: '132475000009948173', name: 'Support', disabled: true },
-    { id: '132475000009958716', name: 'Products', disabled: true },
-    { id: '132475000000010772', name: 'Muraai', disabled: true }
+    { id: '132475000009925079', name: 'HR', disabled: false },
+    { id: '132475000009948173', name: 'Support', disabled: false },
+    { id: '132475000009958716', name: 'Products', disabled: false },
+    { id: '132475000000010772', name: 'Muraai', disabled: false }
   ];
   selectedDepartmentId = '';
 
@@ -1871,7 +1871,7 @@ export class TicketsComponent implements OnInit, OnDestroy, AfterViewInit {
   }
 
   async ngOnInit(): Promise<void> {
-    await this.initCurrentUser();
+    this.initCurrentUser();
 
     // Restore department selection from sessionStorage
     const savedDept = sessionStorage.getItem('ITSM_SELECTED_DEPT') || '';
@@ -3027,7 +3027,13 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     return ticket.assignedTo || ticket.assignee?.email || ticket.assignee?.firstName || 'Unassigned';
   }
 
-  private async initCurrentUser(): Promise<void> {
+  // Synchronous on purpose: role/email come straight from sessionStorage/MSAL's
+  // in-memory account, so ngOnInit's tab-resolution (which depends on userRole/
+  // isCloudOpsMember) doesn't have to wait on the slow Graph group-mail lookup
+  // below. Awaiting that lookup here used to delay selectedTab past the first
+  // render, leaving the embedded overview dashboard mounted (and then torn
+  // down mid-request, cancelling its calls) for users who should never see it.
+  private initCurrentUser(): void {
     const account = this.msalService.getAccount();
     const storedEmail = sessionStorage.getItem('username') || '';
     const storedName = sessionStorage.getItem('displayName') || '';
@@ -3043,6 +3049,10 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
     this.isCloudOpsMember = sessionStorage.getItem('isCloudOps') === 'true' || this.isAdmin;
 
+    this.loadAllowedRequesterEmails();
+  }
+
+  private async loadAllowedRequesterEmails(): Promise<void> {
     const allowed = new Set<string>();
     if (this.currentUserEmail) allowed.add(this.currentUserEmail);
 

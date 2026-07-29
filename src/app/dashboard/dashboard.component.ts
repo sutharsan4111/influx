@@ -2,7 +2,7 @@ import { Component, OnInit, OnDestroy, OnChanges, SimpleChanges, ChangeDetection
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
-import { Subject, takeUntil } from 'rxjs';
+import { Subject, takeUntil, finalize } from 'rxjs';
 import { TicketService, Ticket } from '../services/ticket.service';
 import { LoadingService } from '../services/loading.service';
 import { MessageService } from '../services/message.service';
@@ -15,19 +15,6 @@ import { ReportComponent } from '../admin/report.component';
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [CommonModule, FormsModule, ReportComponent],
   template: `
-    <ng-container *ngIf="showComingSoonForNonCloudOps; else dashboardContent">
-      <div class="coming-soon-wrap">
-        <div class="coming-soon-card">
-          <h2>Coming Soon</h2>
-          <p>
-            Dashboard features for your team are under development.
-            Please check back soon.
-          </p>
-        </div>
-      </div>
-    </ng-container>
-
-    <ng-template #dashboardContent>
     <ng-container *ngIf="showReportOnDashboard; else overviewBlock">
       <div class="welcome-banner">
         <div class="welcome-content">
@@ -73,7 +60,7 @@ import { ReportComponent } from '../admin/report.component';
         </div>
       </div>
 
-      <app-admin-report *ngIf="isAdmin" [isEmbedded]="true" [departmentFilter]="deptFilterForReport" [overrideGroupEmail]="deptGroupEmail" #reportComponent></app-admin-report>
+      <app-admin-report *ngIf="isAdmin" [isEmbedded]="true" [departmentFilter]="deptFilterForReport" [overrideGroupEmail]="deptGroupEmail" (reportDataChanged)="onReportDataChanged()" #reportComponent></app-admin-report>
     </ng-container>
 
     <ng-template #overviewBlock>
@@ -299,41 +286,8 @@ import { ReportComponent } from '../admin/report.component';
 
     </ng-template>
 
-    </ng-template>
-
   `,
   styles: [`
-    .coming-soon-wrap {
-      min-height: calc(100vh - 110px);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-    }
-
-    .coming-soon-card {
-      width: min(560px, 100%);
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 14px;
-      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
-      text-align: center;
-      padding: 28px 24px;
-    }
-
-    .coming-soon-card h2 {
-      margin: 0 0 8px 0;
-      font-size: 1.4rem;
-      color: #0f172a;
-      font-weight: 700;
-    }
-
-    .coming-soon-card p {
-      margin: 0;
-      color: #475569;
-      font-size: 0.95rem;
-      line-height: 1.5;
-    }
 
     /* Page-level Tabs */
     .page-tabs {
@@ -1089,15 +1043,6 @@ import { ReportComponent } from '../admin/report.component';
       background: rgba(239, 68, 68, 0.15);
     }
 
-    :host-context(.dark-theme) .coming-soon-card {
-      background: #1e293b;
-      border-color: #334155;
-      box-shadow: 0 12px 28px rgba(2, 6, 23, 0.45);
-    }
-
-    :host-context(.dark-theme) .coming-soon-card h2 { color: #e2e8f0; }
-    :host-context(.dark-theme) .coming-soon-card p { color: #94a3b8; }
-
     :host-context(.dark-theme) .sla-item:hover { background: rgba(239, 68, 68, 0.1); }
     :host-context(.dark-theme) .sla-subject { color: #e2e8f0; }
     :host-context(.dark-theme) .card-header { border-color: #334155; }
@@ -1137,7 +1082,6 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
   slaTickets: Ticket[] = [];
   selectedTab: 'open' | 'closed' = 'open';
   showReportOnDashboard = false;
-  showComingSoonForNonCloudOps = false;
 
   // Department analytics config
   readonly DEPT_CONFIG: Record<string, { id: string; groupEmail: string; name: string }> = {
@@ -1234,16 +1178,17 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
     this.showReportOnDashboard = this.router.url.startsWith('/dashboard');
 
     this.initUserInfo();
-    // Show Coming Soon only if admin user is NOT in cloudops group
-    // CloudOps role users always see dashboard
-    const isCloudOps = sessionStorage.getItem('isCloudOps') === 'true';
-    const isAdminRole = this.userRole === 'admin';
-    this.showComingSoonForNonCloudOps = isAdminRole && !isCloudOps && !this.isEmbeddedMode;
 
-    if (this.showComingSoonForNonCloudOps) {
-      this.countsLoading = false;
-      this.cdr.markForCheck();
-      return;
+    // The standalone /dashboard route is CloudOps-only. Admins land on the
+    // Tickets "Overview" tab instead (still embeds this component), and
+    // everyone else lands on their own "My Tickets" view.
+    if (!this.isEmbeddedMode) {
+      const isCloudOpsRole = this.userRole === 'cloudops' || this.userRole === 'itsm';
+      if (!isCloudOpsRole) {
+        const tab = this.userRole === 'admin' ? 'overview' : 'my';
+        this.router.navigate(['/tickets'], { queryParams: { tab } });
+        return;
+      }
     }
 
     this.setGreeting();
@@ -1318,7 +1263,7 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
   }
 
   get isAdmin(): boolean {
-    const elevatedRoles = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
+    const elevatedRoles = new Set(['admin', 'cloudops', 'itsm']);
     return elevatedRoles.has((this.userRole || '').toLowerCase());
   }
 
@@ -1397,7 +1342,15 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
       : undefined;
     // 50 records is enough for dashboard widgets and faster than 100.
     this.ticketService.getTickets(1, 50, this.selectedTab, undefined, filterEmail, undefined, departmentId)
-      .pipe(takeUntil(this.destroy$))
+      .pipe(
+        takeUntil(this.destroy$),
+        finalize(() => {
+          // Runs on success, error, AND cancellation (e.g. this embedded
+          // dashboard being torn down mid-request) so the shared loading
+          // counter never gets stuck incremented.
+          if (!silent) this.loadingService.hide();
+        })
+      )
       .subscribe({
         next: res => {
           this.tickets = res.data || [];
@@ -1409,15 +1362,11 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
             this.TICKETS_CACHE_KEY,
             JSON.stringify({ data: this.tickets, timestamp: Date.now() })
           );
-          if (!silent) {
-            this.loadingService.hide();
-          }
           this.cdr.markForCheck();
         },
         error: () => {
           if (!silent) {
             this.messageService.error('Failed to load tickets');
-            this.loadingService.hide();
           }
           this.cdr.markForCheck();
         }
@@ -1578,6 +1527,16 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
     this.reportComponent.onPeriodChange();
     this.startDate = this.reportComponent.startDate;
     this.endDate = this.reportComponent.endDate;
+  }
+
+  // The embedded report loads/rebuilds its data on its own async timeline
+  // (initial fetch, background cache refresh). Since this dashboard uses
+  // OnPush, those updates would otherwise sit unrendered until some
+  // unrelated event elsewhere forced a check — this keeps the view in sync.
+  onReportDataChanged() {
+    this.startDate = this.reportComponent?.startDate ?? this.startDate;
+    this.endDate = this.reportComponent?.endDate ?? this.endDate;
+    this.cdr.markForCheck();
   }
 
   onDateInputChange() {

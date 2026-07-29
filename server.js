@@ -1305,6 +1305,9 @@ app.post("/api/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
+    // Start warming the My Tickets cache now so it's ready before the user navigates there.
+    prewarmUserTickets(user.email.toLowerCase(), normalizedRole);
+
     res.json({
       accessToken,
       refreshToken,
@@ -2775,10 +2778,10 @@ function prewarmUserTickets(userEmail, userRole = 'user') {
   if (!userEmail) return;
   const allowedDeptIds = getAllowedDepartmentIdsForRole(userRole);
   for (const status of ['open', 'closed']) {
-    const cacheKey = `${userRole}_${userEmail}_${status}_all`;
+    const cacheKey = `${userRole}_${userEmail}_${status}`;
     const cached = userTicketsCache.get(cacheKey);
     if (cached && (Date.now() - cached.time) < USER_TICKETS_CACHE_MS) continue;
-    refreshUserTicketsCache(cacheKey, userEmail, status, 'all', allowedDeptIds).catch(err =>
+    refreshUserTicketsCache(cacheKey, userEmail, status, allowedDeptIds).catch(err =>
       console.error(`Pre-warm user-tickets failed for ${cacheKey}:`, err?.message || err)
     );
   }
@@ -3036,7 +3039,7 @@ async function refreshStandardTicketsCache(cacheKey, endpoint, limit, allowedDep
 
 // ── Compute the full filtered ticket list for a user ──
 // Uses Zoho contact search (fast path) + limited assignee scan + Supabase-assigned fetch.
-async function computeUserTickets(userEmail, status, filterType = 'all', allowedDeptIds = []) {
+async function computeUserTickets(userEmail, status, allowedDeptIds = []) {
   const include = 'contacts,assignee';
 
   const [recycledIds, supabaseResult] = await Promise.all([
@@ -3072,15 +3075,14 @@ async function computeUserTickets(userEmail, status, filterType = 'all', allowed
     const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toLowerCase();
     const isRequester = contactEmail === userEmail;
     const isAssignee = assigneeEmail === userEmail || supabaseAssignedIds.has(tid);
-    // Apply filterType
-    if (filterType === 'assigned' && !isAssignee) return;
-    if (filterType === 'raised' && !isRequester) return;
     if (!isRequester && !isAssignee) return;
     seenIds.add(tid);
     allUserTickets.push({
       ...t,
       email: t.email || t.contact?.email || t.contact?.emailAddress || t.contact?.secondaryEmail,
-      assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId
+      assignedTo: t.assignedTo || t.assignee?.name || t.assignee?.email || t.assignee?.emailId,
+      _isRequester: isRequester,
+      _isAssignee: isAssignee
     });
   }
 
@@ -3192,13 +3194,16 @@ async function computeUserTickets(userEmail, status, filterType = 'all', allowed
 }
 
 // ── Refresh user-tickets cache; deduped per cache key ──
-async function refreshUserTicketsCache(cacheKey, userEmail, status, filterType = 'all', allowedDeptIds = []) {
+// cacheKey covers (role, email, status) only — filterType ('all'/'assigned'/'raised')
+// is derived in-memory from the cached set via deriveUserTicketsView(), so switching
+// tabs never triggers another Zoho scan.
+async function refreshUserTicketsCache(cacheKey, userEmail, status, allowedDeptIds = []) {
   const inflight = userTicketsRefreshInFlight.get(cacheKey);
   if (inflight) return inflight;
 
   const promise = (async () => {
     const start = Date.now();
-    const tickets = await computeUserTickets(userEmail, status, filterType, allowedDeptIds);
+    const tickets = await computeUserTickets(userEmail, status, allowedDeptIds);
     userTicketsCache.set(cacheKey, { tickets, time: Date.now() });
     console.log(`[USER-TICKETS REFRESHED] ${cacheKey} → ${tickets.length} rows in ${Date.now() - start}ms`);
     return tickets;
@@ -3206,6 +3211,14 @@ async function refreshUserTicketsCache(cacheKey, userEmail, status, filterType =
 
   userTicketsRefreshInFlight.set(cacheKey, promise);
   return promise;
+}
+
+function deriveUserTicketsView(tickets, filterType) {
+  const source = tickets || [];
+  let filtered = source;
+  if (filterType === 'assigned') filtered = source.filter(t => t._isAssignee);
+  else if (filterType === 'raised') filtered = source.filter(t => t._isRequester);
+  return filtered.map(({ _isRequester, _isAssignee, ...rest }) => rest);
 }
 
 app.get('/api/tickets', authenticateToken, async (req, res) => {
@@ -3224,27 +3237,31 @@ app.get('/api/tickets', authenticateToken, async (req, res) => {
       const userEmail = filterByEmail.toLowerCase();
       const filterType = req.query.filterType || 'all'; // 'all' | 'assigned' | 'raised'
       const forceRefresh = req.query.refresh === 'true';
-      const cacheKey = `${userRole}_${userEmail}_${status || 'all'}_${filterType}`;
+      // Cache key intentionally excludes filterType — the underlying scan already
+      // captures both requester and assignee tickets, so all three tabs share one
+      // cached scan per (role, email, status) and just filter it in memory below.
+      const cacheKey = `${userRole}_${userEmail}_${status || 'all'}`;
       const startIdx = (page - 1) * limit;
       const cached = userTicketsCache.get(cacheKey);
       const age = cached ? Date.now() - cached.time : Infinity;
 
-      let allUserTickets;
+      let rawUserTickets;
 
       if (!forceRefresh && cached && age < USER_TICKETS_CACHE_MS) {
         // Fresh — instant
-        allUserTickets = cached.tickets;
+        rawUserTickets = cached.tickets;
       } else if (cached && age < USER_TICKETS_STALE_MS) {
         // Stale — serve cached + refresh in background
-        allUserTickets = cached.tickets;
-        refreshUserTicketsCache(cacheKey, userEmail, status, filterType, allowedDeptIds).catch(err =>
+        rawUserTickets = cached.tickets;
+        refreshUserTicketsCache(cacheKey, userEmail, status, allowedDeptIds).catch(err =>
           console.error(`Background user-tickets refresh failed for ${cacheKey}:`, err?.message || err)
         );
       } else {
         // Cold — must compute synchronously
-        allUserTickets = await refreshUserTicketsCache(cacheKey, userEmail, status, filterType, allowedDeptIds);
+        rawUserTickets = await refreshUserTicketsCache(cacheKey, userEmail, status, allowedDeptIds);
       }
 
+      const allUserTickets = deriveUserTicketsView(rawUserTickets, filterType);
       const pageData = allUserTickets.slice(startIdx, startIdx + limit);
       const hasMore = startIdx + limit < allUserTickets.length;
 
@@ -3963,9 +3980,6 @@ app.post("/api/msal-login", async (req, res) => {
     }
 
     const roles = normalizeRoleList([...rolesSet], null);
-    if (!roles.length) {
-      return res.status(403).json({ message: 'No application role is assigned for this account' });
-    }
 
     // Check if user is a member of cloudops group
     const cloudopsGroupIdentifiers = ROLE_GROUP_MAP['cloudops'] || [];
@@ -4000,6 +4014,9 @@ app.post("/api/msal-login", async (req, res) => {
       process.env.JWT_REFRESH_SECRET,
       { expiresIn: "7d" }
     );
+
+    // Start warming the My Tickets cache now so it's ready before the user navigates there.
+    prewarmUserTickets(normalizedEmail, effectiveRole);
 
     res.json({ accessToken: newAccessToken, refreshToken, role: effectiveRole, roles: effectiveRoles, isCloudOps: isCloudOpsMember });
 
@@ -4152,7 +4169,7 @@ app.post('/api/tickets', upload.array('attachments'), authenticateToken, async (
       }
     }
     delete payload.assigneeEmail;
-    if (ZOHO_DEPARTMENT_ID) {
+    if (!payload.departmentId && ZOHO_DEPARTMENT_ID) {
       payload.departmentId = ZOHO_DEPARTMENT_ID;
     }
     if (ZOHO_ASSIGNEE_ID) {
@@ -6274,14 +6291,18 @@ function readLatestAzureBackupReport() {
   return buildAzureBackupReport(JSON.parse(raw), latest.name, latest.mtime);
 }
 
-function saveAzureBackupReport(report, filename) {
+// Persists the RAW collector records (PascalCase Azure fields, e.g. BackupType/SubscriptionName) —
+// NOT report.items. readLatestAzureBackupReport() re-parses this file straight back through
+// buildAzureBackupReport(), which expects that raw shape; saving the already-normalized
+// (camelCase) report.items here silently produced 0 records on every restart-triggered re-read.
+function saveAzureBackupReport(records, filename) {
   if (!fs.existsSync(AZURE_BACKUP_DIR)) {
     fs.mkdirSync(AZURE_BACKUP_DIR, { recursive: true });
   }
   const filepath = path.join(AZURE_BACKUP_DIR, filename);
-  const records = report.items || [];
-  fs.writeFileSync(filepath, JSON.stringify(records, null, 2));
-  console.log(`[AZ-REPORT] Saved report to ${filepath} (${records.length} items)`);
+  const data = records || [];
+  fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
+  console.log(`[AZ-REPORT] Saved report to ${filepath} (${data.length} items)`);
 }
 
 function generateSeedBackupData() {
@@ -6442,7 +6463,7 @@ function runAzureBackupCollection(trigger = 'manual') {
           const filename = `AzureBackupData_${nowStr.replace(/[:.]/g, '-').slice(0, 19)}.json`;
           const report = buildAzureBackupReport(records, filename, nowStr);
           latestAzureBackupReport = report;
-          saveAzureBackupReport(report, filename);
+          saveAzureBackupReport(records, filename);
           console.log(`[AZ-SDK] Generated ${records.length} records (user token)`);
           resolve({ report, stdout: '', stderr: '' });
           return;
@@ -6466,7 +6487,7 @@ function runAzureBackupCollection(trigger = 'manual') {
           const filename = `AzureBackupData_${nowStr.replace(/[:.]/g, '-').slice(0, 19)}.json`;
           const report = buildAzureBackupReport(records, filename, nowStr);
           latestAzureBackupReport = report;
-          saveAzureBackupReport(report, filename);
+          saveAzureBackupReport(records, filename);
           console.log(`[AZ-SDK] Generated ${records.length} records`);
           resolve({ report, stdout: '', stderr: '' });
           return;

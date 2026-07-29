@@ -1223,7 +1223,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   currentUserEmail = '';
   currentUserName = '';
   userRole: 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user' = 'user';
-  private readonly elevatedRoles = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
+  private readonly elevatedRoles = new Set(['admin', 'cloudops', 'itsm']);
   private inlineObjectUrls: string[] = [];
 
   get isAdmin(): boolean {

@@ -1,6 +1,7 @@
 import { Component, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
 import { MsalService } from '../services/msal.service';
 import { AzureBackupService, BackupReport, BackupItem, SubscriptionGroup } from './azure-backup.service';
 
@@ -451,10 +452,21 @@ export class AzureBackupComponent implements OnInit, OnDestroy {
 
   constructor(
     private backupService: AzureBackupService,
-    private msalService: MsalService
+    private msalService: MsalService,
+    private router: Router
   ) {}
 
   ngOnInit(): void {
+    // Azure Backup is CloudOps-only. Admins go to the Tickets "Overview" tab,
+    // everyone else to their own "My Tickets" view.
+    const role = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    const isCloudOpsRole = role === 'cloudops' || role === 'itsm';
+    if (!isCloudOpsRole) {
+      const tab = role === 'admin' ? 'overview' : 'my';
+      this.router.navigate(['/tickets'], { queryParams: { tab } });
+      return;
+    }
+
     this.loadReport();
     this.pollStatus();
   }
@@ -496,20 +508,18 @@ export class AzureBackupComponent implements OnInit, OnDestroy {
     this.loading = true;
     this.backupService.getReport().subscribe({
       next: (data) => {
-        console.log('[AZ-UI] loadReport response:', data);
-        console.log('[AZ-UI] loadReport items:', data?.items?.length);
-        console.log('[AZ-UI] loadReport subscriptions:', data?.subscriptions?.length);
-        // Only update if we got valid data
-        if (data && data.items && data.items.length > 0) {
+        if (data) {
           this.reportData = data;
+          this.reportError = '';
         }
         this.loading = false;
-        this.lastUpdate = data.generatedAt ? new Date(data.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        this.lastUpdate = data?.generatedAt ? new Date(data.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
       },
       error: (err) => {
-        console.error('[AZ-UI] loadReport error:', err);
         this.loading = false;
-        // Keep existing reportData instead of nulling it
+        if (!this.reportData) {
+          this.reportError = err?.error?.message || err?.error?.error || 'Failed to load the Azure backup report.';
+        }
       }
     });
   }
