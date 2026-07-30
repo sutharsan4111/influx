@@ -351,6 +351,62 @@ async function runMigrations() {
         ON monitoring_intune_devices (hostname)
     `);
 
+    // CloudOps Projects & Tasks tables
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_projects (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        status VARCHAR(50) NOT NULL DEFAULT 'Open',
+        owner_email VARCHAR(255),
+        owner_name VARCHAR(255),
+        created_by VARCHAR(255),
+        updated_by VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+    // Idempotent upgrade for tables created before owner_email/owner_name existed
+    await pool.query(`
+      ALTER TABLE cloudops_projects ADD COLUMN IF NOT EXISTS owner_email VARCHAR(255);
+      ALTER TABLE cloudops_projects ADD COLUMN IF NOT EXISTS owner_name VARCHAR(255);
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_project_members (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES cloudops_projects(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        display_name VARCHAR(255),
+        role VARCHAR(50) NOT NULL DEFAULT 'member',
+        assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        UNIQUE(project_id, email)
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_tasks (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES cloudops_projects(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        status VARCHAR(50) NOT NULL DEFAULT 'Open',
+        assigned_to TEXT[] NOT NULL DEFAULT '{}',
+        created_by VARCHAR(255),
+        updated_by VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_task_assignees (
+        id SERIAL PRIMARY KEY,
+        task_id INTEGER NOT NULL REFERENCES cloudops_tasks(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        display_name VARCHAR(255),
+        assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        UNIQUE(task_id, email)
+      )
+    `);
+
     // 🚀 Production performance indexes (007). Idempotent.
     try {
       await pool.query(`
@@ -6656,6 +6712,680 @@ app.get('/api/monitoring/azure/report-log', authenticateToken, authorizeElevated
 app.get('/api/monitoring/azure/report-html', authenticateToken, authorizeElevated, async (req, res) => {
   // HTML reports are no longer generated (file storage removed)
   return res.status(404).json({ message: 'HTML reports are no longer generated. Use /api/monitoring/azure/report-log for JSON data.' });
+});
+
+// -------------------------------------------------------
+// CLOUDOPS PROJECTS & TASKS API
+// -------------------------------------------------------
+
+// Configurable so the group can be corrected without a code change once a
+// dedicated "Services - Managed Services" group exists. Until then, this falls
+// back to the same AD group (CLOUDOPS_GROUP_MAIL) already used to gate CloudOps
+// login/role access, since no separate roster group exists in this tenant yet.
+const CLOUDOPS_TEAM_GROUP = (process.env.CLOUDOPS_TEAM_GROUP || CLOUDOPS_GROUP_MAIL || 'Services - Managed Services').trim();
+
+// Looks up the CloudOps AD group and returns its members (with jobTitle/department
+// so the manager can be identified). Throws on a hard Graph failure; returns
+// { groupFound: false } if the group itself can't be located (distinct from a
+// group that exists but has zero members).
+async function fetchCloudOpsGroupMembers(graphToken) {
+  // CLOUDOPS_TEAM_GROUP may be a mail address (e.g. "cloudops@muraai.com") or a
+  // display name — match on either so the fallback default above resolves correctly.
+  const groupUrl = `https://graph.microsoft.com/v1.0/groups?$filter=mail eq '${encodeURIComponent(CLOUDOPS_TEAM_GROUP)}' or displayName eq '${encodeURIComponent(CLOUDOPS_TEAM_GROUP)}'&$select=id,displayName,mail`;
+  const groupRes = await fetch(groupUrl, {
+    headers: { Authorization: `Bearer ${graphToken}` }
+  });
+  if (!groupRes.ok) {
+    const body = await groupRes.text().catch(() => '');
+    throw new Error(`Graph group lookup failed (HTTP ${groupRes.status}): ${body.slice(0, 300)}`);
+  }
+  const groupData = await groupRes.json();
+  let group = (groupData.value || [])[0];
+
+  if (!group?.id) {
+    // Fall back to a fuzzy search in case the exact display name differs slightly
+    // (e.g. trailing space, different dash character) from what's configured.
+    try {
+      const fallbackUrl = `https://graph.microsoft.com/v1.0/groups?$search="displayName:${encodeURIComponent(CLOUDOPS_TEAM_GROUP)}"&$select=id,displayName,mail&$top=5`;
+      const fallbackRes = await fetch(fallbackUrl, {
+        headers: { Authorization: `Bearer ${graphToken}`, ConsistencyLevel: 'eventual' }
+      });
+      if (fallbackRes.ok) {
+        const fallbackData = await fallbackRes.json();
+        group = (fallbackData.value || [])[0];
+        if (group) {
+          console.warn(`[CloudOps] Group "${CLOUDOPS_TEAM_GROUP}" had no exact match; using closest match "${group.displayName}" (id: ${group.id}). Set CLOUDOPS_TEAM_GROUP to silence this.`);
+        }
+      }
+    } catch (fallbackErr) {
+      console.warn('[CloudOps] Fallback group search failed:', fallbackErr?.message);
+    }
+  }
+
+  if (!group?.id) {
+    console.error(`[CloudOps] Azure AD group "${CLOUDOPS_TEAM_GROUP}" was not found. Verify the group name and that the signed-in user's Graph token includes Group.Read.All / GroupMember.Read.All consent.`);
+    return { members: [], groupFound: false };
+  }
+
+  const members = [];
+  let membersUrl = `https://graph.microsoft.com/v1.0/groups/${group.id}/members?$select=mail,userPrincipalName,displayName,jobTitle,department&$top=100`;
+  while (membersUrl) {
+    const mRes = await fetch(membersUrl, {
+      headers: { Authorization: `Bearer ${graphToken}` }
+    });
+    if (!mRes.ok) {
+      const body = await mRes.text().catch(() => '');
+      throw new Error(`Graph group-members lookup failed (HTTP ${mRes.status}): ${body.slice(0, 300)}`);
+    }
+    const mData = await mRes.json();
+    (mData.value || []).forEach((u) => {
+      const email = (u.mail || u.userPrincipalName || '').trim().toLowerCase();
+      const displayName = (u.displayName || '').trim();
+      if (email && !email.includes('#ext#')) {
+        members.push({
+          email,
+          displayName,
+          jobTitle: (u.jobTitle || '').trim(),
+          department: (u.department || '').trim()
+        });
+      }
+    });
+    membersUrl = mData['@odata.nextLink'] || '';
+  }
+
+  members.sort((a, b) => (a.displayName || a.email).localeCompare(b.displayName || b.email));
+  return { members, groupFound: true };
+}
+
+// The CloudOps group manager is identified by job title (e.g. "Manager - Managed
+// Services") rather than by whoever happens to be logged in.
+function pickCloudOpsManager(members) {
+  return members.find((m) => /manager/i.test(m.jobTitle || '')) || null;
+}
+
+// Get all CloudOps team members (from the CloudOps AD group via Graph)
+app.get('/api/cloudops/team-members', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const graphToken = req.headers['x-graph-token'];
+    if (!graphToken) {
+      return res.status(400).json({ message: 'x-graph-token header required' });
+    }
+
+    const { members, groupFound } = await fetchCloudOpsGroupMembers(graphToken);
+    if (!groupFound) {
+      return res.status(404).json({
+        message: `Azure AD group "${CLOUDOPS_TEAM_GROUP}" was not found or its members aren't visible to this account. Verify the group name and Graph permissions.`,
+        members: []
+      });
+    }
+    res.json({ members });
+  } catch (err) {
+    console.error('Failed to fetch cloudops team members:', err);
+    res.status(502).json({ message: err.message || 'Failed to fetch team members from Microsoft Graph' });
+  }
+});
+
+// Get the CloudOps group manager (identified by job title, from the same AD group)
+app.get('/api/cloudops/manager', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const graphToken = req.headers['x-graph-token'];
+    if (!graphToken) {
+      return res.status(400).json({ message: 'x-graph-token header required' });
+    }
+
+    const { members, groupFound } = await fetchCloudOpsGroupMembers(graphToken);
+    if (!groupFound) {
+      return res.status(404).json({ message: `Azure AD group "${CLOUDOPS_TEAM_GROUP}" was not found.` });
+    }
+
+    const manager = pickCloudOpsManager(members);
+    if (!manager) {
+      return res.status(404).json({ message: `No member of "${CLOUDOPS_TEAM_GROUP}" has a job title containing "Manager".` });
+    }
+
+    res.json({
+      displayName: manager.displayName || '',
+      email: manager.email || '',
+      jobTitle: manager.jobTitle || '',
+      department: manager.department || CLOUDOPS_TEAM_GROUP
+    });
+  } catch (err) {
+    console.error('Failed to fetch manager info:', err);
+    res.status(502).json({ message: err.message || 'Failed to fetch manager info from Microsoft Graph' });
+  }
+});
+
+// Get employee hierarchy (manager excluded, remaining members sorted ascending by name)
+app.get('/api/cloudops/employees', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const graphToken = req.headers['x-graph-token'];
+    if (!graphToken) {
+      return res.status(400).json({ message: 'x-graph-token header required' });
+    }
+
+    const { members, groupFound } = await fetchCloudOpsGroupMembers(graphToken);
+    if (!groupFound) {
+      return res.status(404).json({
+        message: `Azure AD group "${CLOUDOPS_TEAM_GROUP}" was not found or its members aren't visible to this account. Verify the group name and Graph permissions.`,
+        employees: []
+      });
+    }
+
+    const manager = pickCloudOpsManager(members);
+    const employees = members.filter((m) => !manager || m.email !== manager.email);
+
+    // Enrich each employee with project and task counts
+    const enriched = await Promise.all(employees.map(async (emp) => {
+      const projectCount = await pool.query(
+        `SELECT COUNT(*) AS count FROM cloudops_project_members WHERE LOWER(email) = $1`,
+        [emp.email.toLowerCase()]
+      );
+      const taskCount = await pool.query(
+        `SELECT COUNT(*) AS count FROM cloudops_task_assignees WHERE LOWER(email) = $1`,
+        [emp.email.toLowerCase()]
+      );
+      return {
+        ...emp,
+        project_count: parseInt(projectCount.rows[0]?.count || '0', 10),
+        task_count: parseInt(taskCount.rows[0]?.count || '0', 10)
+      };
+    }));
+
+    res.json({ employees: enriched });
+  } catch (err) {
+    console.error('Failed to fetch employees:', err);
+    res.status(502).json({ message: err.message || 'Failed to fetch employees from Microsoft Graph' });
+  }
+});
+
+// Get projects for a specific employee
+app.get('/api/cloudops/employees/:email/projects', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email).toLowerCase();
+    const result = await pool.query(
+      `SELECT p.* FROM cloudops_projects p
+       INNER JOIN cloudops_project_members pm ON pm.project_id = p.id
+       WHERE LOWER(pm.email) = $1
+       ORDER BY p.name ASC`,
+      [email]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Failed to fetch employee projects:', err);
+    res.status(500).json({ message: 'Failed to fetch employee projects' });
+  }
+});
+
+// Get tasks for a specific employee
+app.get('/api/cloudops/employees/:email/tasks', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email).toLowerCase();
+    const result = await pool.query(
+      `SELECT t.*, p.name AS project_name FROM cloudops_tasks t
+       INNER JOIN cloudops_projects p ON p.id = t.project_id
+       INNER JOIN cloudops_task_assignees ta ON ta.task_id = t.id
+       WHERE LOWER(ta.email) = $1
+       ORDER BY t.status ASC, t.name ASC`,
+      [email]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Failed to fetch employee tasks:', err);
+    res.status(500).json({ message: 'Failed to fetch employee tasks' });
+  }
+});
+
+// ---- PROJECTS CRUD ----
+
+// Get all projects (with optional status filter)
+app.get('/api/cloudops/projects', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const statusFilter = (req.query.status || '').toString().trim();
+    let query = `
+      SELECT p.*,
+        COALESCE(
+          (SELECT json_agg(json_build_object('email', pm.email, 'display_name', pm.display_name))
+           FROM cloudops_project_members pm WHERE pm.project_id = p.id),
+          '[]'::json
+        ) AS members,
+        COALESCE(
+          (SELECT json_agg(json_build_object('id', t.id, 'name', t.name, 'status', t.status))
+           FROM cloudops_tasks t WHERE t.project_id = p.id),
+          '[]'::json
+        ) AS tasks
+      FROM cloudops_projects p
+    `;
+    const params = [];
+    if (statusFilter && statusFilter !== 'all') {
+      query += ` WHERE LOWER(p.status) = $1`;
+      params.push(statusFilter.toLowerCase());
+    }
+    query += ` ORDER BY p.created_at DESC`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Failed to fetch projects:', err);
+    res.status(500).json({ message: 'Failed to fetch projects' });
+  }
+});
+
+// Get single project with full details
+app.get('/api/cloudops/projects/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const projectResult = await pool.query('SELECT * FROM cloudops_projects WHERE id = $1', [projectId]);
+    if (projectResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+    const project = projectResult.rows[0];
+
+    const membersResult = await pool.query(
+      'SELECT * FROM cloudops_project_members WHERE project_id = $1 ORDER BY display_name ASC',
+      [projectId]
+    );
+    project.members = membersResult.rows;
+
+    const tasksResult = await pool.query(
+      'SELECT * FROM cloudops_tasks WHERE project_id = $1 ORDER BY created_at DESC',
+      [projectId]
+    );
+
+    // Enrich tasks with assignee details
+    const tasksWithAssignees = await Promise.all(tasksResult.rows.map(async (task) => {
+      const assigneesResult = await pool.query(
+        'SELECT * FROM cloudops_task_assignees WHERE task_id = $1 ORDER BY display_name ASC',
+        [task.id]
+      );
+      return { ...task, assignees: assigneesResult.rows };
+    }));
+
+    project.tasks = tasksWithAssignees;
+
+    res.json(project);
+  } catch (err) {
+    console.error('Failed to fetch project:', err);
+    res.status(500).json({ message: 'Failed to fetch project' });
+  }
+});
+
+// Create project (optionally with an owner and initial team members)
+app.post('/api/cloudops/projects', authenticateToken, authorizeAdmin, async (req, res) => {
+  const { name, description, status, ownerEmail, ownerName, members } = req.body || {};
+  if (!name || !name.trim()) {
+    return res.status(400).json({ message: 'Project name is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const result = await client.query(
+      `INSERT INTO cloudops_projects (name, description, status, owner_email, owner_name, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING *`,
+      [
+        name.trim(),
+        (description || '').trim(),
+        (status || 'Open').trim(),
+        (ownerEmail || '').trim().toLowerCase() || null,
+        (ownerName || '').trim() || null,
+        (req.user?.email || '').toLowerCase()
+      ]
+    );
+    const project = result.rows[0];
+
+    // De-dupe by email so the owner isn't inserted twice if also present in `members`.
+    const memberMap = new Map();
+    if (ownerEmail && ownerEmail.trim()) {
+      memberMap.set(ownerEmail.trim().toLowerCase(), {
+        email: ownerEmail.trim().toLowerCase(),
+        display_name: (ownerName || '').trim() || null,
+        role: 'owner'
+      });
+    }
+    (Array.isArray(members) ? members : []).forEach((m) => {
+      const email = (m?.email || '').trim().toLowerCase();
+      if (!email || memberMap.has(email)) return;
+      memberMap.set(email, {
+        email,
+        display_name: (m.display_name || m.displayName || '').trim() || null,
+        role: 'member'
+      });
+    });
+
+    for (const m of memberMap.values()) {
+      await client.query(
+        `INSERT INTO cloudops_project_members (project_id, email, display_name, role)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (project_id, email) DO NOTHING`,
+        [project.id, m.email, m.display_name, m.role]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json(project);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Failed to create project:', err);
+    res.status(500).json({ message: 'Failed to create project' });
+  } finally {
+    client.release();
+  }
+});
+
+// Update project
+app.put('/api/cloudops/projects/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const { name, description, status, ownerEmail, ownerName } = req.body || {};
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Project name is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE cloudops_projects SET
+         name = $1, description = $2, status = $3,
+         owner_email = $4, owner_name = $5,
+         updated_by = $6, updated_at = NOW()
+       WHERE id = $7 RETURNING *`,
+      [
+        name.trim(),
+        (description || '').trim(),
+        (status || 'Open').trim(),
+        (ownerEmail || '').trim().toLowerCase() || null,
+        (ownerName || '').trim() || null,
+        (req.user?.email || '').toLowerCase(),
+        projectId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update project:', err);
+    res.status(500).json({ message: 'Failed to update project' });
+  }
+});
+
+// Delete project
+app.delete('/api/cloudops/projects/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const result = await pool.query('DELETE FROM cloudops_projects WHERE id = $1 RETURNING id', [projectId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+    res.json({ message: 'Project deleted successfully' });
+  } catch (err) {
+    console.error('Failed to delete project:', err);
+    res.status(500).json({ message: 'Failed to delete project' });
+  }
+});
+
+// ---- PROJECT MEMBERS ----
+
+// Add member to project
+app.post('/api/cloudops/projects/:id/members', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const { email, display_name } = req.body || {};
+    if (!email || !email.trim()) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO cloudops_project_members (project_id, email, display_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (project_id, email) DO NOTHING
+       RETURNING *`,
+      [projectId, email.trim().toLowerCase(), display_name || null]
+    );
+    res.status(201).json(result.rows[0] || { message: 'Member already exists' });
+  } catch (err) {
+    console.error('Failed to add project member:', err);
+    res.status(500).json({ message: 'Failed to add project member' });
+  }
+});
+
+// Remove member from project
+app.delete('/api/cloudops/projects/:id/members/:email', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const email = decodeURIComponent(req.params.email).toLowerCase();
+    await pool.query(
+      'DELETE FROM cloudops_project_members WHERE project_id = $1 AND LOWER(email) = $2',
+      [projectId, email]
+    );
+    res.json({ message: 'Member removed successfully' });
+  } catch (err) {
+    console.error('Failed to remove project member:', err);
+    res.status(500).json({ message: 'Failed to remove project member' });
+  }
+});
+
+// ---- TASKS CRUD ----
+
+// Get tasks for a project
+app.get('/api/cloudops/projects/:id/tasks', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const result = await pool.query(
+      'SELECT * FROM cloudops_tasks WHERE project_id = $1 ORDER BY created_at DESC',
+      [projectId]
+    );
+
+    const tasksWithAssignees = await Promise.all(result.rows.map(async (task) => {
+      const assigneesResult = await pool.query(
+        'SELECT * FROM cloudops_task_assignees WHERE task_id = $1 ORDER BY display_name ASC',
+        [task.id]
+      );
+      return { ...task, assignees: assigneesResult.rows };
+    }));
+
+    res.json(tasksWithAssignees);
+  } catch (err) {
+    console.error('Failed to fetch tasks:', err);
+    res.status(500).json({ message: 'Failed to fetch tasks' });
+  }
+});
+
+// Create task
+app.post('/api/cloudops/projects/:id/tasks', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Invalid project id' });
+    }
+
+    const { name, description, status } = req.body || {};
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Task name is required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO cloudops_tasks (project_id, name, description, status, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $5) RETURNING *`,
+      [
+        projectId,
+        name.trim(),
+        (description || '').trim(),
+        (status || 'Open').trim(),
+        (req.user?.email || '').toLowerCase()
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to create task:', err);
+    res.status(500).json({ message: 'Failed to create task' });
+  }
+});
+
+// Update task
+app.put('/api/cloudops/tasks/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const taskId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(taskId)) {
+      return res.status(400).json({ message: 'Invalid task id' });
+    }
+
+    const { name, description, status } = req.body || {};
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Task name is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE cloudops_tasks SET
+         name = $1, description = $2, status = $3,
+         updated_by = $4, updated_at = NOW()
+       WHERE id = $5 RETURNING *`,
+      [
+        name.trim(),
+        (description || '').trim(),
+        (status || 'Open').trim(),
+        (req.user?.email || '').toLowerCase(),
+        taskId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update task:', err);
+    res.status(500).json({ message: 'Failed to update task' });
+  }
+});
+
+// Delete task
+app.delete('/api/cloudops/tasks/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const taskId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(taskId)) {
+      return res.status(400).json({ message: 'Invalid task id' });
+    }
+
+    const result = await pool.query('DELETE FROM cloudops_tasks WHERE id = $1 RETURNING id', [taskId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    res.json({ message: 'Task deleted successfully' });
+  } catch (err) {
+    console.error('Failed to delete task:', err);
+    res.status(500).json({ message: 'Failed to delete task' });
+  }
+});
+
+// ---- TASK ASSIGNEES ----
+
+// Add assignee to task
+app.post('/api/cloudops/tasks/:id/assignees', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const taskId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(taskId)) {
+      return res.status(400).json({ message: 'Invalid task id' });
+    }
+
+    const { email, display_name } = req.body || {};
+    if (!email || !email.trim()) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO cloudops_task_assignees (task_id, email, display_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (task_id, email) DO NOTHING
+       RETURNING *`,
+      [taskId, email.trim().toLowerCase(), display_name || null]
+    );
+
+    // Also update the assigned_to array on the task
+    await pool.query(
+      `UPDATE cloudops_tasks SET assigned_to = ARRAY(
+        SELECT email FROM cloudops_task_assignees WHERE task_id = $1
+      ) WHERE id = $1`,
+      [taskId]
+    );
+
+    res.status(201).json(result.rows[0] || { message: 'Assignee already exists' });
+  } catch (err) {
+    console.error('Failed to add task assignee:', err);
+    res.status(500).json({ message: 'Failed to add task assignee' });
+  }
+});
+
+// Remove assignee from task
+app.delete('/api/cloudops/tasks/:id/assignees/:email', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const taskId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(taskId)) {
+      return res.status(400).json({ message: 'Invalid task id' });
+    }
+
+    const email = decodeURIComponent(req.params.email).toLowerCase();
+    await pool.query(
+      'DELETE FROM cloudops_task_assignees WHERE task_id = $1 AND LOWER(email) = $2',
+      [taskId, email]
+    );
+
+    // Update assigned_to array on the task
+    await pool.query(
+      `UPDATE cloudops_tasks SET assigned_to = ARRAY(
+        SELECT email FROM cloudops_task_assignees WHERE task_id = $1
+      ) WHERE id = $1`,
+      [taskId]
+    );
+
+    res.json({ message: 'Assignee removed successfully' });
+  } catch (err) {
+    console.error('Failed to remove task assignee:', err);
+    res.status(500).json({ message: 'Failed to remove task assignee' });
+  }
+});
+
+// ---- PROJECT STATUS COUNTS ----
+app.get('/api/cloudops/stats', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COALESCE(SUM(CASE WHEN LOWER(status) = 'open' THEN 1 ELSE 0 END), 0)::int AS open,
+        COALESCE(SUM(CASE WHEN LOWER(status) = 'in progress' THEN 1 ELSE 0 END), 0)::int AS in_progress,
+        COALESCE(SUM(CASE WHEN LOWER(status) = 'testing' THEN 1 ELSE 0 END), 0)::int AS testing,
+        COALESCE(SUM(CASE WHEN LOWER(status) = 'closed' THEN 1 ELSE 0 END), 0)::int AS closed
+      FROM cloudops_projects
+    `);
+    res.json(result.rows[0] || { total: 0, open: 0, in_progress: 0, testing: 0, closed: 0 });
+  } catch (err) {
+    console.error('Failed to fetch project stats:', err);
+    res.status(500).json({ message: 'Failed to fetch project stats' });
+  }
 });
 
 // -------------------------------------------------------

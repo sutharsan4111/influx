@@ -10,7 +10,7 @@ import { MsalService } from '../services/msal.service';
   standalone: true,
   imports: [RouterModule, CommonModule, FormsModule],
   template: `
-    <div class="sidebar">
+    <div class="sidebar" [class.expanded]="isProfileMenuOpen">
 
       <!-- MENU -->
       <ul class="menu">
@@ -45,6 +45,13 @@ import { MsalService } from '../services/msal.service';
             [class.active]="isActive('/azure-backup')">
           <i class="fas fa-cloud"></i>
           <span>Azure Backup</span>
+        </li>
+        <li *ngIf="isCloudops()"
+            class="menu-item"
+            routerLink="/cloudops"
+            [class.active]="isActive('/cloudops')">
+          <i class="fas fa-folder"></i>
+          <span>CloudOps Projects</span>
         </li>
 
         <li *ngIf="isCloudops()"
@@ -166,34 +173,46 @@ import { MsalService } from '../services/msal.service';
   styles: [`
     :host {
       display: block;
-      width: 100%;
+      width: 44px;
       height: 100%;
       overflow: visible;
     }
 
     .sidebar {
-      width: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 44px;
       height: 100%;
       display: flex;
       flex-direction: column;
       background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
       box-sizing: border-box;
       overflow-y: auto;
-      overflow-x: visible;
+      overflow-x: hidden;
       border-right: 1px solid #e2e8f0;
+      transition: width 0.25s ease, box-shadow 0.25s ease;
+      z-index: 10;
+    }
+
+    .sidebar:hover,
+    .sidebar.expanded {
+      width: 154px;
+      box-shadow: 6px 0 24px rgba(15, 23, 42, 0.12);
     }
 
     .menu {
       list-style: none;
-      padding: 8px 6px;
+      padding: 8px 4px;
       margin: 0;
     }
 
     .menu-item {
       display: flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
-      padding: 6px 8px;
+      padding: 6px 4px;
       cursor: pointer;
       border-radius: 5px;
       margin-bottom: 2px;
@@ -203,12 +222,33 @@ import { MsalService } from '../services/msal.service';
       font-size: 0.7rem;
     }
 
+    .sidebar:hover .menu-item,
+    .sidebar.expanded .menu-item {
+      justify-content: flex-start;
+      padding: 6px 10px;
+    }
+
+    .menu-item span {
+      opacity: 0;
+      width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      transition: opacity 0.15s ease;
+    }
+
+    .sidebar:hover .menu-item span,
+    .sidebar.expanded .menu-item span {
+      opacity: 1;
+      width: auto;
+    }
+
     .menu-item i {
       width: 14px;
       text-align: center;
       font-size: 0.7rem;
       color: #64748b;
       transition: color 0.2s ease;
+      flex-shrink: 0;
     }
 
     .menu-item > i:last-child {
@@ -239,6 +279,34 @@ import { MsalService } from '../services/msal.service';
 
     .menu-item.active i {
       color: white;
+    }
+
+    /* Below the layout's mobile breakpoint the sidebar stacks statically full-width
+       (see main-layout.component.ts) — there's no hover on touch, so disable the
+       collapse/expand behavior and always show full labels. */
+    @media (max-width: 900px) {
+      :host {
+        width: 100%;
+        height: auto;
+      }
+      .sidebar {
+        position: static;
+        width: 100%;
+        height: auto;
+      }
+      .sidebar:hover,
+      .sidebar.expanded {
+        width: 100%;
+        box-shadow: none;
+      }
+      .menu-item {
+        justify-content: flex-start;
+      }
+      .menu-item span,
+      .profile-info {
+        opacity: 1;
+        width: auto;
+      }
     }
 
     /* Dark Theme Sidebar */
@@ -330,6 +398,18 @@ import { MsalService } from '../services/msal.service';
       font-size: 9px;
       flex: 1;
       min-width: 0;
+      opacity: 0;
+      width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      transition: opacity 0.15s ease;
+    }
+
+    .sidebar:hover .profile-info,
+    .sidebar.expanded .profile-info {
+      opacity: 1;
+      width: auto;
+      flex: 1;
     }
 
     .name {

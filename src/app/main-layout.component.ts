@@ -56,7 +56,7 @@ import { SidebarComponent } from './sidebar/sidebar.component';
     }
 
     .sidebar-wrapper {
-      width: 140px;
+      width: 44px;
       flex-shrink: 0;
       border-right: 1px solid #e5e7eb;
       background: var(--card-bg, #fff);
@@ -77,20 +77,9 @@ import { SidebarComponent } from './sidebar/sidebar.component';
       min-width: 0;
       overflow-x: hidden;
       height: calc(100% - 40px);
-      margin-left: 140px;
+      margin-left: 44px;
       position: relative;
       z-index: 1;
-    }
-
-    @media (max-width: 1100px) {
-      .sidebar-wrapper {
-        width: 120px;
-      }
-
-      .content-wrapper {
-        margin-left: 120px;
-        padding: 10px;
-      }
     }
 
     @media (max-width: 900px) {

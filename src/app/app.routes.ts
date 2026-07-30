@@ -58,6 +58,11 @@ export const routes: Routes = [
           import('./azure-backup/azure-backup.component').then(m => m.AzureBackupComponent)
       },
       {
+        path: 'cloudops',
+        loadComponent: () =>
+          import('./cloudops/cloudops.component').then(m => m.CloudopsComponent)
+      },
+      {
         path: 'admin/user-roles',
         loadComponent: () =>
           import('./admin/user-roles.component').then(m => m.UserRolesComponent)
