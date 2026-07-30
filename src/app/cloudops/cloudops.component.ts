@@ -190,22 +190,22 @@ import {
           <label>Description</label>
           <textarea [(ngModel)]="projectForm.description" rows="3" placeholder="Project description"></textarea>
 
-          <label>Status</label>
-          <select [(ngModel)]="projectForm.status">
-            <option value="Open">Open</option>
-            <option value="In Progress">In Progress</option>
-            <option value="Testing">Testing</option>
-            <option value="Closed">Closed</option>
-          </select>
-
-          <label>Project Owner *</label>
-          <select [(ngModel)]="projectForm.ownerEmail">
-            <option value="">Select project owner...</option>
-            <option *ngFor="let m of teamMembers" [value]="m.email">{{ m.displayName || m.email }}</option>
-          </select>
-          <div class="empty-hint" *ngIf="teamMembers.length === 0">No team members available — check the CloudOps team configuration</div>
-
           <ng-container *ngIf="!editingProjectId">
+            <label>Status</label>
+            <select [(ngModel)]="projectForm.status">
+              <option value="Open">Open</option>
+              <option value="In Progress">In Progress</option>
+              <option value="Testing">Testing</option>
+              <option value="Closed">Closed</option>
+            </select>
+
+            <label>Project Owner *</label>
+            <select [(ngModel)]="projectForm.ownerEmail">
+              <option value="">Select project owner...</option>
+              <option *ngFor="let m of teamMembers" [value]="m.email">{{ m.displayName || m.email }}</option>
+            </select>
+            <div class="empty-hint" *ngIf="teamMembers.length === 0">No team members available — check the CloudOps team configuration</div>
+
             <label>Team Members</label>
             <div class="member-checklist">
               <label class="member-check-item" *ngFor="let m of teamMembers">
@@ -231,89 +231,121 @@ import {
         <div class="modal-header">
           <h3>{{ selectedProject?.name }}</h3>
           <div class="header-actions">
-            <select class="status-select" [ngClass]="statusClass(selectedProject?.status || '')"
-                    [ngModel]="selectedProject?.status"
-                    (ngModelChange)="changeProjectStatus($event)"
-                    (click)="$event.stopPropagation()"
-                    title="Change project status">
-              <option value="Open">Open</option>
-              <option value="In Progress">In Progress</option>
-              <option value="Testing">Testing</option>
-              <option value="Closed">Closed</option>
-            </select>
-            <button class="btn-icon" (click)="openEditProjectModal()" title="Edit Project"><i class="fas fa-edit"></i></button>
+            <button class="btn-icon" (click)="openEditProjectModal()" title="Edit Name/Description"><i class="fas fa-edit"></i></button>
             <button class="btn-icon danger" (click)="deleteCurrentProject()" title="Delete Project"><i class="fas fa-trash"></i></button>
             <button class="icon-close" (click)="closeProjectDetail()">✕</button>
           </div>
         </div>
-        <div class="modal-body">
-          <div class="detail-section">
-            <h4><i class="fas fa-info-circle"></i> Description</h4>
-            <p class="detail-desc">{{ selectedProject?.description || 'No description' }}</p>
-          </div>
-
-          <div class="detail-section" *ngIf="selectedProject?.owner_name || selectedProject?.owner_email">
-            <h4><i class="fas fa-user-tie"></i> Project Owner</h4>
-            <p class="detail-desc">{{ selectedProject?.owner_name || selectedProject?.owner_email }}</p>
-          </div>
-
-          <div class="detail-section">
-            <h4><i class="fas fa-users"></i> Team Members ({{ projectMembers.length }})</h4>
-            <div class="member-list">
-              <div class="member-item" *ngFor="let m of projectMembers">
-                <div class="avatar sm">{{ memberInitial(m) }}</div>
-                <span>{{ memberName(m) }}</span>
-                <button class="btn-remove-sm" (click)="removeProjectMember(m)" title="Remove">✕</button>
-              </div>
-              <div class="empty-hint" *ngIf="projectMembers.length === 0">No members assigned</div>
-            </div>
-            <div class="add-member-row">
-              <select [(ngModel)]="newMemberEmail" class="member-select">
-                <option value="">Select team member...</option>
+        <div class="modal-body detail-layout">
+          <!-- LEFT: Owner / Status / Team -->
+          <div class="detail-sidebar">
+            <div class="detail-field">
+              <label>Project Owner</label>
+              <select [ngModel]="selectedProject?.owner_email || ''" (ngModelChange)="changeProjectOwner($event)">
+                <option value="">Unassigned</option>
                 <option *ngFor="let m of teamMembers" [value]="m.email">{{ m.displayName || m.email }}</option>
               </select>
-              <button class="btn-sm" (click)="addProjectMember()" [disabled]="!newMemberEmail">Add</button>
+            </div>
+
+            <div class="detail-field">
+              <label>Status</label>
+              <select class="status-select" [ngClass]="statusClass(selectedProject?.status || '')"
+                      [ngModel]="selectedProject?.status"
+                      (ngModelChange)="changeProjectStatus($event)"
+                      title="Change project status">
+                <option value="Open">Open</option>
+                <option value="In Progress">In Progress</option>
+                <option value="Testing">Testing</option>
+                <option value="Closed">Closed</option>
+              </select>
+            </div>
+
+            <div class="detail-field">
+              <label>Team Members ({{ projectMembers.length }})</label>
+              <div class="member-list">
+                <div class="member-item" *ngFor="let m of projectMembers">
+                  <div class="avatar sm">{{ memberInitial(m) }}</div>
+                  <span>{{ memberName(m) }}</span>
+                  <button class="btn-remove-sm" (click)="removeProjectMember(m)" title="Remove">✕</button>
+                </div>
+                <div class="empty-hint" *ngIf="projectMembers.length === 0">No members assigned</div>
+              </div>
+              <div class="add-member-row">
+                <select [(ngModel)]="newMemberEmail" class="member-select">
+                  <option value="">Select team member...</option>
+                  <option *ngFor="let m of teamMembers" [value]="m.email">{{ m.displayName || m.email }}</option>
+                </select>
+                <button class="btn-sm" (click)="addProjectMember()" [disabled]="!newMemberEmail">Add</button>
+              </div>
             </div>
           </div>
 
-          <div class="detail-section">
-            <h4><i class="fas fa-tasks"></i> Tasks ({{ projectTasks.length }}) <span class="progress-hint">· {{ completedTaskCount }}/{{ projectTasks.length }} done</span></h4>
-
-            <div class="add-task-row">
-              <input [(ngModel)]="newTaskName" placeholder="Task name" class="task-input" (keyup.enter)="addTask()" />
-              <button class="btn-sm" (click)="addTask()" [disabled]="!newTaskName.trim()">Add Task</button>
+          <!-- RIGHT: Description then Tasks -->
+          <div class="detail-main">
+            <div class="detail-section">
+              <h4><i class="fas fa-info-circle"></i> Description</h4>
+              <p class="detail-desc">{{ selectedProject?.description || 'No description' }}</p>
             </div>
 
-            <div class="task-list">
-              <div class="task-item" *ngFor="let task of projectTasks" [class.completed]="task.status === 'Closed'">
-                <div class="task-check" (click)="cycleTaskStatus(task)" [title]="'Status: ' + task.status">
-                  <i class="fas" [ngClass]="{
-                    'fa-circle': task.status === 'Open',
-                    'fa-spinner': task.status === 'In Progress',
-                    'fa-vial': task.status === 'Testing',
-                    'fa-check-circle': task.status === 'Closed'
-                  }"></i>
-                </div>
-                <div class="task-body">
-                  <div class="task-name">{{ task.name }}</div>
-                  <div class="task-meta" *ngIf="task.description">{{ task.description }}</div>
-                  <div class="task-assignees">
-                    <div class="mini-chip" *ngFor="let a of (task.assignees || [])" [title]="a.display_name || a.email">
-                      {{ (a.display_name || a.email)[0] }}
-                      <span class="chip-remove" (click)="$event.stopPropagation(); removeTaskAssignee(task, a.email)">✕</span>
-                    </div>
-                    <select class="assignee-add" (change)="addTaskAssignee(task, $event)" (click)="$event.stopPropagation()">
-                      <option value="">+ assign</option>
-                      <option *ngFor="let m of teamMembers" [value]="m.email">{{ m.displayName || m.email }}</option>
-                    </select>
-                  </div>
-                </div>
-                <div class="task-actions">
-                  <button class="btn-icon sm" (click)="openEditTaskModal(task)" title="Edit"><i class="fas fa-edit"></i></button>
-                  <button class="btn-icon sm danger" (click)="deleteTask(task)" title="Delete"><i class="fas fa-trash"></i></button>
-                </div>
+            <div class="detail-section">
+              <h4><i class="fas fa-tasks"></i> Tasks ({{ projectTasks.length }}) <span class="progress-hint">· {{ completedTaskCount }}/{{ projectTasks.length }} done</span></h4>
+
+              <div class="add-task-row">
+                <input [(ngModel)]="newTaskName" placeholder="Task name" class="task-input" (keyup.enter)="addTask()" />
+                <button class="btn-sm" (click)="addTask()" [disabled]="!newTaskName.trim()">Add Task</button>
               </div>
-              <div class="empty-hint" *ngIf="projectTasks.length === 0">No tasks yet. Add one above!</div>
+
+              <div class="task-table-wrap">
+                <table class="task-table">
+                  <thead>
+                    <tr>
+                      <th class="col-sno">S.No</th>
+                      <th>Task</th>
+                      <th>Assignees</th>
+                      <th class="col-status">Status</th>
+                      <th class="col-actions"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr *ngFor="let task of projectTasks; let i = index" [class.completed]="task.status === 'Closed'">
+                      <td class="col-sno">{{ i + 1 }}</td>
+                      <td>
+                        <div class="task-name">{{ task.name }}</div>
+                        <div class="task-meta" *ngIf="task.description">{{ task.description }}</div>
+                      </td>
+                      <td>
+                        <div class="task-assignees">
+                          <div class="mini-chip" *ngFor="let a of (task.assignees || [])" [title]="a.display_name || a.email">
+                            {{ (a.display_name || a.email)[0] }}
+                            <span class="chip-remove" (click)="removeTaskAssignee(task, a.email)">✕</span>
+                          </div>
+                          <select class="assignee-add" (change)="addTaskAssignee(task, $event)">
+                            <option value="">+ assign</option>
+                            <option *ngFor="let m of teamMembers" [value]="m.email">{{ m.displayName || m.email }}</option>
+                          </select>
+                        </div>
+                      </td>
+                      <td class="col-status">
+                        <select class="status-select sm" [ngClass]="statusClass(task.status)"
+                                [ngModel]="task.status"
+                                (ngModelChange)="updateTaskStatus(task, $event)">
+                          <option value="Open">Open</option>
+                          <option value="In Progress">In Progress</option>
+                          <option value="Testing">Testing</option>
+                          <option value="Closed">Closed</option>
+                        </select>
+                      </td>
+                      <td class="col-actions">
+                        <button class="btn-icon sm" (click)="openEditTaskModal(task)" title="Edit"><i class="fas fa-edit"></i></button>
+                        <button class="btn-icon sm danger" (click)="deleteTask(task)" title="Delete"><i class="fas fa-trash"></i></button>
+                      </td>
+                    </tr>
+                    <tr *ngIf="projectTasks.length === 0">
+                      <td colspan="5" class="empty-hint">No tasks yet. Add one above!</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
@@ -457,57 +489,61 @@ import {
 
     /* MAIN CONTENT */
     .main-content {
+      display: block;
       padding: 16px;
       overflow-y: auto;
       background: #f8fafc;
     }
     .projects-header {
-      margin-bottom: 14px;
+      display: block;
+      width: 100%;
+      margin-bottom: 18px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #e2e8f0;
     }
     .projects-header h2 { margin: 0; color: #1e293b; font-size: 20px; line-height: 1.25; white-space: nowrap; }
 
     .projects-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
-      grid-auto-rows: min-content;
-      align-items: start;
-      gap: 12px;
+      gap: 10px;
     }
     .project-card {
       background: #fff;
-      border-radius: 10px;
+      border-radius: 8px;
       border: 1px solid #e2e8f0;
-      padding: 12px;
+      padding: 10px;
       cursor: pointer;
-      transition: all 0.25s ease;
-      display: grid;
-      gap: 8px;
-      align-content: start;
+      transition: all 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-height: 110px;
     }
     .project-card:hover {
-      box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-      transform: translateY(-2px);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.07);
+      transform: translateY(-1px);
       border-color: #bfdbfe;
     }
-    .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-    .card-header h3 { margin: 0; font-size: 14px; color: #1e293b; }
-    .card-desc { font-size: 11px; color: #64748b; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-    .card-meta { display: flex; gap: 12px; font-size: 10px; color: #94a3b8; flex-wrap: wrap; }
-    .meta-item { display: flex; align-items: center; gap: 4px; }
-    .meta-item i { font-size: 10px; }
-    .card-progress { display: flex; align-items: center; gap: 8px; }
-    .progress-bar { flex: 1; height: 4px; background: #e2e8f0; border-radius: 4px; overflow: hidden; }
-    .progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #2563eb); border-radius: 4px; transition: width 0.3s ease; }
-    .progress-label { font-size: 10px; font-weight: 600; color: #475569; min-width: 30px; text-align: right; }
-    .card-members { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+    .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; }
+    .card-header h3 { margin: 0; font-size: 12.5px; color: #1e293b; }
+    .card-desc { font-size: 10px; color: #64748b; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .card-meta { display: flex; gap: 10px; font-size: 9px; color: #94a3b8; flex-wrap: wrap; }
+    .meta-item { display: flex; align-items: center; gap: 3px; }
+    .meta-item i { font-size: 9px; }
+    .card-progress { display: flex; align-items: center; gap: 6px; }
+    .progress-bar { flex: 1; height: 3px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #2563eb); border-radius: 3px; transition: width 0.3s ease; }
+    .progress-label { font-size: 9px; font-weight: 600; color: #475569; min-width: 26px; text-align: right; }
+    .card-members { display: flex; gap: 3px; align-items: center; flex-wrap: wrap; margin-top: auto; }
     .member-chip {
-      width: 22px; height: 22px;
+      width: 18px; height: 18px;
       background: linear-gradient(135deg, #e2e8f0, #cbd5e1);
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 9px;
+      font-size: 8px;
       font-weight: 600;
       color: #475569;
     }
@@ -654,7 +690,7 @@ import {
       box-shadow: 0 20px 60px rgba(0,0,0,0.2);
     }
     .project-detail-card {
-      width: 700px;
+      width: 820px;
       max-width: calc(100vw - 24px);
     }
     .modal-header {
@@ -767,24 +803,9 @@ import {
     .add-task-row { display: flex; gap: 6px; margin-bottom: 8px; }
     .task-input { flex: 1; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; font-size: 12px; }
 
-    .task-list { display: grid; gap: 4px; }
-    .task-item {
-      display: flex; align-items: flex-start; gap: 8px;
-      padding: 10px 12px; background: #fff; border-radius: 8px;
-      border: 1px solid #e2e8f0;
-      transition: all 0.2s;
-    }
-    .task-item.completed { opacity: 0.65; background: #f8fafc; }
-    .task-check { cursor: pointer; padding-top: 2px; }
-    .task-check i { font-size: 14px; color: #94a3b8; transition: color 0.2s; }
-    .task-check i.fa-circle { color: #3b82f6; }
-    .task-check i.fa-spinner { color: #d97706; }
-    .task-check i.fa-vial { color: #7c3aed; }
-    .task-check i.fa-check-circle { color: #059669; }
-    .task-body { flex: 1; min-width: 0; }
     .task-name { font-size: 12px; font-weight: 500; color: #1e293b; }
     .task-meta { font-size: 10px; color: #94a3b8; margin-top: 2px; }
-    .task-assignees { display: flex; align-items: center; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+    .task-assignees { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
     .mini-chip {
       display: inline-flex; align-items: center; gap: 3px;
       padding: 2px 6px; background: #eff6ff; border-radius: 4px;
@@ -797,7 +818,52 @@ import {
       font-size: 9px; color: #3b82f6; font-weight: 500;
       padding: 2px 4px;
     }
-    .task-actions { display: flex; gap: 2px; flex-shrink: 0; }
+
+    /* DETAIL LAYOUT: sidebar (owner/status/team) + main (description/tasks) */
+    .detail-layout {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      gap: 18px;
+    }
+    .detail-sidebar {
+      display: grid;
+      gap: 16px;
+      align-content: start;
+      border-right: 1px solid #f1f5f9;
+      padding-right: 16px;
+    }
+    .detail-field label {
+      font-size: 10.5px;
+      font-weight: 700;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      display: block;
+      margin-bottom: 5px;
+    }
+    .detail-field select { width: 100%; }
+    .detail-main { display: grid; gap: 16px; align-content: start; min-width: 0; }
+
+    /* TASK TABLE */
+    .task-table-wrap { overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 8px; }
+    .task-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .task-table th, .task-table td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: middle; }
+    .task-table thead th {
+      background: #f8fafc;
+      font-size: 9.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      font-weight: 700;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    .task-table .col-sno { width: 40px; text-align: center; color: #94a3b8; font-weight: 600; }
+    .task-table .col-status { width: 130px; }
+    .task-table .col-actions { width: 66px; text-align: right; white-space: nowrap; }
+    .task-table tbody tr:last-child td { border-bottom: none; }
+    .task-table tbody tr:hover { background: #f8fafc; }
+    .task-table tbody tr.completed { opacity: 0.6; }
+    .task-table tbody tr.completed .task-name { text-decoration: line-through; }
 
     /* DARK THEME */
     :host-context(.dark-theme) .cloudops-page { background: #0f172a; }
@@ -838,8 +904,6 @@ import {
     :host-context(.dark-theme) .btn-secondary:hover { background: #475569; }
     :host-context(.dark-theme) .icon-close { background: #334155; color: #94a3b8; }
     :host-context(.dark-theme) .member-item { background: #0f172a; color: #e2e8f0; }
-    :host-context(.dark-theme) .task-item { background: #1e293b; border-color: #334155; }
-    :host-context(.dark-theme) .task-item.completed { background: #0f172a; }
     :host-context(.dark-theme) .task-name { color: #e2e8f0; }
     :host-context(.dark-theme) .mini-chip { background: #1e3a8a; color: #93c5fd; }
     :host-context(.dark-theme) .detail-desc { background: #0f172a; color: #94a3b8; }
@@ -851,6 +915,12 @@ import {
     :host-context(.dark-theme) .member-select { background: #0f172a; border-color: #334155; color: #e2e8f0; }
     :host-context(.dark-theme) .task-input { background: #0f172a; border-color: #334155; color: #e2e8f0; }
     :host-context(.dark-theme) .modal-footer { border-top-color: #334155; }
+    :host-context(.dark-theme) .detail-sidebar { border-right-color: #334155; }
+    :host-context(.dark-theme) .detail-field label { color: #94a3b8; }
+    :host-context(.dark-theme) .task-table-wrap { border-color: #334155; }
+    :host-context(.dark-theme) .task-table th, :host-context(.dark-theme) .task-table td { border-bottom-color: #334155; }
+    :host-context(.dark-theme) .task-table thead th { background: #0f172a; color: #94a3b8; border-bottom-color: #334155; }
+    :host-context(.dark-theme) .task-table tbody tr:hover { background: #0f172a; }
   `]
 })
 export class CloudopsComponent implements OnInit {
@@ -1164,6 +1234,29 @@ export class CloudopsComponent implements OnInit {
     }
   }
 
+  // Quick owner change from the detail modal sidebar.
+  async changeProjectOwner(newOwnerEmail: string): Promise<void> {
+    if (!this.selectedProject?.id) return;
+    if ((newOwnerEmail || '') === (this.selectedProject.owner_email || '')) return;
+
+    const owner = this.teamMembers.find(m => m.email === newOwnerEmail);
+    try {
+      const updated = await firstValueFrom(this.cloudOpsService.updateProject(this.selectedProject.id, {
+        name: this.selectedProject.name,
+        description: this.selectedProject.description || '',
+        status: this.selectedProject.status,
+        ownerEmail: newOwnerEmail || '',
+        ownerName: owner?.displayName || ''
+      }));
+
+      this.selectedProject = { ...this.selectedProject, ...updated };
+      this.messageService.success('Project owner updated');
+      await this.loadProjects();
+    } catch (err: any) {
+      this.messageService.error(err?.error?.message || 'Failed to update project owner');
+    }
+  }
+
   async deleteCurrentProject(): Promise<void> {
     if (!this.selectedProject?.id) return;
     const confirmed = window.confirm(`Delete project "${this.selectedProject.name}"?`);
@@ -1244,16 +1337,8 @@ export class CloudopsComponent implements OnInit {
     }
   }
 
-  async cycleTaskStatus(task: CloudOpsTask): Promise<void> {
-    if (!task.id) return;
-    const statusFlow: Record<string, string> = {
-      'Open': 'In Progress',
-      'In Progress': 'Testing',
-      'Testing': 'Closed',
-      'Closed': 'Open'
-    };
-    const current = task.status || 'Open';
-    const newStatus = statusFlow[current] || 'Open';
+  async updateTaskStatus(task: CloudOpsTask, newStatus: string): Promise<void> {
+    if (!task.id || !newStatus || newStatus === task.status) return;
 
     try {
       await firstValueFrom(this.cloudOpsService.updateTask(task.id, {
@@ -1267,7 +1352,7 @@ export class CloudopsComponent implements OnInit {
       this.projectTasks = (detail.tasks || []) as any;
       this.loadProjects();
     } catch (err: any) {
-      this.messageService.error(err?.error?.message || 'Failed to update task');
+      this.messageService.error(err?.error?.message || 'Failed to update task status');
     }
   }
 
