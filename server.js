@@ -49,6 +49,163 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+function isZohoProjectsConfigured() {
+  return ENABLE_ZOHO_PROJECTS && !!ZOHO_PROJECTS_PORTAL_ID;
+}
+
+app.get('/api/project-workspace/projects', async (req, res) => {
+  try {
+    if (isZohoProjectsConfigured()) {
+      const zohoProjects = await fetchZohoProjectsItems();
+      return res.json(zohoProjects);
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, owner, status, progress, due_date AS "dueDate" FROM project_workspace_projects ORDER BY id DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Project workspace get projects failed', err);
+    res.status(500).json({ message: 'Failed to load projects' });
+  }
+});
+
+app.post('/api/project-workspace/projects', async (req, res) => {
+  try {
+    const { name, owner, status, progress, dueDate } = req.body;
+    const result = await pool.query(
+      `INSERT INTO project_workspace_projects (name, owner, status, progress, due_date)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, owner, status, progress, due_date AS "dueDate"`,
+      [name, owner, status, progress, dueDate]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Project workspace create project failed', err);
+    res.status(500).json({ message: 'Failed to create project' });
+  }
+});
+
+app.get('/api/project-workspace/tasks', async (req, res) => {
+  try {
+    if (isZohoProjectsConfigured()) {
+      const zohoTasks = await fetchZohoTasksItems();
+      return res.json(zohoTasks);
+    }
+
+    const result = await pool.query(
+      `SELECT id, project_id AS "projectId", title, assignee, status, priority, due_date AS "dueDate"
+       FROM project_workspace_tasks ORDER BY created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Project workspace get tasks failed', err);
+    res.status(500).json({ message: 'Failed to load tasks' });
+  }
+});
+
+app.post('/api/project-workspace/tasks', async (req, res) => {
+  try {
+    const { projectId, title, assignee, status, priority, dueDate } = req.body;
+    const result = await pool.query(
+      `INSERT INTO project_workspace_tasks (project_id, title, assignee, status, priority, due_date)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, project_id AS "projectId", title, assignee, status, priority, due_date AS "dueDate"`,
+      [projectId, title, assignee, status, priority, dueDate]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Project workspace create task failed', err);
+    res.status(500).json({ message: 'Failed to create task' });
+  }
+});
+
+app.get('/api/project-workspace/time-logs', async (req, res) => {
+  try {
+    if (isZohoProjectsConfigured() && ENABLE_ZOHO_PROJECTS_TIME_LOGS) {
+      const zohoTimeLogs = await fetchZohoTimeLogsItems();
+      return res.json(zohoTimeLogs);
+    }
+
+    const result = await pool.query(
+      `SELECT id, task_id AS "taskId", project_id AS "projectId", "user", hours, date, note
+       FROM project_workspace_time_logs ORDER BY created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Project workspace get time logs failed', err);
+    res.status(500).json({ message: 'Failed to load time logs' });
+  }
+});
+
+app.post('/api/project-workspace/time-logs', async (req, res) => {
+  try {
+    const { taskId, projectId, user, hours, date, note } = req.body;
+    const result = await pool.query(
+      `INSERT INTO project_workspace_time_logs (task_id, project_id, "user", hours, date, note)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, task_id AS "taskId", project_id AS "projectId", "user", hours, date, note`,
+      [taskId, projectId, user, hours, date, note]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Project workspace create time log failed', err);
+    res.status(500).json({ message: 'Failed to create time log' });
+  }
+});
+
+app.patch('/api/project-workspace/tasks/:id/status', async (req, res) => {
+  try {
+    const taskId = Number(req.params.id);
+    const { status } = req.body;
+    const result = await pool.query(
+      `UPDATE project_workspace_tasks SET status = $1, updated_at = NOW()
+       WHERE id = $2 RETURNING id, project_id AS "projectId", title, assignee, status, priority, due_date AS "dueDate"`,
+      [status, taskId]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Project workspace update task status failed', err);
+    res.status(500).json({ message: 'Failed to update task status' });
+  }
+});
+
+app.get('/api/project-workspace/dashboard', async (req, res) => {
+  try {
+    if (isZohoProjectsConfigured()) {
+      const dashboard = await fetchZohoDashboardItems();
+      return res.json(dashboard);
+    }
+
+    const [projectCount, activeProjectCount, pendingTaskCount, totalHours] = await Promise.all([
+      pool.query('SELECT COUNT(*)::int AS count FROM project_workspace_projects'),
+      pool.query("SELECT COUNT(*)::int AS count FROM project_workspace_projects WHERE status = 'Active'"),
+      pool.query("SELECT COUNT(*)::int AS count FROM project_workspace_tasks WHERE status <> 'Done'"),
+      pool.query('SELECT COALESCE(SUM(hours),0)::numeric AS total_hours FROM project_workspace_time_logs')
+    ]);
+
+    res.json({
+      totalProjects: projectCount.rows[0].count,
+      activeProjects: activeProjectCount.rows[0].count,
+      pendingTasks: pendingTaskCount.rows[0].count,
+      totalHours: Number(totalHours.rows[0].total_hours)
+    });
+  } catch (err) {
+    console.error('Project workspace dashboard failed', err);
+    res.status(500).json({ message: 'Failed to load dashboard' });
+  }
+});
+
+app.get('/api/project-workspace/config', (req, res) => {
+  res.json({
+    zohoProjectsEnabled: isZohoProjectsConfigured(),
+    zohoTimeLogsEnabled: isZohoProjectsConfigured() && ENABLE_ZOHO_PROJECTS_TIME_LOGS
+  });
+});
+
 // ------------------------
 // DB Connection + Auto Migration
 // ------------------------
@@ -405,6 +562,77 @@ async function runMigrations() {
         assigned_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
         UNIQUE(task_id, email)
       )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS project_workspace_projects (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        owner VARCHAR(255) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'Planning',
+        progress INTEGER NOT NULL DEFAULT 0,
+        due_date DATE,
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS project_workspace_tasks (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES project_workspace_projects(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        assignee VARCHAR(255) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'To Do',
+        priority VARCHAR(50) NOT NULL DEFAULT 'Medium',
+        due_date DATE,
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS project_workspace_time_logs (
+        id SERIAL PRIMARY KEY,
+        task_id INTEGER NOT NULL REFERENCES project_workspace_tasks(id) ON DELETE CASCADE,
+        project_id INTEGER NOT NULL REFERENCES project_workspace_projects(id) ON DELETE CASCADE,
+        "user" VARCHAR(255) NOT NULL,
+        hours NUMERIC(6,2) NOT NULL DEFAULT 0,
+        date DATE NOT NULL,
+        note TEXT,
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      INSERT INTO project_workspace_projects (id, name, owner, status, progress, due_date)
+      SELECT 1, 'ITSM Upgrade', 'Alicia', 'Active', 72, '2026-08-20'
+      WHERE NOT EXISTS (SELECT 1 FROM project_workspace_projects WHERE id = 1);
+    `);
+
+    await pool.query(`
+      INSERT INTO project_workspace_projects (id, name, owner, status, progress, due_date)
+      SELECT 2, 'Mobile App Rollout', 'Daniel', 'Planning', 24, '2026-09-10'
+      WHERE NOT EXISTS (SELECT 1 FROM project_workspace_projects WHERE id = 2);
+    `);
+
+    await pool.query(`
+      INSERT INTO project_workspace_tasks (id, project_id, title, assignee, status, priority, due_date)
+      SELECT 101, 1, 'Configure workflow approvals', 'Nadia', 'In Progress', 'High', '2026-08-05'
+      WHERE NOT EXISTS (SELECT 1 FROM project_workspace_tasks WHERE id = 101);
+    `);
+
+    await pool.query(`
+      INSERT INTO project_workspace_tasks (id, project_id, title, assignee, status, priority, due_date)
+      SELECT 102, 2, 'Prepare deployment checklist', 'Omar', 'To Do', 'Medium', '2026-08-15'
+      WHERE NOT EXISTS (SELECT 1 FROM project_workspace_tasks WHERE id = 102);
+    `);
+
+    await pool.query(`
+      INSERT INTO project_workspace_time_logs (id, task_id, project_id, "user", hours, date, note)
+      SELECT 1001, 101, 1, 'Nadia', 4.5, '2026-08-02', 'Approval design and testing'
+      WHERE NOT EXISTS (SELECT 1 FROM project_workspace_time_logs WHERE id = 1001);
     `);
 
     // 🚀 Production performance indexes (007). Idempotent.
@@ -1437,7 +1665,11 @@ const CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const ZOHO_ORG_ID = process.env.ZOHO_ORG_ID;
 const ZOHO_BASE_URL = process.env.ZOHO_BASE_URL || 'https://desk.zoho.in/api/v1';
+const ZOHO_PROJECTS_BASE_URL = process.env.ZOHO_PROJECTS_BASE_URL || 'https://projectsapi.zoho.com/restapi';
+const ZOHO_PROJECTS_PORTAL_ID = (process.env.ZOHO_PROJECTS_PORTAL_ID || '').trim();
 const ENABLE_ZOHO_OUTBOUND = (process.env.ENABLE_ZOHO_OUTBOUND || 'true').toLowerCase() === 'true';
+const ENABLE_ZOHO_PROJECTS = (process.env.ENABLE_ZOHO_PROJECTS || 'true').toLowerCase() === 'true';
+const ENABLE_ZOHO_PROJECTS_TIME_LOGS = (process.env.ENABLE_ZOHO_PROJECTS_TIME_LOGS || 'false').toLowerCase() === 'true';
 const ZOHO_ALLOWED_EGRESS_IPS = new Set(
   (process.env.ZOHO_ALLOWED_EGRESS_IPS || '')
     .split(',')
@@ -1759,7 +1991,7 @@ function trackZohoApiCall() {
   zohoApiCallCount++;
 }
 
-async function zohoFetch(endpoint, options = {}) {
+async function zohoFetch(endpoint, options = {}, baseUrl = ZOHO_BASE_URL) {
   // Rate limit check — reject if budget exhausted
   if (!zohoRateLimitCheck()) {
     console.warn(`[ZOHO RATE LIMIT] Blocked call to ${endpoint} — hourly budget exhausted`);
@@ -1819,17 +2051,177 @@ async function zohoFetch(endpoint, options = {}) {
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${ZOHO_BASE_URL}${endpoint}`, {
+  const res = await fetch(`${baseUrl}${endpoint}`, {
     ...options,
     headers
   });
 
   if (res.status === 401) {
     await refreshZohoToken();
-    return zohoFetch(endpoint, options);
+    return zohoFetch(endpoint, options, baseUrl);
   }
 
   return res;
+}
+
+function getZohoList(data, keys) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (typeof data !== 'object') return [];
+
+  for (const key of keys) {
+    const value = data[key];
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === 'object') {
+      const nested = getZohoList(value, keys);
+      if (nested.length) return nested;
+      return [value];
+    }
+  }
+
+  if (data.response) {
+    return getZohoList(data.response, keys);
+  }
+
+  return [];
+}
+
+async function fetchZohoPaginatedList(endpointBase, listKeyNames) {
+  const items = [];
+  const limit = 200;
+  let from = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const endpoint = `${endpointBase}${endpointBase.includes('?') ? '&' : '?'}from=${from}&limit=${limit}`;
+    const response = await zohoProjectsFetch(endpoint);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Zoho paginated fetch failed: ${response.status} ${text}`);
+    }
+    const data = await response.json();
+    const pageItems = getZohoList(data, listKeyNames);
+    if (!Array.isArray(pageItems) || pageItems.length === 0) {
+      break;
+    }
+    items.push(...pageItems);
+    if (pageItems.length < limit) {
+      hasMore = false;
+    } else {
+      from += limit;
+    }
+  }
+
+  return items;
+}
+
+function normalizeZohoProject(project) {
+  return {
+    id: Number(project.id || project.project_id || project.projectId || project.projectId || 0),
+    name: project.name || project.project_name || project.projectName || '',
+    owner:
+      project.owner?.name || project.owner_name || project.owner || project.created_by?.name || 'Unknown',
+    status: project.status || project.project_status || project.status_name || 'Planning',
+    progress: Number(project.progress ?? project.completion_percentage ?? project.percent_complete ?? 0),
+    dueDate: project.end_date || project.due_date || project.target_end_date || ''
+  };
+}
+
+function normalizeZohoTask(task, projectId) {
+  return {
+    id: Number(task.id || task.task_id || task.taskId || task.taskId || 0),
+    projectId: Number(projectId || task.project_id || task.projectId || 0),
+    title: task.name || task.task_name || task.title || 'Untitled Task',
+    assignee:
+      task.owner?.name || task.assignee?.name || task.assigned_to?.name || task.owner_name || task.assignee_name || 'Unassigned',
+    status: task.status || task.task_status || 'To Do',
+    priority: task.priority || task.priority_name || 'Medium',
+    dueDate: task.due_date || task.end_date || task.dueDate || ''
+  };
+}
+
+async function zohoProjectsFetch(endpoint, options = {}) {
+  return zohoFetch(endpoint, options, ZOHO_PROJECTS_BASE_URL);
+}
+
+async function fetchZohoProjectsItems() {
+  if (!ENABLE_ZOHO_PROJECTS || !ZOHO_PROJECTS_PORTAL_ID) {
+    throw new Error('Zoho Projects is not configured');
+  }
+  const portal = ZOHO_PROJECTS_PORTAL_ID;
+  const projects = await fetchZohoPaginatedList(
+    `/portal/${portal}/projects/?status=all`,
+    ['projects', 'project']
+  );
+  return projects.map(normalizeZohoProject).filter(p => p.id > 0);
+}
+
+async function fetchZohoTasksForProject(projectId) {
+  if (!ENABLE_ZOHO_PROJECTS || !ZOHO_PROJECTS_PORTAL_ID) {
+    throw new Error('Zoho Projects is not configured');
+  }
+  const portal = ZOHO_PROJECTS_PORTAL_ID;
+  const response = await zohoProjectsFetch(`/portal/${portal}/projects/${projectId}/tasks/?status=all&from=1&limit=200`);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Zoho task list failed for project ${projectId}: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  const tasks = getZohoList(data, ['tasks', 'task']);
+  return tasks.map(task => normalizeZohoTask(task, projectId)).filter(t => t.id > 0);
+}
+
+async function fetchZohoTasksItems() {
+  const projects = await fetchZohoProjectsItems();
+  const settled = await Promise.allSettled(
+    projects.map(project => fetchZohoTasksForProject(project.id))
+  );
+  return settled.reduce((acc, result) => {
+    if (result.status === 'fulfilled') {
+      return acc.concat(result.value);
+    }
+    console.warn('Zoho Projects tasks fetch warning:', result.reason?.message || result.reason);
+    return acc;
+  }, []);
+}
+
+async function fetchZohoDashboardItems() {
+  const [projects, tasks] = await Promise.all([fetchZohoProjectsItems(), fetchZohoTasksItems()]);
+  return {
+    totalProjects: projects.length,
+    activeProjects: projects.filter(p => /active/i.test(p.status)).length,
+    pendingTasks: tasks.filter(t => !/done|completed/i.test(t.status)).length,
+    totalHours: 0
+  };
+}
+
+async function fetchZohoTimeLogsItems() {
+  if (!ENABLE_ZOHO_PROJECTS_TIME_LOGS) {
+    throw new Error('Zoho Projects time log sync is disabled');
+  }
+  const portal = ZOHO_PROJECTS_PORTAL_ID;
+  const tasks = await fetchZohoTasksItems();
+  const entries = [];
+  await Promise.allSettled(
+    tasks.map(async task => {
+      const logs = await fetchZohoPaginatedList(
+        `/portal/${portal}/projects/${task.projectId}/tasks/${task.id}/timelogs`,
+        ['time_logs', 'timelogs', 'timelog', 'timeLog']
+      );
+      for (const log of logs) {
+        entries.push({
+          id: Number(log.id || log.log_id || 0),
+          taskId: task.id,
+          projectId: task.projectId,
+          user: log.user?.name || log.user_name || log.owner?.name || log.owner_name || 'Unknown',
+          hours: Number(log.hours || log.time_spent || log.spent_hours || 0),
+          date: log.date || log.log_date || '',
+          note: log.description || log.note || log.comments || ''
+        });
+      }
+    })
+  );
+  return entries;
 }
 
 async function lookupAgentIdByEmail(email) {

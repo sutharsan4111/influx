@@ -1,0 +1,137 @@
+.workspace-shell {
+  padding: 16px;
+  background: #f8fafc;
+  min-height: 100%;
+  color: #0f172a;
+}
+
+.workspace-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.workspace-header h1 {
+  margin: 0 0 4px;
+  font-size: 1.4rem;
+}
+
+.workspace-header p {
+  margin: 0;
+  color: #64748b;
+}
+
+.download-btn {
+  background: #2563eb;
+  color: #fff;
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.summary-card, .panel {
+  background: #fff;
+  border-radius: 12px;
+  padding: 14px;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+}
+
+.summary-card span {
+  display: block;
+  color: #64748b;
+  font-size: 0.8rem;
+  margin-bottom: 6px;
+}
+
+.summary-card strong {
+  font-size: 1.4rem;
+}
+
+.content-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.form input,
+.form select,
+.form button {
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #dbe2ea;
+}
+
+.form button {
+  background: #0f766e;
+  color: #fff;
+  border: 0;
+  cursor: pointer;
+}
+
+.notification {
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  color: #3730a3;
+  padding: 12px;
+  border-radius: 10px;
+  margin-bottom: 12px;
+}
+
+.item-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.item-list li {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.pill {
+  background: #e8f0ff;
+  color: #2457c5;
+  padding: 5px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.task-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 1100px) {
+  .summary-grid,
+  .content-grid {
+    grid-template-columns: 1fr;
+  }
+}

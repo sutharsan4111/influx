@@ -1,0 +1,44 @@
+// This file defines common types and interfaces used across different features. 
+
+export interface Project {
+    id: string;
+    name: string;
+    description: string;
+    startDate: Date;
+    endDate: Date;
+    status: 'active' | 'completed' | 'on-hold';
+    tasks: Task[];
+}
+
+export interface Task {
+    id: string;
+    projectId: string;
+    title: string;
+    description: string;
+    assignedTo: string; // User ID or name
+    status: 'not-started' | 'in-progress' | 'completed';
+    timeLogs: TimeLog[];
+}
+
+export interface TimeLog {
+    id: string;
+    taskId: string;
+    userId: string; // User ID or name
+    hoursSpent: number;
+    date: Date;
+}
+
+export interface User {
+    id: string;
+    name: string;
+    email: string;
+}
+
+export interface DashboardMetrics {
+    totalProjects: number;
+    activeProjects: number;
+    completedProjects: number;
+    totalTasks: number;
+    completedTasks: number;
+    totalTimeLogged: number; // in hours
+}

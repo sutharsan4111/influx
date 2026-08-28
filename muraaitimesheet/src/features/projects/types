@@ -1,0 +1,40 @@
+export interface Project {
+    id: string;
+    name: string;
+    description: string;
+    startDate: Date;
+    endDate: Date;
+    status: ProjectStatus;
+    tasks: Task[];
+}
+
+export interface Task {
+    id: string;
+    projectId: string;
+    name: string;
+    description: string;
+    assignedTo: string;
+    status: TaskStatus;
+    timeLogs: TimeLog[];
+}
+
+export interface TimeLog {
+    id: string;
+    taskId: string;
+    hours: number;
+    date: Date;
+}
+
+export enum ProjectStatus {
+    NOT_STARTED = 'Not Started',
+    IN_PROGRESS = 'In Progress',
+    COMPLETED = 'Completed',
+    ON_HOLD = 'On Hold',
+}
+
+export enum TaskStatus {
+    NOT_STARTED = 'Not Started',
+    IN_PROGRESS = 'In Progress',
+    COMPLETED = 'Completed',
+    BLOCKED = 'Blocked',
+}

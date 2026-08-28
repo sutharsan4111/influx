@@ -1,0 +1,30 @@
+import React from 'react';
+import { Link } from 'react-router-dom';
+import './Layout.css';
+
+const Layout = ({ children }) => {
+    const handleDownload = () => {
+        // Logic to trigger download of the Electron application
+        const downloadUrl = 'path/to/electron/app'; // Replace with actual download URL
+        window.open(downloadUrl, '_blank');
+    };
+
+    return (
+        <div className="layout">
+            <header className="layout-header">
+                <h1>Muraai Timesheet</h1>
+                <button className="download-button" onClick={handleDownload}>
+                    Download
+                </button>
+            </header>
+            <main className="layout-content">
+                {children}
+            </main>
+            <footer className="layout-footer">
+                <p>&copy; 2023 Muraai Timesheet. All rights reserved.</p>
+            </footer>
+        </div>
+    );
+};
+
+export default Layout;

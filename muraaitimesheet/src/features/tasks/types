@@ -1,0 +1,30 @@
+export interface Task {
+    id: string;
+    projectId: string;
+    title: string;
+    description?: string;
+    status: TaskStatus;
+    assignedTo?: string;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+export enum TaskStatus {
+    TODO = 'TODO',
+    IN_PROGRESS = 'IN_PROGRESS',
+    COMPLETED = 'COMPLETED',
+    ON_HOLD = 'ON_HOLD',
+}
+
+export interface TimeLog {
+    id: string;
+    taskId: string;
+    hoursSpent: number;
+    date: Date;
+    notes?: string;
+}
+
+export interface TaskAssignment {
+    taskId: string;
+    userId: string;
+}

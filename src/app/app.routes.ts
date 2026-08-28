@@ -63,6 +63,11 @@ export const routes: Routes = [
           import('./cloudops/cloudops.component').then(m => m.CloudopsComponent)
       },
       {
+        path: 'project-workspace',
+        loadComponent: () =>
+          import('./project-workspace/project-workspace.component').then(m => m.ProjectWorkspaceComponent)
+      },
+      {
         path: 'admin/user-roles',
         loadComponent: () =>
           import('./admin/user-roles.component').then(m => m.UserRolesComponent)

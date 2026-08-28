@@ -53,6 +53,12 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-folder"></i>
           <span>CloudOps Projects</span>
         </li>
+        <li class="menu-item"
+            routerLink="/project-workspace"
+            [class.active]="isActive('/project-workspace')">
+          <i class="fas fa-briefcase"></i>
+          <span>Project Workspace</span>
+        </li>
 
         <li *ngIf="isCloudops()"
             class="menu-item"

@@ -1,0 +1,29 @@
+export interface TimeLog {
+    id: string;
+    taskId: string;
+    projectId: string;
+    userId: string;
+    startTime: Date;
+    endTime: Date;
+    duration: number; // in minutes
+    description?: string;
+}
+
+export interface TimeLogCreate {
+    taskId: string;
+    projectId: string;
+    userId: string;
+    startTime: Date;
+    endTime: Date;
+    description?: string;
+}
+
+export interface TimeLogUpdate {
+    id: string;
+    taskId?: string;
+    projectId?: string;
+    userId?: string;
+    startTime?: Date;
+    endTime?: Date;
+    description?: string;
+}

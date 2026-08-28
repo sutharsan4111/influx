@@ -1,0 +1,145 @@
+<section class="workspace-shell">
+  <header class="workspace-header">
+    <div>
+      <h1>Project Workspace</h1>
+      <p>Plan work, track assignments, and log delivery time in one place.</p>
+    </div>
+
+    <button type="button" class="download-btn" (click)="downloadElectronApp()">
+      Download Electron App
+    </button>
+  </header>
+
+  <div class="summary-grid">
+    <div class="summary-card">
+      <span>Total Projects</span>
+      <strong>{{ dashboard.totalProjects || 0 }}</strong>
+    </div>
+    <div class="summary-card">
+      <span>Active Projects</span>
+      <strong>{{ dashboard.activeProjects || 0 }}</strong>
+    </div>
+    <div class="summary-card">
+      <span>Pending Tasks</span>
+      <strong>{{ dashboard.pendingTasks || 0 }}</strong>
+    </div>
+    <div class="summary-card">
+      <span>Hours Logged</span>
+      <strong>{{ dashboard.totalHours || 0 }}</strong>
+    </div>
+  </div>
+
+  <div class="content-grid">
+    <div class="panel">
+      <h2>Projects</h2>
+
+      <div *ngIf="zohoProjectsEnabled" class="notification">
+        <strong>Zoho Projects live data enabled.</strong>
+        Project creation is disabled because this workspace is connected to Zoho Projects.
+      </div>
+
+      <form class="form" *ngIf="!zohoProjectsEnabled" (ngSubmit)="createProject()">
+        <input type="text" [(ngModel)]="newProject.name" name="projectName" placeholder="Project name" />
+        <input type="text" [(ngModel)]="newProject.owner" name="projectOwner" placeholder="Owner" />
+        <select [(ngModel)]="newProject.status" name="projectStatus">
+          <option value="Planning">Planning</option>
+          <option value="Active">Active</option>
+          <option value="On Hold">On Hold</option>
+          <option value="Completed">Completed</option>
+        </select>
+        <input type="number" [(ngModel)]="newProject.progress" name="projectProgress" min="0" max="100" />
+        <input type="date" [(ngModel)]="newProject.dueDate" name="projectDueDate" />
+        <button type="submit">Add Project</button>
+      </form>
+
+      <ul class="item-list">
+        <li *ngFor="let project of projects">
+          <div>
+            <strong>{{ project.name }}</strong>
+            <p>{{ project.owner }} · {{ project.status }} · Due {{ project.dueDate || 'TBD' }}</p>
+          </div>
+          <span class="pill">{{ project.progress }}%</span>
+        </li>
+      </ul>
+    </div>
+
+    <div class="panel">
+      <h2>Tasks</h2>
+
+      <form class="form" *ngIf="!zohoProjectsEnabled" (ngSubmit)="createTask()">
+        <select [(ngModel)]="newTask.projectId" name="taskProjectId">
+          <option *ngFor="let project of projects" [ngValue]="project.id">{{ project.name }}</option>
+        </select>
+        <input type="text" [(ngModel)]="newTask.title" name="taskTitle" placeholder="Task title" />
+        <input type="text" [(ngModel)]="newTask.assignee" name="taskAssignee" placeholder="Assignee" />
+        <select [(ngModel)]="newTask.status" name="taskStatus">
+          <option value="To Do">To Do</option>
+          <option value="In Progress">In Progress</option>
+          <option value="Blocked">Blocked</option>
+          <option value="Done">Done</option>
+        </select>
+        <select [(ngModel)]="newTask.priority" name="taskPriority">
+          <option value="Low">Low</option>
+          <option value="Medium">Medium</option>
+          <option value="High">High</option>
+        </select>
+        <input type="date" [(ngModel)]="newTask.dueDate" name="taskDueDate" />
+        <button type="submit">Add Task</button>
+      </form>
+      <div *ngIf="zohoProjectsEnabled" class="notification">
+        <strong>Zoho Projects live tasks are shown here.</strong>
+        Updates must be made in Zoho Projects directly.
+      </div>
+
+      <ul class="item-list">
+        <li *ngFor="let task of tasks">
+          <div>
+            <strong>{{ task.title }}</strong>
+            <p>{{ getProjectName(task.projectId) }} · {{ task.assignee }} · {{ task.priority }}</p>
+          </div>
+          <div class="task-actions">
+            <select [ngModel]="task.status" (ngModelChange)="updateTaskStatus(task, $event)" [name]="'taskStatus' + task.id">
+              <option value="To Do">To Do</option>
+              <option value="In Progress">In Progress</option>
+              <option value="Blocked">Blocked</option>
+              <option value="Done">Done</option>
+            </select>
+            <span class="pill">{{ task.dueDate || 'No due date' }}</span>
+          </div>
+        </li>
+      </ul>
+    </div>
+
+    <div class="panel">
+      <h2>Time Logs</h2>
+
+      <form class="form" *ngIf="!zohoProjectsEnabled || zohoTimeLogsEnabled" (ngSubmit)="createTimeLog()">
+        <select [(ngModel)]="newTimeLog.projectId" name="timeProjectId">
+          <option *ngFor="let project of projects" [ngValue]="project.id">{{ project.name }}</option>
+        </select>
+        <select [(ngModel)]="newTimeLog.taskId" name="timeTaskId">
+          <option *ngFor="let task of tasks" [ngValue]="task.id">{{ task.title }}</option>
+        </select>
+        <input type="text" [(ngModel)]="newTimeLog.user" name="timeUser" placeholder="User" />
+        <input type="number" [(ngModel)]="newTimeLog.hours" name="timeHours" min="0" step="0.5" />
+        <input type="date" [(ngModel)]="newTimeLog.date" name="timeDate" />
+        <input type="text" [(ngModel)]="newTimeLog.note" name="timeNote" placeholder="Work note" />
+        <button type="submit">Log Time</button>
+      </form>
+      <div *ngIf="zohoProjectsEnabled && !zohoTimeLogsEnabled" class="notification">
+        <strong>Zoho Projects live data is enabled.</strong>
+        Time log creation is disabled until Zoho time log sync is enabled.
+      </div>
+
+      <ul class="item-list">
+        <li *ngFor="let log of timeLogs">
+          <div>
+            <strong>{{ log.note || 'Time entry' }}</strong>
+            <p>{{ getProjectName(log.projectId) }} · {{ log.user }} · {{ log.hours }}h</p>
+          </div>
+          <span class="pill">{{ log.date }}</span>
+        </li>
+      </ul>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,47 @@
+{
+  "name": "muraaitimesheet",
+  "version": "1.0.0",
+  "description": "A time management application with project management features.",
+  "main": "src/electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "test": "jest"
+  },
+  "keywords": [
+    "time management",
+    "project management",
+    "electron"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "redux": "^4.1.0",
+    "react-redux": "^7.2.6",
+    "axios": "^0.21.1"
+  },
+  "devDependencies": {
+    "typescript": "^4.3.2",
+    "jest": "^27.0.6",
+    "electron": "^13.1.7",
+    "electron-builder": "^22.11.7"
+  },
+  "build": {
+    "appId": "com.muraaitimesheet.app",
+    "productName": "Muraai Timesheet",
+    "files": [
+      "dist/**/*",
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "path/to/your/resources",
+        "to": "resources",
+        "filter": ["**/*"]
+      }
+    ]
+  }
+}
