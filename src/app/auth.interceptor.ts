@@ -8,7 +8,7 @@ let refreshRequest$: Observable<any> | null = null;
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
 
   const http = inject(HttpClient);
-  const token = sessionStorage.getItem('accessToken');
+  const token = localStorage.getItem('accessToken');
   const isApiRequest = req.url.startsWith('/api');
 
   let authReq = req;
@@ -30,7 +30,7 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
       // Refresh logic is only valid for our backend API calls.
       if (isApiRequest && isAuthError && !isRefreshEndpoint) {
 
-        const refreshToken = sessionStorage.getItem('refreshToken');
+        const refreshToken = localStorage.getItem('refreshToken');
 
         if (!refreshToken) {
           return throwError(() => error);
@@ -40,7 +40,7 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
           refreshRequest$ = http.post<any>('/api/refresh', { refreshToken }).pipe(
             tap(response => {
               if (response?.accessToken) {
-                sessionStorage.setItem('accessToken', response.accessToken);
+                localStorage.setItem('accessToken', response.accessToken);
               }
             }),
             shareReplay({ bufferSize: 1, refCount: false }),
@@ -67,8 +67,8 @@ export const authInterceptor: HttpInterceptorFn = (req, next) => {
           catchError(refreshErr => {
             const refreshAuthError = refreshErr?.status === 401 || refreshErr?.status === 403;
             if (refreshAuthError) {
-              sessionStorage.removeItem('accessToken');
-              sessionStorage.removeItem('refreshToken');
+              localStorage.removeItem('accessToken');
+              localStorage.removeItem('refreshToken');
             }
             return throwError(() => refreshErr);
           })

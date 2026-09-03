@@ -41,7 +41,7 @@ export class SslService {
   constructor(private http: HttpClient) {}
 
   private getAuthHeaders(extraHeaders?: Record<string, string>): HttpHeaders {
-    const token = sessionStorage.getItem('accessToken') || '';
+    const token = localStorage.getItem('accessToken') || '';
     let headers = new HttpHeaders({
       Authorization: `Bearer ${token}`
     });

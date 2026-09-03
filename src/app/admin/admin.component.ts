@@ -428,7 +428,7 @@ export class AdminComponent implements OnInit {
   constructor(private router: Router) {}
 
   ngOnInit() {
-    if (sessionStorage.getItem('role') !== 'admin') {
+    if (localStorage.getItem('role') !== 'admin') {
       this.router.navigate(['/dashboard']);
     }
     
@@ -442,7 +442,7 @@ export class AdminComponent implements OnInit {
   }
 
   get token() {
-    return sessionStorage.getItem('accessToken');
+    return localStorage.getItem('accessToken');
   }
 
   private async authFetch(input: RequestInfo, init: RequestInit = {}) {
@@ -458,7 +458,7 @@ export class AdminComponent implements OnInit {
       return res;
     }
 
-    const refreshToken = sessionStorage.getItem('refreshToken');
+    const refreshToken = localStorage.getItem('refreshToken');
     if (!refreshToken) {
       return res;
     }
@@ -478,7 +478,7 @@ export class AdminComponent implements OnInit {
       return res;
     }
 
-    sessionStorage.setItem('accessToken', data.accessToken);
+    localStorage.setItem('accessToken', data.accessToken);
     headers.set('Authorization', `Bearer ${data.accessToken}`);
 
     return fetch(input, { ...init, headers });

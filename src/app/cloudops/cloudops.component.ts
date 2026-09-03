@@ -975,7 +975,7 @@ export class CloudopsComponent implements OnInit {
   ) {}
 
   async ngOnInit(): Promise<void> {
-    const role = (sessionStorage.getItem('role') || '').toLowerCase();
+    const role = (localStorage.getItem('role') || '').toLowerCase();
     if (role !== 'admin' && role !== 'cloudops' && role !== 'itsm') {
       this.router.navigate(['/dashboard']);
       return;

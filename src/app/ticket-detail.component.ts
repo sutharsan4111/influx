@@ -2026,7 +2026,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
 
   private initCurrentUser(): void {
     const account = this.msalService.getAccount();
-    const storedEmail = sessionStorage.getItem('username') || '';
+    const storedEmail = localStorage.getItem('username') || '';
     this.currentUserEmail = (account?.username || storedEmail || '').trim().toLowerCase();
     this.currentUserName = account?.name || this.currentUserEmail.split('@')[0] || 'Unknown';
     // Capitalize first letter
@@ -2035,7 +2035,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     }
     
     // Load user role from sessionStorage
-    const storedRole = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    const storedRole = (localStorage.getItem('role') || 'user').toLowerCase();
     this.userRole = (this.elevatedRoles.has(storedRole)
       ? storedRole
       : 'user') as 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user';

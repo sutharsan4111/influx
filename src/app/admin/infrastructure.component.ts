@@ -18,7 +18,13 @@ import { Router, RouterModule, RouterOutlet } from '@angular/router';
           class="infra-tab"
           routerLink="/infrastructure/ihub"
           [class.active]="isActive('/infrastructure/ihub')">
-          IHUB
+          IHUB License
+        </a>
+        <a
+          class="infra-tab"
+          routerLink="/infrastructure/ihub-certificate"
+          [class.active]="isActive('/infrastructure/ihub-certificate')">
+          IHUB Certificate
         </a>
         <a
           class="infra-tab"

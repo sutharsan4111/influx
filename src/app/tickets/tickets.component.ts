@@ -11,6 +11,7 @@ import { LoadingService } from '../services/loading.service';
 import { MessageService } from '../services/message.service';
 import { MsalService } from '../services/msal.service';
 import { IhubService } from '../services/ihub.service';
+import { IhubCertificateService } from '../services/ihub-certificate.service';
 import { SslService } from '../services/ssl.service';
 import { DashboardComponent } from '../dashboard/dashboard.component';
 
@@ -255,7 +256,7 @@ import { DashboardComponent } from '../dashboard/dashboard.component';
           <h2>Close Ticket</h2>
           <p>Are you sure you want to close this ticket?</p>
           <label class="modal-label" *ngIf="closeRequiresNewExpiry">
-            New {{ closingTicketType === 'IHUB' ? 'IHUB' : 'SSL' }} Expiry Date
+            New {{ closingTicketType === 'IHUB' ? 'IHUB' : (closingTicketType === 'IHUB_CERTIFICATE' ? 'IHUB Certificate' : 'SSL') }} Expiry Date
             <input type="date" [(ngModel)]="closeNewExpiryDate" />
           </label>
           <div class="modal-actions">
@@ -1859,6 +1860,7 @@ export class TicketsComponent implements OnInit, OnDestroy, AfterViewInit {
     private messageService: MessageService,
     private msalService: MsalService,
     private ihubService: IhubService,
+    private ihubCertificateService: IhubCertificateService,
     private sslService: SslService,
     private cdr: ChangeDetectorRef,
     private router: Router,
@@ -2752,7 +2754,7 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     this.closingTicketType = category;
     const subject = (selectedTicket?.subject || '').toUpperCase();
     const isAutomationSslTicket = category === 'SSL' && subject.includes('[SSL][AUTOMATION]');
-    this.closeRequiresNewExpiry = category === 'IHUB' || (category === 'SSL' && !isAutomationSslTicket);
+    this.closeRequiresNewExpiry = category === 'IHUB' || category === 'IHUB_CERTIFICATE' || (category === 'SSL' && !isAutomationSslTicket);
     this.closeNewExpiryDate = '';
     this.showCloseDialog = true;
   }
@@ -2835,7 +2837,9 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     if (!this.activeTicketId) return;
 
     if (this.closeRequiresNewExpiry && !this.closeNewExpiryDate) {
-      const dateType = this.closingTicketType === 'IHUB' ? 'IHUB' : 'SSL';
+      const dateType = this.closingTicketType === 'IHUB'
+        ? 'IHUB'
+        : this.closingTicketType === 'IHUB_CERTIFICATE' ? 'IHUB Certificate' : 'SSL';
       this.messageService.error(`New ${dateType} expiry date is required for ticket closure`);
       return;
     }
@@ -2843,6 +2847,8 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     let closeRequest$;
     if (this.closingTicketType === 'IHUB') {
       closeRequest$ = this.ihubService.closeIhubTicket(this.activeTicketId, this.closeNewExpiryDate);
+    } else if (this.closingTicketType === 'IHUB_CERTIFICATE') {
+      closeRequest$ = this.ihubCertificateService.closeIhubCertificateTicket(this.activeTicketId, this.closeNewExpiryDate);
     } else if (this.closingTicketType === 'SSL') {
       closeRequest$ = this.sslService.closeAlertTicket(this.activeTicketId, this.closeNewExpiryDate);
     } else {
@@ -3035,19 +3041,19 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
   // down mid-request, cancelling its calls) for users who should never see it.
   private initCurrentUser(): void {
     const account = this.msalService.getAccount();
-    const storedEmail = sessionStorage.getItem('username') || '';
-    const storedName = sessionStorage.getItem('displayName') || '';
+    const storedEmail = localStorage.getItem('username') || '';
+    const storedName = localStorage.getItem('displayName') || '';
 
     this.currentUserEmail = (account?.username || storedEmail || '').trim().toLowerCase();
     this.currentUserName = (account?.name || storedName || '').trim().toLowerCase();
 
     // Load user role from sessionStorage
-    const storedRole = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    const storedRole = (localStorage.getItem('role') || 'user').toLowerCase();
     this.userRole = (this.elevatedRoles.has(storedRole)
       ? storedRole
       : 'user') as 'admin' | 'cloudops' | 'itsm' | 'product' | 'hr' | 'support' | 'muraai' | 'user';
 
-    this.isCloudOpsMember = sessionStorage.getItem('isCloudOps') === 'true' || this.isAdmin;
+    this.isCloudOpsMember = localStorage.getItem('isCloudOps') === 'true' || this.isAdmin;
 
     this.loadAllowedRequesterEmails();
   }
@@ -3354,7 +3360,8 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
           zoho_ticket_number: ticket?.ticketNumber,
           assigned_users: this.selectedAssignees,
           assigned_by: this.currentUserEmail,
-          ...(category ? { category } : {})
+          ...(category ? { category } : {}),
+          ...(ticket?.departmentId ? { zoho_department_id: ticket.departmentId } : {})
         }));
         this.messageService.success('Ticket assigned successfully');
       }
@@ -3378,17 +3385,20 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
 
     try {
       const ticketCategories: Record<string, string> = {};
+      const ticketDepartmentIds: Record<string, string> = {};
       this.selectedTickets.forEach(ticketId => {
         const ticket = this.filteredTickets.find(t => (t.id || t.ticketId) === ticketId);
         const category = this.normalizeCategoryValue(ticket?.category);
         if (category) ticketCategories[ticketId] = category;
+        if (ticket?.departmentId) ticketDepartmentIds[ticketId] = ticket.departmentId;
       });
 
       const result = await firstValueFrom(this.assignmentService.bulkAssign({
         ticket_ids: Array.from(this.selectedTickets),
         assigned_users: this.bulkAssignees,
         assigned_by: this.currentUserEmail,
-        ticket_categories: Object.keys(ticketCategories).length ? ticketCategories : undefined
+        ticket_categories: Object.keys(ticketCategories).length ? ticketCategories : undefined,
+        ticket_department_ids: Object.keys(ticketDepartmentIds).length ? ticketDepartmentIds : undefined
       }));
 
       if (result.success.length > 0) {

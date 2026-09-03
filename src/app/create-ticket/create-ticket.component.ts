@@ -1010,8 +1010,8 @@ export class CreateTicketComponent implements OnInit {
   ) {}
 
   async ngOnInit(): Promise<void> {
-    const storedEmail = sessionStorage.getItem('username') || '';
-    const storedName = sessionStorage.getItem('displayName') || '';
+    const storedEmail = localStorage.getItem('username') || '';
+    const storedName = localStorage.getItem('displayName') || '';
     if (storedEmail) this.formData.email = storedEmail;
     if (storedName) this.formData.name = storedName;
 

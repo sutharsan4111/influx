@@ -3,7 +3,7 @@ import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { Observable, of } from 'rxjs';
 import { tap } from 'rxjs/operators';
 
-export interface IhubAsset {
+export interface IhubCertificateAsset {
   id?: number;
   client: string;
   environment: string;
@@ -18,7 +18,7 @@ export interface IhubAsset {
   updated_at?: string;
 }
 
-export interface IhubResponsiblePerson {
+export interface IhubCertificateResponsiblePerson {
   email: string;
   displayName: string;
 }
@@ -30,10 +30,10 @@ export interface AssignableUserLite {
 @Injectable({
   providedIn: 'root'
 })
-export class IhubService {
-  private apiUrl = '/api/ihub';
-  private assetsCache: IhubAsset[] | null = null;
-  private responsiblePeopleCache = new Map<string, IhubResponsiblePerson[]>();
+export class IhubCertificateService {
+  private apiUrl = '/api/ihub-certificate';
+  private assetsCache: IhubCertificateAsset[] | null = null;
+  private responsiblePeopleCache = new Map<string, IhubCertificateResponsiblePerson[]>();
 
   constructor(private http: HttpClient) {}
 
@@ -52,12 +52,12 @@ export class IhubService {
     return headers;
   }
 
-  getAssets(forceRefresh = false): Observable<IhubAsset[]> {
+  getAssets(forceRefresh = false): Observable<IhubCertificateAsset[]> {
     if (!forceRefresh && this.assetsCache) {
       return of(this.assetsCache);
     }
 
-    return this.http.get<IhubAsset[]>(this.apiUrl, {
+    return this.http.get<IhubCertificateAsset[]>(this.apiUrl, {
       headers: this.getAuthHeaders()
     }).pipe(
       tap((assets) => {
@@ -70,14 +70,14 @@ export class IhubService {
     this.assetsCache = null;
   }
 
-  createAsset(payload: IhubAsset): Observable<IhubAsset> {
-    return this.http.post<IhubAsset>(this.apiUrl, payload, {
+  createAsset(payload: IhubCertificateAsset): Observable<IhubCertificateAsset> {
+    return this.http.post<IhubCertificateAsset>(this.apiUrl, payload, {
       headers: this.getAuthHeaders()
     });
   }
 
-  updateAsset(assetId: number, payload: IhubAsset): Observable<IhubAsset> {
-    return this.http.put<IhubAsset>(`${this.apiUrl}/${assetId}`, payload, {
+  updateAsset(assetId: number, payload: IhubCertificateAsset): Observable<IhubCertificateAsset> {
+    return this.http.put<IhubCertificateAsset>(`${this.apiUrl}/${assetId}`, payload, {
       headers: this.getAuthHeaders()
     });
   }
@@ -88,7 +88,7 @@ export class IhubService {
     });
   }
 
-  getResponsiblePeople(groupEmail: string, graphToken: string, forceRefresh = false): Observable<{ members: IhubResponsiblePerson[] }> {
+  getResponsiblePeople(groupEmail: string, graphToken: string, forceRefresh = false): Observable<{ members: IhubCertificateResponsiblePerson[] }> {
     const cacheKey = (groupEmail || '').toLowerCase();
     const cachedMembers = this.responsiblePeopleCache.get(cacheKey);
 
@@ -96,7 +96,7 @@ export class IhubService {
       return of({ members: cachedMembers });
     }
 
-    return this.http.get<{ members: IhubResponsiblePerson[] }>(
+    return this.http.get<{ members: IhubCertificateResponsiblePerson[] }>(
       `/api/admin/group-members?groupEmail=${encodeURIComponent(groupEmail)}`,
       {
         headers: this.getAuthHeaders({ 'x-graph-token': graphToken || '' })
@@ -118,7 +118,7 @@ export class IhubService {
     });
   }
 
-  closeIhubTicket(ticketId: string, newExpiryDate: string): Observable<{ message: string; license_expiry: string }> {
+  closeIhubCertificateTicket(ticketId: string, newExpiryDate: string): Observable<{ message: string; license_expiry: string }> {
     return this.http.post<{ message: string; license_expiry: string }>(
       `${this.apiUrl}/tickets/${ticketId}/close`,
       { new_expiry_date: newExpiryDate },

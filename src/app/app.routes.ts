@@ -89,6 +89,11 @@ export const routes: Routes = [
               import('./admin/ihub.component').then(m => m.IhubComponent)
           },
           {
+            path: 'ihub-certificate',
+            loadComponent: () =>
+              import('./admin/ihub-certificate.component').then(m => m.IhubCertificateComponent)
+          },
+          {
             path: 'automation-ssl',
             loadComponent: () =>
               import('./admin/automation-ssl.component').then(m => m.AutomationSslComponent)
@@ -98,6 +103,11 @@ export const routes: Routes = [
       {
         path: 'ihub',
         redirectTo: 'infrastructure/ihub',
+        pathMatch: 'full'
+      },
+      {
+        path: 'ihub-certificate',
+        redirectTo: 'infrastructure/ihub-certificate',
         pathMatch: 'full'
       },
       {

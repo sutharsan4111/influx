@@ -53,12 +53,9 @@ import { MsalService } from '../services/msal.service';
           <i class="fas fa-folder"></i>
           <span>CloudOps Projects</span>
         </li>
-        <li class="menu-item"
-            routerLink="/project-workspace"
-            [class.active]="isActive('/project-workspace')">
-          <i class="fas fa-briefcase"></i>
-          <span>Project Workspace</span>
-        </li>
+        
+
+        
 
         <li *ngIf="isCloudops()"
             class="menu-item"
@@ -775,7 +772,7 @@ export class SidebarComponent implements OnInit {
     this.loadProfilePhoto();
   } else {
     // 2️⃣ Fallback to normal login (JWT login)
-    const email = sessionStorage.getItem('username') || '';
+    const email = localStorage.getItem('username') || '';
     this.userEmail = email;
 
     // Show name before @
@@ -783,7 +780,7 @@ export class SidebarComponent implements OnInit {
   }
 
   // Always refresh role from sessionStorage
-  this.role = this.toVisibleRole(sessionStorage.getItem('role') || '');
+  this.role = this.toVisibleRole(localStorage.getItem('role') || '');
   this.availableRoles = this.readStoredRoles();
   this.selectedRole = this.availableRoles.includes(this.role) ? this.role : (this.availableRoles[0] || '');
 }
@@ -814,7 +811,7 @@ export class SidebarComponent implements OnInit {
   }
 
   private getAuthHeaders() {
-    const token = sessionStorage.getItem('accessToken') || '';
+    const token = localStorage.getItem('accessToken') || '';
     return {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json'
@@ -823,7 +820,7 @@ export class SidebarComponent implements OnInit {
 
   private readStoredRoles(): string[] {
     try {
-      const parsed = JSON.parse(sessionStorage.getItem('roles') || '[]');
+      const parsed = JSON.parse(localStorage.getItem('roles') || '[]');
       if (!Array.isArray(parsed)) return this.getVisibleRoles([this.role]);
       const normalized = parsed.map((r: any) => (r || '').toString().toLowerCase()).filter(Boolean);
       const visible = this.getVisibleRoles(normalized);
@@ -866,14 +863,14 @@ export class SidebarComponent implements OnInit {
       headers: this.getAuthHeaders()
     }).subscribe({
       next: (data) => {
-        if (data?.accessToken) sessionStorage.setItem('accessToken', data.accessToken);
-        if (data?.refreshToken) sessionStorage.setItem('refreshToken', data.refreshToken);
+        if (data?.accessToken) localStorage.setItem('accessToken', data.accessToken);
+        if (data?.refreshToken) localStorage.setItem('refreshToken', data.refreshToken);
         if (data?.role) {
-          sessionStorage.setItem('role', data.role);
+          localStorage.setItem('role', data.role);
           this.role = this.toVisibleRole(data.role);
         }
         if (Array.isArray(data?.roles)) {
-          sessionStorage.setItem('roles', JSON.stringify(data.roles));
+          localStorage.setItem('roles', JSON.stringify(data.roles));
           this.availableRoles = this.getVisibleRoles(data.roles);
         }
         this.isProfileMenuOpen = false;
@@ -890,6 +887,11 @@ export class SidebarComponent implements OnInit {
     this.isProfileMenuOpen = false;
 
     sessionStorage.clear();
+    // Auth session now lives in localStorage (shared across tabs) — clear it
+    // explicitly by key rather than localStorage.clear(), since that also
+    // holds MSAL's own account cache and unrelated app data (e.g. ITSMS_USERS).
+    ['accessToken', 'refreshToken', 'role', 'roles', 'username', 'displayName', 'isCloudOps']
+      .forEach(key => localStorage.removeItem(key));
     localStorage.removeItem('ITSMS_USERS'); // optional
 
     this.msalService.logout();
@@ -967,7 +969,7 @@ export class SidebarComponent implements OnInit {
   }
 
   isLicenceSection() {
-    return this.router.url.startsWith('/infrastructure') || this.router.url.startsWith('/ssl') || this.router.url.startsWith('/ihub') || this.router.url.startsWith('/automation-ssl');
+    return this.router.url.startsWith('/infrastructure') || this.router.url.startsWith('/ssl') || this.router.url.startsWith('/ihub') || this.router.url.startsWith('/ihub-certificate') || this.router.url.startsWith('/automation-ssl');
   }
 
   isAdmin() { return this.role === 'admin'; }

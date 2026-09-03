@@ -459,7 +459,7 @@ export class AzureBackupComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     // Azure Backup is CloudOps-only. Admins go to the Tickets "Overview" tab,
     // everyone else to their own "My Tickets" view.
-    const role = (sessionStorage.getItem('role') || 'user').toLowerCase();
+    const role = (localStorage.getItem('role') || 'user').toLowerCase();
     const isCloudOpsRole = role === 'cloudops' || role === 'itsm';
     if (!isCloudOpsRole) {
       const tab = role === 'admin' ? 'overview' : 'my';

@@ -49,7 +49,7 @@ export class AutomationSslService {
   constructor(private http: HttpClient) {}
 
   private getAuthHeaders(): HttpHeaders {
-    const token = sessionStorage.getItem('accessToken') || '';
+    const token = localStorage.getItem('accessToken') || '';
     return new HttpHeaders({
       Authorization: `Bearer ${token}`
     });

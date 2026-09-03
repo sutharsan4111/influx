@@ -1,6 +1,6 @@
 import { Component, OnInit } from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { CommonModule } from '@angular/common';
 import { MsalService } from '../services/msal.service';
 
@@ -395,13 +395,22 @@ export class LoginComponent implements OnInit {
     password: ['', Validators.required]
   });
 
+  private returnUrl: string | null = null;
+
   constructor(
     private fb: FormBuilder,
     private router: Router,
+    private route: ActivatedRoute,
     private msalService: MsalService
   ) {}
 
   async ngOnInit() {
+    // Set by AuthGuard when it bounced an unauthenticated visit to a deep link
+    // (e.g. a ticket link opened from a Teams notification) — only accept an
+    // internal path, never an absolute URL, to avoid an open-redirect.
+    const candidate = this.route.snapshot.queryParamMap.get('returnUrl');
+    this.returnUrl = candidate && candidate.startsWith('/') && !candidate.startsWith('//') ? candidate : null;
+
     try {
       await this.msalService.ensureInitialized();
       this.msalReady = true;
@@ -416,6 +425,11 @@ export class LoginComponent implements OnInit {
   }
 
   private navigateByRole(role: string): void {
+    if (this.returnUrl) {
+      this.router.navigateByUrl(this.returnUrl);
+      return;
+    }
+
     const normalized = (role || '').toLowerCase();
     if (normalized === 'cloudops' || normalized === 'itsm') {
       this.router.navigate(['/dashboard']);
@@ -450,12 +464,12 @@ export class LoginComponent implements OnInit {
   })
   .then(data => {
     if (data.accessToken) {
-      sessionStorage.setItem('accessToken', data.accessToken);
-      sessionStorage.setItem('refreshToken', data.refreshToken);
-      sessionStorage.setItem('role', data.role);
-      sessionStorage.setItem('roles', JSON.stringify(Array.isArray(data.roles) ? data.roles : [data.role || 'user']));
-      sessionStorage.setItem('username', data.email);
-      sessionStorage.setItem('isCloudOps', data.isCloudOps ? 'true' : 'false');
+      localStorage.setItem('accessToken', data.accessToken);
+      localStorage.setItem('refreshToken', data.refreshToken);
+      localStorage.setItem('role', data.role);
+      localStorage.setItem('roles', JSON.stringify(Array.isArray(data.roles) ? data.roles : [data.role || 'user']));
+      localStorage.setItem('username', data.email);
+      localStorage.setItem('isCloudOps', data.isCloudOps ? 'true' : 'false');
 
       this.navigateByRole(data.role);
     } else {
@@ -510,12 +524,12 @@ async loginWithMicrosoft() {
     const data = await response.json();
 
     if (data.accessToken) {
-      sessionStorage.setItem('accessToken', data.accessToken);
-      sessionStorage.setItem('refreshToken', data.refreshToken);
-      sessionStorage.setItem('role', data.role);
-      sessionStorage.setItem('roles', JSON.stringify(Array.isArray(data.roles) ? data.roles : [data.role || 'user']));
-      sessionStorage.setItem('username', email);
-      sessionStorage.setItem('displayName', displayName);
+      localStorage.setItem('accessToken', data.accessToken);
+      localStorage.setItem('refreshToken', data.refreshToken);
+      localStorage.setItem('role', data.role);
+      localStorage.setItem('roles', JSON.stringify(Array.isArray(data.roles) ? data.roles : [data.role || 'user']));
+      localStorage.setItem('username', email);
+      localStorage.setItem('displayName', displayName);
 
       this.navigateByRole(data.role);
     } else {

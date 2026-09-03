@@ -54,6 +54,9 @@ import { ReportComponent } from '../admin/report.component';
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                   Export Excel
                 </button>
+                <button class="btn" (click)="fixMissingData()" [disabled]="reportLoading || reportComponent?.backfilling" title="Repairs older ticket assignments that are missing category/department data and are being excluded from this report">
+                  {{ reportComponent?.backfilling ? 'Fixing…' : 'Fix Missing Data' }}
+                </button>
               </div>
             </div>
           </div>
@@ -1057,22 +1060,22 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
   @ViewChild('reportComponent') reportComponent?: ReportComponent;
 
   private get COUNT_CACHE_KEY(): string {
-    const userEmail = sessionStorage.getItem('username') || 'guest';
-    const userRole = sessionStorage.getItem('role') || 'user';
+    const userEmail = localStorage.getItem('username') || 'guest';
+    const userRole = localStorage.getItem('role') || 'user';
     const deptSuffix = this.isEmbeddedMode && this.overviewDepartmentId ? `_${this.overviewDepartmentId}` : '';
     return `dashboard_ticket_counts_${userRole}_${userEmail}${deptSuffix}`;
   }
 
   private get TICKETS_CACHE_KEY(): string {
-    const userEmail = sessionStorage.getItem('username') || 'guest';
-    const userRole = sessionStorage.getItem('role') || 'user';
+    const userEmail = localStorage.getItem('username') || 'guest';
+    const userRole = localStorage.getItem('role') || 'user';
     const deptSuffix = this.isEmbeddedMode && this.overviewDepartmentId ? `_${this.overviewDepartmentId}` : '';
     return `dashboard_tickets_${userRole}_${userEmail}_${this.selectedTab}${deptSuffix}`;
   }
 
   private get TICKETS_CACHE_KEY_BASE(): string {
-    const userEmail = sessionStorage.getItem('username') || 'guest';
-    const userRole = sessionStorage.getItem('role') || 'user';
+    const userEmail = localStorage.getItem('username') || 'guest';
+    const userRole = localStorage.getItem('role') || 'user';
     const deptSuffix = this.isEmbeddedMode && this.overviewDepartmentId ? `_${this.overviewDepartmentId}` : '';
     return `dashboard_tickets_${userRole}_${userEmail}${deptSuffix}`;
   }
@@ -1268,8 +1271,8 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
   }
 
   initUserInfo() {
-    this.userRole = (sessionStorage.getItem('role') || 'user').toLowerCase();
-    this.currentUserEmail = (sessionStorage.getItem('username') || '').toLowerCase().trim();
+    this.userRole = (localStorage.getItem('role') || 'user').toLowerCase();
+    this.currentUserEmail = (localStorage.getItem('username') || '').toLowerCase().trim();
     const account = this.msalService.getAccount();
     if (account) {
       this.userName = account.name || account.username?.split('@')[0] || 'User';
@@ -1277,7 +1280,7 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
         this.currentUserEmail = (account.username || '').toLowerCase().trim();
       }
     } else {
-      const email = sessionStorage.getItem('username') || '';
+      const email = localStorage.getItem('username') || '';
       this.userName = email ? email.split('@')[0] : 'User';
     }
     this.userName = this.userName.charAt(0).toUpperCase() + this.userName.slice(1);
@@ -1583,6 +1586,10 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
 
   downloadExcel() {
     this.reportComponent?.downloadExcel();
+  }
+
+  fixMissingData() {
+    this.reportComponent?.backfillCategories();
   }
 
   onAdminDeptChange() {

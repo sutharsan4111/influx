@@ -4,7 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 
-import { IhubAsset, IhubResponsiblePerson, IhubService } from '../services/ihub.service';
+import { IhubCertificateAsset, IhubCertificateResponsiblePerson, IhubCertificateService } from '../services/ihub-certificate.service';
 import { MsalService } from '../services/msal.service';
 import { MessageService } from '../services/message.service';
 
@@ -14,13 +14,13 @@ import { MessageService } from '../services/message.service';
   template: `
     <div class="ihub-page">
       <div class="page-header-row">
-        <h2>IHUB License</h2>
+        <h2>IHUB Certificate</h2>
         <div class="header-actions">
           <button class="btn-check" (click)="runExpiryCheck()" title="Run Expiry Check" [disabled]="isRunningCheck">
             <i class="fas fa-clock" [class.spinning]="isRunningCheck"></i>
             {{ isRunningCheck ? 'Checking...' : 'Run Check' }}
           </button>
-          <button class="btn-add" (click)="openAddModal()" title="Add IHUB License">
+          <button class="btn-add" (click)="openAddModal()" title="Add IHUB Certificate">
             <i class="fas fa-plus"></i>
           </button>
         </div>
@@ -62,7 +62,7 @@ import { MessageService } from '../services/message.service';
               </td>
             </tr>
             <tr *ngIf="assets.length === 0">
-              <td colspan="9" class="empty">No IHUB License records found.</td>
+              <td colspan="9" class="empty">No IHUB Certificate records found.</td>
             </tr>
           </tbody>
         </table>
@@ -71,7 +71,7 @@ import { MessageService } from '../services/message.service';
 
     <div class="modal-backdrop" *ngIf="showModal" (click)="closeModal()">
       <div class="modal-card" (click)="$event.stopPropagation()">
-        <h3>{{ editingId ? 'Edit IHUB License' : 'Add IHUB License' }}</h3>
+        <h3>{{ editingId ? 'Edit IHUB Certificate' : 'Add IHUB Certificate' }}</h3>
 
         <div class="grid">
           <label>
@@ -494,19 +494,19 @@ import { MessageService } from '../services/message.service';
     }
   `]
 })
-export class IhubComponent implements OnInit {
-  assets: IhubAsset[] = [];
-  responsiblePeople: IhubResponsiblePerson[] = [];
+export class IhubCertificateComponent implements OnInit {
+  assets: IhubCertificateAsset[] = [];
+  responsiblePeople: IhubCertificateResponsiblePerson[] = [];
 
   showModal = false;
   editingId: number | null = null;
   isRunningCheck = false;
 
-  form: IhubAsset = this.emptyForm();
+  form: IhubCertificateAsset = this.emptyForm();
 
   constructor(
     private router: Router,
-    private ihubService: IhubService,
+    private ihubCertificateService: IhubCertificateService,
     private msalService: MsalService,
     private messageService: MessageService
   ) {}
@@ -526,9 +526,9 @@ export class IhubComponent implements OnInit {
 
   async loadAssets(): Promise<void> {
     try {
-      this.assets = await firstValueFrom(this.ihubService.getAssets());
+      this.assets = await firstValueFrom(this.ihubCertificateService.getAssets());
     } catch (err: any) {
-      this.messageService.error(err?.error?.message || 'Failed to load IHUB License assets');
+      this.messageService.error(err?.error?.message || 'Failed to load IHUB Certificate assets');
     }
   }
 
@@ -540,11 +540,11 @@ export class IhubComponent implements OnInit {
         'GroupMember.Read.All',
         'Group.Read.All'
       ]);
-      let members: IhubResponsiblePerson[] = [];
+      let members: IhubCertificateResponsiblePerson[] = [];
 
       for (const groupMail of groupCandidates) {
         const result = await firstValueFrom(
-          this.ihubService.getResponsiblePeople(groupMail, graphToken)
+          this.ihubCertificateService.getResponsiblePeople(groupMail, graphToken)
         );
         members = result?.members || [];
         if (members.length > 0) break;
@@ -561,7 +561,7 @@ export class IhubComponent implements OnInit {
     }
 
     try {
-      const fallbackUsers = await firstValueFrom(this.ihubService.getAssignableUsersFallback());
+      const fallbackUsers = await firstValueFrom(this.ihubCertificateService.getAssignableUsersFallback());
       this.responsiblePeople = (fallbackUsers || []).map(u => ({
         email: u.email,
         displayName: u.email
@@ -581,7 +581,7 @@ export class IhubComponent implements OnInit {
     this.showModal = true;
   }
 
-  openEditModal(item: IhubAsset): void {
+  openEditModal(item: IhubCertificateAsset): void {
     this.editingId = item.id || null;
     this.form = {
       ...item,
@@ -604,10 +604,10 @@ export class IhubComponent implements OnInit {
   async runExpiryCheck(): Promise<void> {
     this.isRunningCheck = true;
     try {
-      await firstValueFrom(this.ihubService.runExpiryCheck());
-      this.ihubService.invalidateAssetsCache();
+      await firstValueFrom(this.ihubCertificateService.runExpiryCheck());
+      this.ihubCertificateService.invalidateAssetsCache();
       this.messageService.success('Expiry check completed. New alert tickets have been generated if applicable.');
-      this.assets = await firstValueFrom(this.ihubService.getAssets(true));
+      this.assets = await firstValueFrom(this.ihubCertificateService.getAssets(true));
     } catch (err: any) {
       this.messageService.error(err?.error?.message || 'Expiry check failed');
     } finally {
@@ -615,19 +615,19 @@ export class IhubComponent implements OnInit {
     }
   }
 
-  async deleteAsset(item: IhubAsset): Promise<void> {
+  async deleteAsset(item: IhubCertificateAsset): Promise<void> {
     if (!item.id) return;
 
-    const confirmed = window.confirm(`Delete IHUB License record for ${item.client} (${item.hostname})?`);
+    const confirmed = window.confirm(`Delete IHUB Certificate record for ${item.client} (${item.hostname})?`);
     if (!confirmed) return;
 
     try {
-      await firstValueFrom(this.ihubService.deleteAsset(item.id));
-      this.ihubService.invalidateAssetsCache();
-      this.messageService.success('IHUB License details deleted');
-      this.assets = await firstValueFrom(this.ihubService.getAssets(true));
+      await firstValueFrom(this.ihubCertificateService.deleteAsset(item.id));
+      this.ihubCertificateService.invalidateAssetsCache();
+      this.messageService.success('IHUB Certificate details deleted');
+      this.assets = await firstValueFrom(this.ihubCertificateService.getAssets(true));
     } catch (err: any) {
-      this.messageService.error(err?.error?.message || 'Failed to delete IHUB License details');
+      this.messageService.error(err?.error?.message || 'Failed to delete IHUB Certificate details');
     }
   }
 
@@ -639,18 +639,18 @@ export class IhubComponent implements OnInit {
 
     try {
       if (this.editingId) {
-        await firstValueFrom(this.ihubService.updateAsset(this.editingId, this.form));
-        this.messageService.success('IHUB License details updated');
+        await firstValueFrom(this.ihubCertificateService.updateAsset(this.editingId, this.form));
+        this.messageService.success('IHUB Certificate details updated');
       } else {
-        await firstValueFrom(this.ihubService.createAsset(this.form));
-        this.messageService.success('IHUB License details added');
+        await firstValueFrom(this.ihubCertificateService.createAsset(this.form));
+        this.messageService.success('IHUB Certificate details added');
       }
 
-      this.ihubService.invalidateAssetsCache();
+      this.ihubCertificateService.invalidateAssetsCache();
       this.showModal = false;
-      this.assets = await firstValueFrom(this.ihubService.getAssets(true));
+      this.assets = await firstValueFrom(this.ihubCertificateService.getAssets(true));
     } catch (err: any) {
-      this.messageService.error(err?.error?.message || 'Failed to save IHUB License details');
+      this.messageService.error(err?.error?.message || 'Failed to save IHUB Certificate details');
     }
   }
 
@@ -676,7 +676,7 @@ export class IhubComponent implements OnInit {
     );
   }
 
-  private emptyForm(): IhubAsset {
+  private emptyForm(): IhubCertificateAsset {
     return {
       client: '',
       environment: '',

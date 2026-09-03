@@ -232,7 +232,18 @@ async function runMigrations() {
         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
       )
     `);
-    
+
+    // Tracks which tickets we've already announced to Teams as "new arrivals" —
+    // independent of ticket_assignments (which requires an assignee and is about
+    // who's handling the ticket, not whether we've seen it exist).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ticket_arrival_notifications (
+        zoho_ticket_id VARCHAR(50) PRIMARY KEY,
+        zoho_department_id VARCHAR(50),
+        notified_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+
     // Add category column if not exists
     await pool.query(`
       ALTER TABLE ticket_assignments 
@@ -269,6 +280,39 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
         closed_at TIMESTAMP WITH TIME ZONE,
         UNIQUE (ihub_asset_id, milestone_days, license_expiry_on)
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ihub_certificate_assets (
+        id SERIAL PRIMARY KEY,
+        client VARCHAR(255) NOT NULL,
+        environment VARCHAR(100) NOT NULL,
+        hostname VARCHAR(255) NOT NULL,
+        ip_address VARCHAR(100) NOT NULL,
+        ihub_version VARCHAR(100),
+        license_expiry DATE NOT NULL,
+        responsible_person_email VARCHAR(255) NOT NULL,
+        responsible_person_name VARCHAR(255),
+        created_by VARCHAR(255),
+        updated_by VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ihub_certificate_alert_tickets (
+        id SERIAL PRIMARY KEY,
+        ihub_certificate_asset_id INTEGER NOT NULL REFERENCES ihub_certificate_assets(id) ON DELETE CASCADE,
+        milestone_days INTEGER NOT NULL,
+        license_expiry_on DATE NOT NULL,
+        zoho_ticket_id VARCHAR(50) NOT NULL UNIQUE,
+        zoho_ticket_number VARCHAR(50),
+        status VARCHAR(50) NOT NULL DEFAULT 'Open',
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        closed_at TIMESTAMP WITH TIME ZONE,
+        UNIQUE (ihub_certificate_asset_id, milestone_days, license_expiry_on)
       )
     `);
 
@@ -1680,6 +1724,7 @@ const ZOHO_DEPARTMENT_ID = process.env.ZOHO_DEPARTMENT_ID;
 const ZOHO_ASSIGNEE_ID = process.env.ZOHO_ASSIGNEE_ID;
 const ENABLE_ALERT_JOBS = (process.env.ENABLE_ALERT_JOBS || 'true').toLowerCase() === 'true';
 const IHUB_ALERT_MILESTONES = [30, 15, 7, 3, 1];
+const IHUB_CERTIFICATE_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const AUTOMATION_SSL_ALERT_MILESTONES = [30, 15, 7, 3, 1];
 const AUTOMATION_PROMETHEUS_URL = (process.env.AUTOMATION_PROMETHEUS_URL || '').trim();
@@ -1689,6 +1734,17 @@ const ADMIN_GROUP_MAIL = (process.env.ADMIN_GROUP_MAIL || 'automation.cloudops@m
 const ADMIN_GROUP_NAME = (process.env.ADMIN_GROUP_NAME || 'automation.cloudops').trim().toLowerCase();
 const CLOUDOPS_GROUP_MAIL = (process.env.CLOUDOPS_GROUP_MAIL || 'cloudops@muraai.com').trim().toLowerCase();
 const CLOUDOPS_GROUP_NAME = (process.env.CLOUDOPS_GROUP_NAME || 'cloudops').trim().toLowerCase();
+// Incoming Webhook URL for the Teams channel that all CloudOps members are in.
+// Left blank, notifications are silently skipped — see notifyCloudOpsTeamsOnAssignment().
+const CLOUDOPS_TEAMS_WEBHOOK_URL = (process.env.CLOUDOPS_TEAMS_WEBHOOK_URL || '').trim();
+// Shared secret a Zoho Desk workflow rule must send to /api/webhook/zoho-ticket-assigned
+// so tickets assigned directly in Zoho (bypassing this portal) still notify Teams.
+const ZOHO_TICKET_WEBHOOK_SECRET = (process.env.ZOHO_TICKET_WEBHOOK_SECRET || '').trim();
+// Public URL of this ITSM portal ("Influx"), used to build "open ticket" links in Teams cards.
+const PORTAL_BASE_URL = (process.env.PORTAL_BASE_URL || '').trim().replace(/\/+$/, '');
+function ticketPortalUrl(zohoTicketId) {
+  return PORTAL_BASE_URL ? `${PORTAL_BASE_URL}/tickets/${zohoTicketId}` : null;
+}
 
 const DEFAULT_ADMIN_EMAIL_ALLOWLIST = [
   'ravi.chadaram@muraai.com',
@@ -1823,6 +1879,95 @@ function isDepartmentAllowed(ticket, allowedDeptIds = []) {
   return !!tid && allowedDeptIds.includes(tid);
 }
 
+// Posts a ticket-assignment notice to the CloudOps Teams channel so the whole
+// team sees it in one place, not just the assignee. No-op until
+// CLOUDOPS_TEAMS_WEBHOOK_URL is configured (see .env). Only fires for CloudOps
+// ("itsm") department tickets — this app also handles assignment for HR/Support/
+// Product/Muraai, and those shouldn't spam the CloudOps channel.
+// Adaptive Cards, not the legacy MessageCard format — this Teams Workflow
+// (the "Post to a channel when a webhook request is received" template) does
+// not render MessageCard's potentialAction buttons, confirmed by testing both
+// side by side. Action.OpenUrl on an Adaptive Card renders correctly.
+async function postCloudOpsTeamsCard(zohoTicketId, { title, facts }) {
+  if (!CLOUDOPS_TEAMS_WEBHOOK_URL) return;
+
+  const card = {
+    type: 'AdaptiveCard',
+    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    version: '1.4',
+    body: [
+      { type: 'TextBlock', text: title, weight: 'Bolder', size: 'Medium', wrap: true },
+      { type: 'FactSet', facts: facts.map(f => ({ title: f.name, value: f.value })) }
+    ]
+  };
+
+  const url = ticketPortalUrl(zohoTicketId);
+  if (url) {
+    card.actions = [{ type: 'Action.OpenUrl', title: 'Open in Influx', url }];
+  }
+
+  try {
+    const res = await fetch(CLOUDOPS_TEAMS_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(card)
+    });
+    if (!res.ok) {
+      console.warn(`[Teams] Webhook post failed for ticket ${zohoTicketId}: ${res.status}`);
+    }
+  } catch (err) {
+    console.warn(`[Teams] Webhook post errored for ticket ${zohoTicketId}:`, err?.message || err);
+  }
+}
+
+async function notifyCloudOpsTeamsOnAssignment({
+  zohoTicketId,
+  zohoTicketNumber,
+  zohoDepartmentId,
+  assignedUsers = [],
+  assignedBy,
+  category,
+  isBulk = false
+}) {
+  if ((zohoDepartmentId || '') !== DEPARTMENT_IDS.itsm) return;
+
+  const ticketLabel = zohoTicketNumber ? `#${zohoTicketNumber}` : `#${zohoTicketId}`;
+  const assigneeText = assignedUsers.length ? assignedUsers.join(', ') : 'Unassigned';
+
+  await postCloudOpsTeamsCard(zohoTicketId, {
+    title: `🎫 Ticket ${ticketLabel} assigned${isBulk ? ' (bulk)' : ''}`,
+    facts: [
+      { name: 'Ticket', value: ticketLabel },
+      { name: 'Assigned To', value: assigneeText },
+      { name: 'Assigned By', value: assignedBy || 'Unknown' },
+      { name: 'Category', value: category || 'Uncategorized' }
+    ]
+  });
+}
+
+// New-ticket "arrival" notice — fires once per ticket, independent of whether
+// it's been assigned yet. See ticket_arrival_notifications / runCloudOpsAssignmentPoll.
+async function notifyCloudOpsTeamsOnNewTicket({
+  zohoTicketId,
+  zohoTicketNumber,
+  subject,
+  requesterEmail,
+  assigneeEmail,
+  category
+}) {
+  const ticketLabel = zohoTicketNumber ? `#${zohoTicketNumber}` : `#${zohoTicketId}`;
+
+  await postCloudOpsTeamsCard(zohoTicketId, {
+    title: `📥 New ticket ${ticketLabel}${subject ? `: ${subject}` : ''}`,
+    facts: [
+      { name: 'Ticket', value: ticketLabel },
+      { name: 'Requester', value: requesterEmail || 'Unknown' },
+      { name: 'Assigned To', value: assigneeEmail || 'Unassigned' },
+      { name: 'Category', value: category || 'Uncategorized' }
+    ]
+  });
+}
+
 let egressIpCache = { value: '', time: 0 };
 const EGRESS_IP_CACHE_MS = 10 * 60 * 1000;
 let egressIpLookupInFlight = null;
@@ -1939,10 +2084,12 @@ if (ENABLE_ALERT_JOBS) {
   // Startup + every 12 hours
   setTimeout(() => {
     processIhubAlerts();
+    processIhubCertificateAlerts();
     processSslAlerts();
     processAutomationSslAlerts();
   }, 15 * 1000);
   setInterval(processIhubAlerts, 12 * 60 * 60 * 1000);
+  setInterval(processIhubCertificateAlerts, 12 * 60 * 60 * 1000);
   setInterval(processSslAlerts, 12 * 60 * 60 * 1000);
   setInterval(processAutomationSslAlerts, 12 * 60 * 60 * 1000);
 } else {
@@ -2296,6 +2443,39 @@ function isAlertmanagerAuthorized(req) {
   if (!ALERTMANAGER_WEBHOOK_SECRET) return true;
   const provided = (req.headers['x-alertmanager-secret'] || '').toString().trim();
   return safeTokenEqual(provided, ALERTMANAGER_WEBHOOK_SECRET);
+}
+
+// Unlike the Alertmanager secret, this one is required — the endpoint it guards
+// writes to ticket_assignments and can be used to spoof a Teams post, so it must
+// not run open-by-default just because the env var was never set.
+function isZohoTicketWebhookAuthorized(req) {
+  if (!ZOHO_TICKET_WEBHOOK_SECRET) return false;
+  const provided = (req.headers['x-zoho-webhook-secret'] || req.query.secret || '').toString().trim();
+  return safeTokenEqual(provided, ZOHO_TICKET_WEBHOOK_SECRET);
+}
+
+// Assigning a ticket through this portal also PATCHes the assignee back to Zoho
+// (see /api/assignments and /api/assignments/bulk). If a Zoho workflow rule fires
+// on "assignee changed" and calls our webhook, that PATCH would echo straight back
+// here and double-post to Teams. This short-lived marker lets the webhook handler
+// recognize "we just did this ourselves" and skip the duplicate.
+const recentPortalAssignments = new Map(); // zohoTicketId -> timestamp
+const PORTAL_ECHO_WINDOW_MS = 60 * 1000;
+
+function markPortalAssignment(zohoTicketId) {
+  if (!zohoTicketId) return;
+  recentPortalAssignments.set(zohoTicketId.toString(), Date.now());
+  if (recentPortalAssignments.size > 500) {
+    const cutoff = Date.now() - PORTAL_ECHO_WINDOW_MS;
+    for (const [id, ts] of recentPortalAssignments) {
+      if (ts < cutoff) recentPortalAssignments.delete(id);
+    }
+  }
+}
+
+function isRecentPortalAssignment(zohoTicketId) {
+  const ts = recentPortalAssignments.get((zohoTicketId || '').toString());
+  return !!ts && (Date.now() - ts) < PORTAL_ECHO_WINDOW_MS;
 }
 
 function parseMilestoneDays(alert) {
@@ -2781,6 +2961,77 @@ app.post('/api/webhook/alertmanager', async (req, res) => {
   }
 });
 
+// Called by a Zoho Desk workflow rule whenever a ticket is assigned directly in
+// Zoho (i.e. not through this portal's Assign/Bulk Assign). Mirrors the
+// assignment into ticket_assignments — so the CloudOps dashboard/report counts
+// it too — and notifies the CloudOps Teams channel, same as portal assignments.
+// Requires ZOHO_TICKET_WEBHOOK_SECRET to be set; see setup notes in .env.
+app.post('/api/webhook/zoho-ticket-assigned', async (req, res) => {
+  if (!isZohoTicketWebhookAuthorized(req)) {
+    return res.status(401).json({ message: 'Invalid or missing webhook secret' });
+  }
+
+  try {
+    const {
+      ticketId,
+      ticketNumber,
+      departmentId,
+      assigneeEmail,
+      assignedByEmail,
+      category,
+      status
+    } = req.body || {};
+
+    const zohoTicketId = (ticketId || '').toString().trim();
+    const primaryAssignee = (assigneeEmail || '').toString().trim().toLowerCase();
+
+    if (!zohoTicketId || !primaryAssignee) {
+      return res.status(400).json({ message: 'ticketId and assigneeEmail are required' });
+    }
+
+    // Our own portal PATCHes the assignee back to Zoho on every assign/reassign,
+    // which would otherwise trigger this same Zoho workflow rule and double-post.
+    if (isRecentPortalAssignment(zohoTicketId)) {
+      return res.json({ message: 'Skipped — matches a recent portal-driven assignment' });
+    }
+
+    const normalizedDeptId = (departmentId || '').toString().trim() || null;
+    const normalizedCategory = (category || '').toString().trim() || null;
+    const normalizedAssignedBy = (assignedByEmail || '').toString().trim().toLowerCase() || 'zoho-desk';
+
+    await pool.query(
+      `INSERT INTO ticket_assignments
+        (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, status, category, zoho_department_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+         assigned_users = EXCLUDED.assigned_users,
+         primary_assignee = EXCLUDED.primary_assignee,
+         reassigned_user = ticket_assignments.primary_assignee,
+         reassigned_at = NOW(),
+         reassigned_by = EXCLUDED.assigned_by,
+         category = COALESCE(EXCLUDED.category, ticket_assignments.category),
+         zoho_department_id = COALESCE(EXCLUDED.zoho_department_id, ticket_assignments.zoho_department_id),
+         updated_at = NOW()`,
+      [zohoTicketId, ticketNumber || null, [primaryAssignee], primaryAssignee, normalizedAssignedBy, status || 'Open', normalizedCategory, normalizedDeptId]
+    );
+
+    notifyCloudOpsTeamsOnAssignment({
+      zohoTicketId,
+      zohoTicketNumber: ticketNumber,
+      zohoDepartmentId: normalizedDeptId,
+      assignedUsers: [primaryAssignee],
+      assignedBy: normalizedAssignedBy,
+      category: normalizedCategory
+    }).catch(() => {});
+
+    invalidateRuntimeCaches();
+    res.json({ message: 'Assignment recorded' });
+  } catch (err) {
+    console.error('Zoho ticket-assigned webhook failed:', err);
+    res.status(500).json({ message: 'Failed to process webhook' });
+  }
+});
+
 async function closeZohoTicketWithFallback(ticketId) {
   const closeTry = await zohoFetch(`/tickets/${ticketId}`, {
     method: 'PATCH',
@@ -2971,6 +3222,184 @@ async function processIhubAlerts() {
     }
   } catch (err) {
     console.error('IHUB alert processor failed:', err?.message || err);
+  }
+}
+
+async function upsertIhubCertificateAssignment(ticketId, ticketNumber, assigneeEmail) {
+  const normalizedEmail = (assigneeEmail || '').trim().toLowerCase();
+  if (!normalizedEmail) return;
+
+  await pool.query(
+    `INSERT INTO ticket_assignments
+      (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, zoho_department_id, status, category)
+     VALUES ($1, $2, $3, $4, $5, $6, 'Open', 'IHUB_CERTIFICATE')
+     ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+       assigned_users = EXCLUDED.assigned_users,
+       primary_assignee = EXCLUDED.primary_assignee,
+       reassigned_user = ticket_assignments.primary_assignee,
+       reassigned_at = NOW(),
+       reassigned_by = EXCLUDED.assigned_by,
+       category = 'IHUB_CERTIFICATE',
+       status = 'Open',
+       updated_at = NOW()`,
+    [
+      ticketId,
+      ticketNumber || null,
+      [normalizedEmail],
+      normalizedEmail,
+      'ihub-certificate-system',
+      ZOHO_DEPARTMENT_ID || null
+    ]
+  );
+}
+
+async function createIhubCertificateAlertTicket(asset, milestoneDays) {
+  const responsibleEmail = (asset.responsible_person_email || '').trim().toLowerCase();
+  console.log(`[IHUB CERTIFICATE] createIhubCertificateAlertTicket: Asset ${asset.id}, email="${responsibleEmail}"`);
+
+  if (!responsibleEmail) {
+    console.log(`[IHUB CERTIFICATE] createIhubCertificateAlertTicket: No responsible email for asset ${asset.id}, skipping`);
+    return;
+  }
+
+  const licenseExpiryOn = normalizeDateOnly(asset.license_expiry);
+  console.log(`[IHUB CERTIFICATE] Checking for existing alert: asset=${asset.id}, milestone=${milestoneDays}, expiry=${licenseExpiryOn}`);
+
+  // Reserve the alert row first to prevent concurrent runs from creating duplicate Zoho tickets.
+  const reservationTicketId = `IHUB-CERT-PENDING-${asset.id}-${milestoneDays}-${licenseExpiryOn}-${Date.now()}`;
+  const reservation = await pool.query(
+    `INSERT INTO ihub_certificate_alert_tickets
+      (ihub_certificate_asset_id, milestone_days, license_expiry_on, zoho_ticket_id, status)
+     VALUES ($1, $2, $3, $4, 'Pending')
+     ON CONFLICT (ihub_certificate_asset_id, milestone_days, license_expiry_on) DO NOTHING
+     RETURNING id`,
+    [asset.id, milestoneDays, licenseExpiryOn, reservationTicketId]
+  );
+
+  if (reservation.rows.length === 0) {
+    console.log(`[IHUB CERTIFICATE] Alert already exists for asset ${asset.id} at ${milestoneDays} days, skipping`);
+    return;
+  }
+
+  const alertRowId = reservation.rows[0].id;
+
+  const subject = `[IHUB Certificate] Certificate expiry in ${milestoneDays} day(s) - ${asset.client} (${asset.hostname})`;
+  const description = [
+    '<p><strong>IHUB Certificate Expiry Alert</strong></p>',
+    `<p>Certificate is due in <strong>${milestoneDays}</strong> day(s).</p>`,
+    `<p>Client: ${asset.client}</p>`,
+    `<p>Environment: ${asset.environment}</p>`,
+    `<p>Hostname: ${asset.hostname}</p>`,
+    `<p>IP Address: ${asset.ip_address}</p>`,
+    `<p>IHUB Version: ${asset.ihub_version || 'N/A'}</p>`,
+    `<p>Certificate Expiry: ${licenseExpiryOn}</p>`,
+    `<p>Responsible Person: ${responsibleEmail}</p>`
+  ].join('');
+
+  const payload = {
+    subject,
+    priority: priorityForIhubAndSslMilestone(milestoneDays),
+    status: 'Open',
+    // Zoho Desk's ticket category picklist only has 'IHUB' configured (Automation
+    // SSL similarly reuses the 'SSL' category) - subCategory + subject differentiate.
+    category: 'IHUB',
+    subCategory: 'Certificate Expiry',
+    description,
+    contact: {
+      lastName: asset.responsible_person_name || asset.client || 'IHUB Owner',
+      email: responsibleEmail
+    }
+  };
+
+  if (ZOHO_DEPARTMENT_ID) {
+    payload.departmentId = ZOHO_DEPARTMENT_ID;
+  }
+
+  const assigneeId = await lookupAgentIdByEmail(responsibleEmail);
+  if (assigneeId) {
+    payload.assigneeId = assigneeId;
+  }
+
+  console.log(`[IHUB CERTIFICATE] Creating Zoho ticket for asset ${asset.id}:`, subject);
+  let response = await zohoFetch('/tickets', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+
+  let data = await response.json().catch(() => null);
+
+  // If Zoho rejects assignee privileges, retry without assigneeId.
+  if (!response.ok && payload.assigneeId) {
+    const assigneeError = Array.isArray(data?.errors)
+      ? data.errors.find((e) => e?.fieldName === '/assigneeId')
+      : null;
+
+    if (assigneeError) {
+      console.warn(`[IHUB CERTIFICATE] Zoho rejected assigneeId for asset ${asset.id}, retrying without assigneeId`);
+      delete payload.assigneeId;
+      response = await zohoFetch('/tickets', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      data = await response.json().catch(() => null);
+    }
+  }
+
+  if (!response.ok || !data?.id) {
+    const errorMsg = data?.message || `IHUB Certificate alert ticket creation failed (${response.status})`;
+    console.error(`[IHUB CERTIFICATE] Zoho API error for asset ${asset.id}:`, errorMsg, data);
+
+    // Release reservation on failure so future runs can retry.
+    await pool.query(
+      `DELETE FROM ihub_certificate_alert_tickets
+       WHERE id = $1 AND status = 'Pending'`,
+      [alertRowId]
+    );
+
+    throw new Error(errorMsg);
+  }
+
+  console.log(`[IHUB CERTIFICATE] Zoho ticket created: ${data.id} (${data.ticketNumber})`);
+
+  await pool.query(
+    `UPDATE ihub_certificate_alert_tickets
+     SET zoho_ticket_id = $1,
+         zoho_ticket_number = $2,
+         status = 'Open'
+     WHERE id = $3`,
+    [data.id, data.ticketNumber || null, alertRowId]
+  );
+
+  console.log(`[IHUB CERTIFICATE] Alert ticket record created in DB for asset ${asset.id}`);
+
+  await upsertIhubCertificateAssignment(data.id, data.ticketNumber || null, responsibleEmail);
+  console.log(`[IHUB CERTIFICATE] Assignment created for asset ${asset.id}`);
+}
+
+async function processIhubCertificateAlerts() {
+  try {
+    const result = await pool.query('SELECT * FROM ihub_certificate_assets');
+    console.log(`[IHUB CERTIFICATE] Processing ${result.rows.length} assets for alert generation...`);
+
+    for (const asset of result.rows) {
+      const daysLeft = daysUntilDate(asset.license_expiry);
+      console.log(`[IHUB CERTIFICATE] Asset ${asset.id} (${asset.client}): ${daysLeft} days until expiry on ${asset.license_expiry}, email: ${asset.responsible_person_email}`);
+
+      if (!IHUB_CERTIFICATE_ALERT_MILESTONES.includes(daysLeft)) {
+        console.log(`[IHUB CERTIFICATE] Asset ${asset.id}: ${daysLeft} days not in milestones [${IHUB_CERTIFICATE_ALERT_MILESTONES.join(',')}], skipping`);
+        continue;
+      }
+
+      try {
+        console.log(`[IHUB CERTIFICATE] Creating alert ticket for asset ${asset.id} at ${daysLeft} day milestone`);
+        await createIhubCertificateAlertTicket(asset, daysLeft);
+        console.log(`[IHUB CERTIFICATE] Alert ticket created successfully for asset ${asset.id}`);
+      } catch (err) {
+        console.error(`IHUB Certificate alert generation failed for asset ${asset.id}:`, err?.message || err);
+      }
+    }
+  } catch (err) {
+    console.error('IHUB Certificate alert processor failed:', err?.message || err);
   }
 }
 
@@ -4938,6 +5367,194 @@ app.delete('/api/ihub/:id', authenticateToken, authorizeAdmin, async (req, res) 
 });
 
 // -------------------------------------------------------
+// IHUB CERTIFICATE API
+// -------------------------------------------------------
+
+app.get('/api/ihub-certificate', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+        a.*,
+        (a.license_expiry::date - CURRENT_DATE) AS days_to_expiry
+       FROM ihub_certificate_assets a
+       ORDER BY a.license_expiry ASC, a.client ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Failed to fetch IHUB Certificate assets:', err);
+    res.status(500).json({ message: 'Failed to fetch IHUB Certificate assets' });
+  }
+});
+
+app.post('/api/ihub-certificate', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const {
+      client,
+      environment,
+      hostname,
+      ip_address,
+      ihub_version,
+      license_expiry,
+      responsible_person_email,
+      responsible_person_name
+    } = req.body || {};
+
+    if (!client || !environment || !license_expiry || !responsible_person_email) {
+      return res.status(400).json({ message: 'Missing required IHUB Certificate fields' });
+    }
+
+    if (!isValidDateInput(license_expiry)) {
+      return res.status(400).json({ message: 'Invalid license expiry date' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO ihub_certificate_assets
+        (client, environment, hostname, ip_address, ihub_version, license_expiry, responsible_person_email, responsible_person_name, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+       RETURNING *`,
+      [
+        client,
+        environment,
+        hostname || '',
+        ip_address || '',
+        ihub_version || null,
+        normalizeDateOnly(license_expiry),
+        responsible_person_email.toLowerCase(),
+        responsible_person_name || null,
+        (req.user?.email || '').toLowerCase() || null
+      ]
+    );
+
+    await processIhubCertificateAlerts();
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to create IHUB Certificate asset:', err);
+    res.status(500).json({ message: 'Failed to create IHUB Certificate asset' });
+  }
+});
+
+app.put('/api/ihub-certificate/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const assetId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(assetId)) {
+      return res.status(400).json({ message: 'Invalid IHUB Certificate asset id' });
+    }
+
+    const {
+      client,
+      environment,
+      hostname,
+      ip_address,
+      ihub_version,
+      license_expiry,
+      responsible_person_email,
+      responsible_person_name
+    } = req.body || {};
+
+    if (!client || !environment || !license_expiry || !responsible_person_email) {
+      return res.status(400).json({ message: 'Missing required IHUB Certificate fields' });
+    }
+
+    if (!isValidDateInput(license_expiry)) {
+      return res.status(400).json({ message: 'Invalid license expiry date' });
+    }
+
+    const result = await pool.query(
+      `UPDATE ihub_certificate_assets SET
+         client = $1,
+         environment = $2,
+         hostname = $3,
+         ip_address = $4,
+         ihub_version = $5,
+         license_expiry = $6,
+         responsible_person_email = $7,
+         responsible_person_name = $8,
+         updated_by = $9,
+         updated_at = NOW()
+       WHERE id = $10
+       RETURNING *`,
+      [
+        client,
+        environment,
+        hostname || '',
+        ip_address || '',
+        ihub_version || null,
+        normalizeDateOnly(license_expiry),
+        responsible_person_email.toLowerCase(),
+        responsible_person_name || null,
+        (req.user?.email || '').toLowerCase() || null,
+        assetId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'IHUB Certificate asset not found' });
+    }
+
+    await pool.query(
+      `UPDATE ihub_certificate_alert_tickets
+       SET status = 'Superseded', closed_at = NOW()
+       WHERE ihub_certificate_asset_id = $1 AND status = 'Open'`,
+      [assetId]
+    );
+
+    await processIhubCertificateAlerts();
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update IHUB Certificate asset:', err);
+    res.status(500).json({ message: 'Failed to update IHUB Certificate asset' });
+  }
+});
+
+app.delete('/api/ihub-certificate/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const assetId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(assetId)) {
+      return res.status(400).json({ message: 'Invalid IHUB Certificate asset id' });
+    }
+
+    const existingAsset = await pool.query(
+      'SELECT id FROM ihub_certificate_assets WHERE id = $1 LIMIT 1',
+      [assetId]
+    );
+
+    if (existingAsset.rows.length === 0) {
+      return res.status(404).json({ message: 'IHUB Certificate asset not found' });
+    }
+
+    const alertTicketIdsResult = await pool.query(
+      `SELECT zoho_ticket_id
+       FROM ihub_certificate_alert_tickets
+       WHERE ihub_certificate_asset_id = $1`,
+      [assetId]
+    );
+    const alertTicketIds = alertTicketIdsResult.rows
+      .map(r => r.zoho_ticket_id)
+      .filter(Boolean);
+
+    await pool.query('DELETE FROM ihub_certificate_assets WHERE id = $1', [assetId]);
+
+    if (alertTicketIds.length > 0) {
+      await pool.query(
+        `UPDATE ticket_assignments
+         SET status = 'Closed',
+             closed_at = NOW(),
+             closed_by = $1,
+             updated_at = NOW()
+         WHERE zoho_ticket_id = ANY($2::text[])
+           AND category = 'IHUB_CERTIFICATE'`,
+        [(req.user?.email || '').toLowerCase() || null, alertTicketIds]
+      );
+    }
+
+    res.json({ message: 'IHUB Certificate asset deleted successfully' });
+  } catch (err) {
+    console.error('Failed to delete IHUB Certificate asset:', err);
+    res.status(500).json({ message: 'Failed to delete IHUB Certificate asset' });
+  }
+});
+
+// -------------------------------------------------------
 // SSL API
 // -------------------------------------------------------
 
@@ -5361,6 +5978,16 @@ app.post('/api/ihub/run-expiry-check', authenticateToken, authorizeAdmin, async 
   }
 });
 
+app.post('/api/ihub-certificate/run-expiry-check', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    await processIhubCertificateAlerts();
+    res.json({ message: 'Expiry check completed successfully' });
+  } catch (err) {
+    console.error('Failed to run expiry check:', err);
+    res.status(500).json({ message: 'Expiry check failed' });
+  }
+});
+
 app.post('/api/ihub/tickets/:zohoTicketId/close', authenticateToken, async (req, res) => {
   try {
     const ticketId = req.params.zohoTicketId;
@@ -5446,6 +6073,94 @@ app.post('/api/ihub/tickets/:zohoTicketId/close', authenticateToken, async (req,
   } catch (err) {
     console.error('Failed to close IHUB ticket:', err);
     return res.status(500).json({ message: 'Failed to close IHUB ticket' });
+  }
+});
+
+app.post('/api/ihub-certificate/tickets/:zohoTicketId/close', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = req.params.zohoTicketId;
+    const newExpiryDate = req.body?.new_expiry_date;
+    const userEmail = (req.user?.email || '').toLowerCase();
+    const isAdmin = req.user?.role === 'admin';
+
+    if (!isValidDateInput(newExpiryDate)) {
+      return res.status(400).json({ message: 'Valid new_expiry_date is required' });
+    }
+
+    const assignmentResult = await pool.query(
+      `SELECT * FROM ticket_assignments WHERE zoho_ticket_id = $1 LIMIT 1`,
+      [ticketId]
+    );
+    const assignment = assignmentResult.rows[0];
+
+    if (!assignment || (assignment.category || '').toUpperCase() !== 'IHUB_CERTIFICATE') {
+      return res.status(404).json({ message: 'IHUB Certificate ticket assignment not found' });
+    }
+
+    const assignedUsers = Array.isArray(assignment.assigned_users)
+      ? assignment.assigned_users.map(u => (u || '').toLowerCase())
+      : [];
+
+    if (!isAdmin && !assignedUsers.includes(userEmail)) {
+      return res.status(403).json({ message: 'Only responsible person or admin can close IHUB Certificate ticket' });
+    }
+
+    const alertResult = await pool.query(
+      `SELECT * FROM ihub_certificate_alert_tickets WHERE zoho_ticket_id = $1 LIMIT 1`,
+      [ticketId]
+    );
+    const alert = alertResult.rows[0];
+
+    if (!alert) {
+      return res.status(404).json({ message: 'IHUB Certificate alert record not found for this ticket' });
+    }
+
+    const closedInZoho = await closeZohoTicketWithFallback(ticketId);
+    if (!closedInZoho) {
+      return res.status(502).json({ message: 'Failed to close ticket in Zoho' });
+    }
+
+    const normalizedDate = normalizeDateOnly(newExpiryDate);
+
+    await pool.query(
+      `UPDATE ihub_certificate_assets
+       SET license_expiry = $1,
+           updated_by = $2,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [normalizedDate, userEmail || null, alert.ihub_certificate_asset_id]
+    );
+
+    await pool.query(
+      `UPDATE ihub_certificate_alert_tickets
+       SET status = 'Closed', closed_at = NOW()
+       WHERE zoho_ticket_id = $1`,
+      [ticketId]
+    );
+
+    await pool.query(
+      `UPDATE ihub_certificate_alert_tickets
+       SET status = 'Superseded', closed_at = NOW()
+       WHERE ihub_certificate_asset_id = $1 AND status = 'Open'`,
+      [alert.ihub_certificate_asset_id]
+    );
+
+    await pool.query(
+      `UPDATE ticket_assignments
+       SET status = 'Closed', closed_at = NOW(), closed_by = $1, updated_at = NOW()
+       WHERE zoho_ticket_id = $2`,
+      [userEmail || null, ticketId]
+    );
+
+    await processIhubCertificateAlerts();
+
+    return res.json({
+      message: 'IHUB Certificate ticket closed and license expiry updated',
+      license_expiry: normalizedDate
+    });
+  } catch (err) {
+    console.error('Failed to close IHUB Certificate ticket:', err);
+    return res.status(500).json({ message: 'Failed to close IHUB Certificate ticket' });
   }
 });
 
@@ -5588,6 +6303,16 @@ app.post("/api/assignments", authenticateToken, async (req, res) => {
       // Don't fail the request, Supabase record is created
     }
 
+    markPortalAssignment(zoho_ticket_id);
+    notifyCloudOpsTeamsOnAssignment({
+      zohoTicketId: zoho_ticket_id,
+      zohoTicketNumber: zoho_ticket_number,
+      zohoDepartmentId: zoho_department_id,
+      assignedUsers: normalizedUsers,
+      assignedBy: assigned_by,
+      category
+    }).catch(() => {});
+
     invalidateRuntimeCaches();
     res.json(result.rows[0]);
   } catch (err) {
@@ -5649,6 +6374,11 @@ app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
       // Silently fail; DB record is primary source of truth
     }
 
+    // This PATCH can trigger the Zoho-side workflow rule that calls our
+    // ticket-assigned webhook — mark it so that handler treats it as an echo
+    // of our own action rather than a fresh Zoho-side assignment.
+    markPortalAssignment(zoho_ticket_id);
+
     invalidateRuntimeCaches();
     res.json(result.rows[0]);
   } catch (err) {
@@ -5660,7 +6390,7 @@ app.put("/api/assignments/reassign", authenticateToken, async (req, res) => {
 // Bulk assign (round-robin distribution)
 app.post("/api/assignments/bulk", authenticateToken, async (req, res) => {
   try {
-    const { ticket_ids, assigned_users, assigned_by, ticket_categories } = req.body;
+    const { ticket_ids, assigned_users, assigned_by, ticket_categories, ticket_department_ids } = req.body;
 
     if (!ticket_ids || ticket_ids.length === 0 || !assigned_users || assigned_users.length === 0 || !assigned_by) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -5678,11 +6408,12 @@ app.post("/api/assignments/bulk", authenticateToken, async (req, res) => {
 
       try {
         const category = ticket_categories?.[ticketId] || null;
+        const departmentId = ticket_department_ids?.[ticketId] || null;
         // Insert/update assignment
         await pool.query(
-          `INSERT INTO ticket_assignments 
-            (zoho_ticket_id, assigned_users, primary_assignee, assigned_by, status, category)
-           VALUES ($1, $2, $3, $4, 'Open', $5)
+          `INSERT INTO ticket_assignments
+            (zoho_ticket_id, assigned_users, primary_assignee, assigned_by, status, category, zoho_department_id)
+           VALUES ($1, $2, $3, $4, 'Open', $5, $6)
            ON CONFLICT (zoho_ticket_id) DO UPDATE SET
              assigned_users = EXCLUDED.assigned_users,
              primary_assignee = EXCLUDED.primary_assignee,
@@ -5690,8 +6421,9 @@ app.post("/api/assignments/bulk", authenticateToken, async (req, res) => {
              reassigned_at = NOW(),
              reassigned_by = EXCLUDED.assigned_by,
              category = COALESCE(EXCLUDED.category, ticket_assignments.category),
+             zoho_department_id = COALESCE(EXCLUDED.zoho_department_id, ticket_assignments.zoho_department_id),
              updated_at = NOW()`,
-          [ticketId, [primaryAssignee], primaryAssignee, assigned_by.toLowerCase(), category]
+          [ticketId, [primaryAssignee], primaryAssignee, assigned_by.toLowerCase(), category, departmentId]
         );
 
         // Sync to Zoho
@@ -5706,6 +6438,16 @@ app.post("/api/assignments/bulk", authenticateToken, async (req, res) => {
         } catch (zohoErr) {
           console.error(`Failed to sync ticket ${ticketId} to Zoho:`, zohoErr);
         }
+
+        markPortalAssignment(ticketId);
+        notifyCloudOpsTeamsOnAssignment({
+          zohoTicketId: ticketId,
+          zohoDepartmentId: departmentId,
+          assignedUsers: [primaryAssignee],
+          assignedBy: assigned_by,
+          category,
+          isBulk: true
+        }).catch(() => {});
 
         success.push(ticketId);
       } catch (err) {
@@ -6131,14 +6873,20 @@ function extractCategoryFromZohoTicket(rawTicket) {
   return '';
 }
 
-// Admin: backfill categories from Zoho for assignments that are NULL/Uncategorized
+// Admin: backfill categories AND department ids from Zoho for assignments that are
+// missing either. Historically, ticket assignment (single + bulk) never recorded
+// zoho_department_id, so department-scoped reports (e.g. the CloudOps dashboard)
+// silently excluded those rows via `WHERE zoho_department_id = ANY(...)`. This
+// shares one Zoho fetch per ticket to fix both fields without doubling API calls.
 app.post("/api/admin/backfill-categories", authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT zoho_ticket_id FROM ticket_assignments
+      `SELECT zoho_ticket_id, category, zoho_department_id FROM ticket_assignments
        WHERE category IS NULL
           OR TRIM(category) = ''
           OR LOWER(TRIM(category)) IN ('uncategorized', 'uncategorised', 'uncategory')
+          OR zoho_department_id IS NULL
+          OR TRIM(zoho_department_id) = ''
        ORDER BY assigned_at DESC`
     );
 
@@ -6151,12 +6899,24 @@ app.post("/api/admin/backfill-categories", authenticateToken, authorizeAdmin, as
         const ticketRes = await zohoFetch(`/tickets/${row.zoho_ticket_id}`);
         if (!ticketRes.ok) { failed++; continue; }
         const ticket = await ticketRes.json();
-        const category = extractCategoryFromZohoTicket(ticket);
-        if (!category) { failed++; continue; }
+
+        const currentCategory = (row.category || '').trim();
+        const needsCategory = !currentCategory
+          || ['uncategorized', 'uncategorised', 'uncategory'].includes(currentCategory.toLowerCase());
+        const category = needsCategory ? extractCategoryFromZohoTicket(ticket) : currentCategory;
+
+        const needsDepartmentId = !(row.zoho_department_id || '').trim();
+        const departmentId = needsDepartmentId ? extractTicketDepartmentId(ticket) : row.zoho_department_id;
+
+        if (!category && !departmentId) { failed++; continue; }
 
         await pool.query(
-          `UPDATE ticket_assignments SET category = $1, updated_at = NOW() WHERE zoho_ticket_id = $2`,
-          [category, row.zoho_ticket_id]
+          `UPDATE ticket_assignments SET
+             category = COALESCE(NULLIF($1, ''), category),
+             zoho_department_id = COALESCE(NULLIF($2, ''), zoho_department_id),
+             updated_at = NOW()
+           WHERE zoho_ticket_id = $3`,
+          [category || '', departmentId || '', row.zoho_ticket_id]
         );
         updated++;
       } catch (innerErr) {
@@ -7030,6 +7790,149 @@ async function runPresenceSync() {
   } catch (e) { /* skip cycle */ }
 }
 
+// Periodic CloudOps assignment poll — replaces the need for a Zoho Desk workflow
+// rule. Scans the CloudOps department's most-recently-modified tickets, and for
+// any whose assignee isn't yet reflected in ticket_assignments (assigned/reassigned
+// directly in Zoho Desk, not through this portal), mirrors it into our DB and
+// notifies the CloudOps Teams channel — same handling as portal assignments.
+let cloudOpsAssignmentPollTimer = null;
+const CLOUDOPS_POLL_PAGE_SIZE = 100;
+const CLOUDOPS_POLL_MAX_PAGES = 3;
+
+async function runCloudOpsAssignmentPoll() {
+  const deptId = DEPARTMENT_IDS.itsm;
+  if (!deptId) return;
+
+  try {
+    const tickets = [];
+    for (let page = 0; page < CLOUDOPS_POLL_MAX_PAGES; page++) {
+      const from = page * CLOUDOPS_POLL_PAGE_SIZE;
+      const res = await zohoFetch(
+        `/tickets?limit=${CLOUDOPS_POLL_PAGE_SIZE}&from=${from}&departmentId=${deptId}&sortBy=-modifiedTime&include=contacts,assignee`
+      );
+      if (!res.ok) break;
+      const data = await res.json();
+      const batch = Array.isArray(data?.data) ? data.data : [];
+      tickets.push(...batch);
+      if (batch.length < CLOUDOPS_POLL_PAGE_SIZE) break;
+    }
+    if (!tickets.length) return;
+
+    const ticketIds = tickets.map(t => (t.id || '').toString()).filter(Boolean);
+    const now = Date.now();
+    // Only ping Teams for things that actually just happened. A ticket assigned
+    // (or created) in Zoho weeks ago that we're only now discovering (because it
+    // never went through the portal) is backlog to record quietly, not a live event.
+    const NOTIFY_RECENCY_MS = 20 * 60 * 1000;
+
+    // ── New-ticket "arrival" pass — fires once per ticket regardless of assignee ──
+    const arrivalRes = await pool.query(
+      `SELECT zoho_ticket_id FROM ticket_arrival_notifications WHERE zoho_ticket_id = ANY($1)`,
+      [ticketIds]
+    );
+    const knownArrivals = new Set(arrivalRes.rows.map(r => r.zoho_ticket_id));
+
+    for (const t of tickets) {
+      const zohoTicketId = (t.id || '').toString();
+      if (!zohoTicketId || knownArrivals.has(zohoTicketId)) continue;
+
+      try {
+        await pool.query(
+          `INSERT INTO ticket_arrival_notifications (zoho_ticket_id, zoho_department_id) VALUES ($1, $2)
+           ON CONFLICT (zoho_ticket_id) DO NOTHING`,
+          [zohoTicketId, deptId]
+        );
+
+        const createdRaw = t.createdTime || t.modifiedTime || null;
+        const createdDate = createdRaw && !Number.isNaN(new Date(createdRaw).getTime()) ? new Date(createdRaw) : null;
+        const isRecentlyCreated = createdDate && (now - createdDate.getTime()) < NOTIFY_RECENCY_MS;
+
+        if (isRecentlyCreated) {
+          const requesterEmail = (t.email || t.contact?.email || t.contact?.emailAddress || '').toString().trim().toLowerCase();
+          const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toString().trim().toLowerCase();
+          notifyCloudOpsTeamsOnNewTicket({
+            zohoTicketId,
+            zohoTicketNumber: t.ticketNumber,
+            subject: t.subject,
+            requesterEmail,
+            assigneeEmail,
+            category: extractCategoryFromZohoTicket(t) || null
+          }).catch(() => {});
+        }
+      } catch (err) {
+        console.error(`[CloudOps poll] Failed to record arrival for ${zohoTicketId}:`, err?.message || err);
+      }
+    }
+
+    // ── Assignment pass — existing logic, unchanged ──
+    const existingRes = await pool.query(
+      `SELECT zoho_ticket_id, primary_assignee FROM ticket_assignments WHERE zoho_ticket_id = ANY($1)`,
+      [ticketIds]
+    );
+    const knownAssignee = new Map(existingRes.rows.map(r => [r.zoho_ticket_id, (r.primary_assignee || '').toLowerCase()]));
+
+    for (const t of tickets) {
+      const zohoTicketId = (t.id || '').toString();
+      const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toString().trim().toLowerCase();
+      if (!zohoTicketId || !assigneeEmail) continue;
+      if (isRecentPortalAssignment(zohoTicketId)) continue;
+
+      const isNewDiscovery = !knownAssignee.has(zohoTicketId);
+      const previousAssignee = knownAssignee.get(zohoTicketId);
+      if (!isNewDiscovery && previousAssignee === assigneeEmail) continue; // already known — nothing changed
+
+      const assignedBy = (t.modifiedBy?.email || t.modifiedBy?.emailId || '').toString().trim().toLowerCase() || 'zoho-desk';
+      const category = extractCategoryFromZohoTicket(t) || null;
+
+      // Ground truth for "when did this happen" comes from Zoho's own timestamps,
+      // never from our poll time — otherwise every backlog ticket we discover
+      // today gets misdated as "assigned today".
+      const rawTimestamp = t.modifiedTime || t.createdTime || null;
+      const assignedAtDate = rawTimestamp && !Number.isNaN(new Date(rawTimestamp).getTime())
+        ? new Date(rawTimestamp)
+        : new Date();
+      const isRecentEvent = (now - assignedAtDate.getTime()) < NOTIFY_RECENCY_MS;
+      const isReassignment = !isNewDiscovery && previousAssignee !== assigneeEmail;
+
+      try {
+        await pool.query(
+          `INSERT INTO ticket_assignments
+            (zoho_ticket_id, zoho_ticket_number, assigned_users, primary_assignee, assigned_by, status, category, zoho_department_id, assigned_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (zoho_ticket_id) DO UPDATE SET
+             assigned_users = EXCLUDED.assigned_users,
+             primary_assignee = EXCLUDED.primary_assignee,
+             reassigned_user = ticket_assignments.primary_assignee,
+             reassigned_at = NOW(),
+             reassigned_by = EXCLUDED.assigned_by,
+             category = COALESCE(ticket_assignments.category, EXCLUDED.category),
+             zoho_department_id = COALESCE(ticket_assignments.zoho_department_id, EXCLUDED.zoho_department_id),
+             updated_at = NOW()`,
+          [zohoTicketId, t.ticketNumber || null, [assigneeEmail], assigneeEmail, assignedBy, t.status || 'Open', category, deptId, assignedAtDate.toISOString()]
+        );
+
+        if (isReassignment || (isNewDiscovery && isRecentEvent)) {
+          notifyCloudOpsTeamsOnAssignment({
+            zohoTicketId,
+            zohoTicketNumber: t.ticketNumber,
+            zohoDepartmentId: deptId,
+            assignedUsers: [assigneeEmail],
+            assignedBy,
+            category,
+            isBulk: false
+          }).catch(() => {});
+        }
+
+        invalidateRuntimeCaches();
+      } catch (err) {
+        console.error(`[CloudOps poll] Failed to record assignment for ${zohoTicketId}:`, err?.message || err);
+      }
+    }
+  } catch (err) {
+    console.error('[CloudOps poll] Cycle failed:', err?.message || err);
+  }
+}
+
 // ------------------------
 // Start server
 // ------------------------
@@ -7041,6 +7944,16 @@ app.listen(PORT, () => {
   // Schedule automatic presence sync every 15 minutes
   runPresenceSync().catch(() => {});
   presenceSyncTimer = setInterval(() => runPresenceSync().catch(() => {}), 15 * 60 * 1000).unref();
+
+  // Poll for CloudOps ticket assignments made directly in Zoho Desk every 5 minutes.
+  // Gated by ENABLE_ALERT_JOBS — production runs this app as multiple replicas
+  // (see zoho-itsm Deployment) plus one dedicated zoho-itsm-scheduler replica for
+  // single-instance jobs. Running unconditionally here would poll Zoho and post
+  // to Teams once per replica in parallel, duplicating every notification.
+  if (ENABLE_ALERT_JOBS) {
+    runCloudOpsAssignmentPoll().catch(() => {});
+    cloudOpsAssignmentPollTimer = setInterval(() => runCloudOpsAssignmentPoll().catch(() => {}), 5 * 60 * 1000).unref();
+  }
 
   // Per-user counts caches are warmed on each user's first dashboard request
   // via the SWR pattern. No shared pre-warm needed (it caused wrong 0-counts

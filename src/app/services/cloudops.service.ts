@@ -82,7 +82,7 @@ export class CloudOpsService {
   constructor(private http: HttpClient) {}
 
   private getAuthHeaders(graphToken?: string): HttpHeaders {
-    const token = sessionStorage.getItem('accessToken') || '';
+    const token = localStorage.getItem('accessToken') || '';
     let headers = new HttpHeaders({ Authorization: `Bearer ${token}` });
     if (graphToken) {
       headers = headers.set('x-graph-token', graphToken);

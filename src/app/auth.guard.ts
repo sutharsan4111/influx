@@ -1,5 +1,5 @@
 import { Injectable, Inject } from '@angular/core';
-import { CanActivate, Router, UrlTree } from '@angular/router';
+import { CanActivate, Router, RouterStateSnapshot, UrlTree } from '@angular/router';
 import { PublicClientApplication } from '@azure/msal-browser';
 
 @Injectable({ providedIn: 'root' })
@@ -10,11 +10,11 @@ export class AuthGuard implements CanActivate {
     private router: Router
   ) {}
 
-  canActivate(): boolean {
-  const token = sessionStorage.getItem('accessToken');
+  canActivate(_route: unknown, state: RouterStateSnapshot): boolean {
+  const token = localStorage.getItem('accessToken');
 
   if (!token) {
-    this.router.navigate(['/login']);
+    this.router.navigate(['/login'], { queryParams: { returnUrl: state.url } });
     return false;
   }
 

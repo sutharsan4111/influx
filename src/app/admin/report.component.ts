@@ -91,8 +91,8 @@ type ReportPeriod = 'custom' | 'monthly' | 'quarterly' | 'halfyearly' | 'annual'
       <div class="notice warn" *ngIf="!isAdmin">You do not have access to this report.</div>
       <div class="notice err"  *ngIf="error && isAdmin">{{ error }}</div>
       <div class="notice info" *ngIf="backfillResult">
-        Categories updated — <strong>{{ backfillResult.updated }}</strong> fixed,
-        {{ backfillResult.failed }} skipped out of {{ backfillResult.total }}.
+        Ticket data repaired — <strong>{{ backfillResult.updated }}</strong> fixed,
+        {{ backfillResult.failed }} skipped out of {{ backfillResult.total }}. The report above now reflects the corrected numbers.
       </div>
 
       <!-- ── Spinner ── -->
@@ -1271,7 +1271,7 @@ export class ReportComponent implements OnInit, AfterViewInit {
   ];
 
   get isAdmin(): boolean {
-    const role = (sessionStorage.getItem('role') || '').toLowerCase();
+    const role = (localStorage.getItem('role') || '').toLowerCase();
     const elevated = new Set(['admin', 'cloudops', 'itsm', 'product', 'hr', 'support', 'muraai']);
     return elevated.has(role);
   }
@@ -1712,7 +1712,12 @@ export class ReportComponent implements OnInit, AfterViewInit {
     this.avgResolutionHours = allResolutionHours.length > 0
       ? Math.round(allResolutionHours.reduce((a, b) => a + b, 0) / allResolutionHours.length * 10) / 10 : 0;
 
-    this.openBacklog = details.filter(d => (d.status || '').toLowerCase() === 'open').length;
+    // Open Backlog must be the complement of "closed" (closedCount) within this
+    // period's tickets so Total Tickets = Open Backlog + Closed always reconciles.
+    // A raw status==='open' filter undercounts whenever a ticket is closed by
+    // status but missing valid assigned_at/closed_at data (excluded from
+    // closedCount too), silently dropping it from both buckets.
+    this.openBacklog = details.length - this.closedCount;
 
     const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     const peakHourEntry = Array.from(hourMap.entries()).sort((a, b) => b[1] - a[1])[0];

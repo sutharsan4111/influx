@@ -611,7 +611,7 @@ export class SslComponent implements OnInit {
   ) {}
 
   async ngOnInit(): Promise<void> {
-    const role = (sessionStorage.getItem('role') || '').toLowerCase();
+    const role = (localStorage.getItem('role') || '').toLowerCase();
     if (role !== 'admin' && role !== 'cloudops') {
       this.router.navigate(['/dashboard']);
       return;

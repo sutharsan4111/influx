@@ -46,6 +46,7 @@ export interface BulkAssignPayload {
   assigned_users: string[];
   assigned_by: string;
   ticket_categories?: Record<string, string>;
+  ticket_department_ids?: Record<string, string>;
 }
 
 export interface GroupMember {
@@ -65,7 +66,7 @@ export class AssignmentService {
   constructor(private http: HttpClient) {}
 
   private getAuthHeaders(): HttpHeaders {
-    const token = sessionStorage.getItem('accessToken');
+    const token = localStorage.getItem('accessToken');
     return new HttpHeaders({
       Authorization: `Bearer ${token || ''}`
     });
