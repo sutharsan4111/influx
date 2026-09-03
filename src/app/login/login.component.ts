@@ -436,7 +436,10 @@ export class LoginComponent implements OnInit {
     } else if (normalized === 'admin') {
       this.router.navigate(['/tickets'], { queryParams: { tab: 'overview' } });
     } else {
-      this.router.navigate(['/tickets'], { queryParams: { tab: 'my' } });
+      // Non-admin, non-CloudOps roles (user/product/hr/support/muraai) have no
+      // dashboard of their own - land them on Features instead of dropping
+      // them straight into their ticket list with no orientation.
+      this.router.navigate(['/features']);
     }
   }
 

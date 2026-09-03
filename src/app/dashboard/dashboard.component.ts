@@ -1183,13 +1183,16 @@ export class DashboardComponent implements OnInit, OnDestroy, OnChanges {
     this.initUserInfo();
 
     // The standalone /dashboard route is CloudOps-only. Admins land on the
-    // Tickets "Overview" tab instead (still embeds this component), and
-    // everyone else lands on their own "My Tickets" view.
+    // Tickets "Overview" tab instead (still embeds this component). Everyone
+    // else has no dashboard of their own, so they land on Features instead.
     if (!this.isEmbeddedMode) {
       const isCloudOpsRole = this.userRole === 'cloudops' || this.userRole === 'itsm';
       if (!isCloudOpsRole) {
-        const tab = this.userRole === 'admin' ? 'overview' : 'my';
-        this.router.navigate(['/tickets'], { queryParams: { tab } });
+        if (this.userRole === 'admin') {
+          this.router.navigate(['/tickets'], { queryParams: { tab: 'overview' } });
+        } else {
+          this.router.navigate(['/features']);
+        }
         return;
       }
     }
