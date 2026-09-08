@@ -608,6 +608,66 @@ async function runMigrations() {
       )
     `);
 
+    // CloudOps Assets pages (Master Page, Rental Laptop, and custom pages)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_asset_pages (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        display_name VARCHAR(255) NOT NULL,
+        description TEXT,
+        is_system_page BOOLEAN NOT NULL DEFAULT FALSE,
+        page_order INTEGER NOT NULL DEFAULT 0,
+        created_by VARCHAR(255),
+        updated_by VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        UNIQUE(name)
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_asset_page_columns (
+        id SERIAL PRIMARY KEY,
+        page_id INTEGER NOT NULL REFERENCES cloudops_asset_pages(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        display_name VARCHAR(255) NOT NULL,
+        data_type VARCHAR(50) NOT NULL DEFAULT 'text',
+        column_order INTEGER NOT NULL DEFAULT 0,
+        is_required BOOLEAN NOT NULL DEFAULT FALSE,
+        default_value TEXT,
+        select_options JSONB,
+        validation_regex TEXT,
+        is_visible BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by VARCHAR(255),
+        updated_by VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        UNIQUE(page_id, name)
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cloudops_asset_page_rows (
+        id SERIAL PRIMARY KEY,
+        page_id INTEGER NOT NULL REFERENCES cloudops_asset_pages(id) ON DELETE CASCADE,
+        row_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+        row_order INTEGER NOT NULL DEFAULT 0,
+        created_by VARCHAR(255),
+        updated_by VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_cloudops_asset_pages_is_system ON cloudops_asset_pages(is_system_page);
+      CREATE INDEX IF NOT EXISTS idx_cloudops_asset_pages_order ON cloudops_asset_pages(page_order);
+      CREATE INDEX IF NOT EXISTS idx_cloudops_asset_page_columns_page_id ON cloudops_asset_page_columns(page_id);
+      CREATE INDEX IF NOT EXISTS idx_cloudops_asset_page_columns_order ON cloudops_asset_page_columns(page_id, column_order);
+      CREATE INDEX IF NOT EXISTS idx_cloudops_asset_page_rows_page_id ON cloudops_asset_page_rows(page_id);
+      CREATE INDEX IF NOT EXISTS idx_cloudops_asset_page_rows_order ON cloudops_asset_page_rows(page_id, row_order);
+    `);
+    // No default pages are seeded — CloudOps users create their own asset pages from scratch.
+    // Remove any default pages seeded by earlier versions of this app.
+    await pool.query(`DELETE FROM cloudops_asset_pages WHERE name IN ('master', 'rental-laptop', 'issued-laptop') AND is_system_page = TRUE`);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS project_workspace_projects (
         id SERIAL PRIMARY KEY,
@@ -8690,6 +8750,590 @@ app.get('/api/cloudops/stats', authenticateToken, authorizeAdmin, async (req, re
   } catch (err) {
     console.error('Failed to fetch project stats:', err);
     res.status(500).json({ message: 'Failed to fetch project stats' });
+  }
+});
+
+// ============================================================
+// CLOUDOPS ASSETS PAGES API
+// ============================================================
+
+// Get all asset pages (with columns and row counts)
+app.get('/api/cloudops/assets/pages', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pagesResult = await pool.query(`
+      SELECT p.*,
+        (SELECT COUNT(*) FROM cloudops_asset_page_columns c WHERE c.page_id = p.id) AS column_count,
+        (SELECT COUNT(*) FROM cloudops_asset_page_rows r WHERE r.page_id = p.id) AS row_count
+      FROM cloudops_asset_pages p
+      ORDER BY p.page_order ASC, p.display_name ASC
+    `);
+    
+    // Get columns for each page
+    for (const page of pagesResult.rows) {
+      const columnsResult = await pool.query(`
+        SELECT * FROM cloudops_asset_page_columns 
+        WHERE page_id = $1 
+        ORDER BY column_order ASC
+      `, [page.id]);
+      page.columns = columnsResult.rows;
+    }
+    
+    res.json(pagesResult.rows);
+  } catch (err) {
+    console.error('Failed to fetch asset pages:', err);
+    res.status(500).json({ message: 'Failed to fetch asset pages' });
+  }
+});
+
+// Get single asset page with full details (columns + rows)
+app.get('/api/cloudops/assets/pages/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const pageResult = await pool.query('SELECT * FROM cloudops_asset_pages WHERE id = $1', [pageId]);
+    if (pageResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+    const page = pageResult.rows[0];
+
+    const columnsResult = await pool.query(`
+      SELECT * FROM cloudops_asset_page_columns 
+      WHERE page_id = $1 
+      ORDER BY column_order ASC
+    `, [pageId]);
+    page.columns = columnsResult.rows;
+
+    const rowsResult = await pool.query(`
+      SELECT * FROM cloudops_asset_page_rows 
+      WHERE page_id = $1 
+      ORDER BY row_order ASC, created_at ASC
+    `, [pageId]);
+    page.rows = rowsResult.rows;
+
+    res.json(page);
+  } catch (err) {
+    console.error('Failed to fetch asset page:', err);
+    res.status(500).json({ message: 'Failed to fetch asset page' });
+  }
+});
+
+// Create new asset page (custom page)
+app.post('/api/cloudops/assets/pages', authenticateToken, authorizeAdmin, async (req, res) => {
+  const { name, display_name, description, columns } = req.body || {};
+  
+  if (!name || !name.trim()) {
+    return res.status(400).json({ message: 'Page name is required' });
+  }
+  if (!display_name || !display_name.trim()) {
+    return res.status(400).json({ message: 'Display name is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Get max page_order
+    const orderResult = await client.query('SELECT COALESCE(MAX(page_order), 0) + 1 AS next_order FROM cloudops_asset_pages');
+    const nextOrder = parseInt(orderResult.rows[0]?.next_order || '1', 10);
+
+    const pageResult = await client.query(
+      `INSERT INTO cloudops_asset_pages (name, display_name, description, is_system_page, page_order, created_by, updated_by)
+       VALUES ($1, $2, $3, FALSE, $4, $5, $5) RETURNING *`,
+      [
+        name.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+        display_name.trim(),
+        (description || '').trim(),
+        nextOrder,
+        (req.user?.email || '').toLowerCase()
+      ]
+    );
+    const page = pageResult.rows[0];
+
+    // Create columns if provided
+    if (Array.isArray(columns) && columns.length > 0) {
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
+        if (!col.name || !col.display_name) continue;
+        
+        await client.query(
+          `INSERT INTO cloudops_asset_page_columns (page_id, name, display_name, data_type, column_order, is_required, default_value, select_options, validation_regex, is_visible, created_by, updated_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
+          [
+            page.id,
+            col.name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+            col.display_name.trim(),
+            col.data_type || 'text',
+            i + 1,
+            col.is_required || false,
+            col.default_value || null,
+            col.select_options ? JSON.stringify(col.select_options) : null,
+            col.validation_regex || null,
+            col.is_visible !== false,
+            (req.user?.email || '').toLowerCase()
+          ]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    
+    // Fetch the complete page with columns
+    const fullPageResult = await pool.query('SELECT * FROM cloudops_asset_pages WHERE id = $1', [page.id]);
+    const fullPage = fullPageResult.rows[0];
+    const fullColumnsResult = await pool.query('SELECT * FROM cloudops_asset_page_columns WHERE page_id = $1 ORDER BY column_order ASC', [page.id]);
+    fullPage.columns = fullColumnsResult.rows;
+    fullPage.rows = [];
+    
+    res.status(201).json(fullPage);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Failed to create asset page:', err);
+    if (err.code === '23505') { // Unique violation
+      return res.status(400).json({ message: 'Page name already exists' });
+    }
+    res.status(500).json({ message: 'Failed to create asset page' });
+  } finally {
+    client.release();
+  }
+});
+
+// Update asset page (name, display_name, description, page_order)
+app.put('/api/cloudops/assets/pages/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    // Check if it's a system page
+    const pageCheck = await pool.query('SELECT is_system_page FROM cloudops_asset_pages WHERE id = $1', [pageId]);
+    if (pageCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+    if (pageCheck.rows[0].is_system_page) {
+      return res.status(403).json({ message: 'Cannot modify system pages' });
+    }
+
+    const { display_name, description, page_order } = req.body || {};
+    if (!display_name || !display_name.trim()) {
+      return res.status(400).json({ message: 'Display name is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE cloudops_asset_pages SET
+         display_name = $1, description = $2, page_order = $3,
+         updated_by = $4, updated_at = NOW()
+       WHERE id = $5 RETURNING *`,
+      [
+        display_name.trim(),
+        (description || '').trim(),
+        page_order || 0,
+        (req.user?.email || '').toLowerCase(),
+        pageId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update asset page:', err);
+    res.status(500).json({ message: 'Failed to update asset page' });
+  }
+});
+
+// Delete asset page (any page, including default pages)
+app.delete('/api/cloudops/assets/pages/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const result = await pool.query('DELETE FROM cloudops_asset_pages WHERE id = $1 RETURNING id', [pageId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+    res.json({ message: 'Page deleted successfully' });
+  } catch (err) {
+    console.error('Failed to delete asset page:', err);
+    res.status(500).json({ message: 'Failed to delete asset page' });
+  }
+});
+
+// ============================================================
+// ASSET PAGE COLUMNS API
+// ============================================================
+
+// Add column to page
+app.post('/api/cloudops/assets/pages/:pageId/columns', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const pageCheck = await pool.query('SELECT is_system_page FROM cloudops_asset_pages WHERE id = $1', [pageId]);
+    if (pageCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+
+    const { name, display_name, data_type, is_required, default_value, select_options, validation_regex, is_visible } = req.body || {};
+    if (!name || !name.trim() || !display_name || !display_name.trim()) {
+      return res.status(400).json({ message: 'Column name and display name are required' });
+    }
+
+    // Get max column_order
+    const orderResult = await pool.query('SELECT COALESCE(MAX(column_order), 0) + 1 AS next_order FROM cloudops_asset_page_columns WHERE page_id = $1', [pageId]);
+    const nextOrder = parseInt(orderResult.rows[0]?.next_order || '1', 10);
+
+    const result = await pool.query(
+      `INSERT INTO cloudops_asset_page_columns (page_id, name, display_name, data_type, column_order, is_required, default_value, select_options, validation_regex, is_visible, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) RETURNING *`,
+      [
+        pageId,
+        name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+        display_name.trim(),
+        data_type || 'text',
+        nextOrder,
+        is_required || false,
+        default_value || null,
+        select_options ? JSON.stringify(select_options) : null,
+        validation_regex || null,
+        is_visible !== false,
+        (req.user?.email || '').toLowerCase()
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to add column:', err);
+    if (err.code === '23505') {
+      return res.status(400).json({ message: 'Column name already exists in this page' });
+    }
+    res.status(500).json({ message: 'Failed to add column' });
+  }
+});
+
+// Update column
+app.put('/api/cloudops/assets/pages/:pageId/columns/:columnId', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    const columnId = parseInt(req.params.columnId, 10);
+    if (!Number.isInteger(pageId) || !Number.isInteger(columnId)) {
+      return res.status(400).json({ message: 'Invalid page or column id' });
+    }
+
+    const pageCheck = await pool.query('SELECT is_system_page FROM cloudops_asset_pages WHERE id = $1', [pageId]);
+    if (pageCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+    // Allow updating columns on system pages, but not deleting system columns (handled in delete)
+
+    const { display_name, data_type, is_required, default_value, select_options, validation_regex, is_visible, column_order } = req.body || {};
+    if (!display_name || !display_name.trim()) {
+      return res.status(400).json({ message: 'Display name is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE cloudops_asset_page_columns SET
+         display_name = $1, data_type = $2, is_required = $3,
+         default_value = $4, select_options = $5, validation_regex = $6,
+         is_visible = $7, column_order = $8,
+         updated_by = $9, updated_at = NOW()
+       WHERE id = $10 AND page_id = $11 RETURNING *`,
+      [
+        display_name.trim(),
+        data_type || 'text',
+        is_required || false,
+        default_value || null,
+        select_options ? JSON.stringify(select_options) : null,
+        validation_regex || null,
+        is_visible !== false,
+        column_order || 0,
+        (req.user?.email || '').toLowerCase(),
+        columnId,
+        pageId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Column not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update column:', err);
+    res.status(500).json({ message: 'Failed to update column' });
+  }
+});
+
+// Delete column
+app.delete('/api/cloudops/assets/pages/:pageId/columns/:columnId', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    const columnId = parseInt(req.params.columnId, 10);
+    if (!Number.isInteger(pageId) || !Number.isInteger(columnId)) {
+      return res.status(400).json({ message: 'Invalid page or column id' });
+    }
+
+    const pageCheck = await pool.query('SELECT is_system_page FROM cloudops_asset_pages WHERE id = $1', [pageId]);
+    if (pageCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+
+    // Check if column belongs to system page and is a system column
+    // We'll allow deleting custom columns on system pages but not system columns
+    // For simplicity, we'll just check if page is system - allow deletion of any column
+    // but in production you might want to track which columns are system-defined
+
+    const result = await pool.query(
+      'DELETE FROM cloudops_asset_page_columns WHERE id = $1 AND page_id = $2 RETURNING id',
+      [columnId, pageId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Column not found' });
+    }
+    res.json({ message: 'Column deleted successfully' });
+  } catch (err) {
+    console.error('Failed to delete column:', err);
+    res.status(500).json({ message: 'Failed to delete column' });
+  }
+});
+
+// Reorder columns
+app.put('/api/cloudops/assets/pages/:pageId/columns/reorder', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const { columnIds } = req.body || {};
+    if (!Array.isArray(columnIds)) {
+      return res.status(400).json({ message: 'columnIds array is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      for (let i = 0; i < columnIds.length; i++) {
+        await client.query(
+          'UPDATE cloudops_asset_page_columns SET column_order = $1, updated_at = NOW() WHERE id = $2 AND page_id = $3',
+          [i + 1, columnIds[i], pageId]
+        );
+      }
+      
+      await client.query('COMMIT');
+      res.json({ message: 'Columns reordered successfully' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Failed to reorder columns:', err);
+    res.status(500).json({ message: 'Failed to reorder columns' });
+  }
+});
+
+// ============================================================
+// ASSET PAGE ROWS API
+// ============================================================
+
+// Get rows for a page (with pagination)
+app.get('/api/cloudops/assets/pages/:pageId/rows', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
+    const offset = parseInt(req.query.offset || '0', 10);
+
+    const result = await pool.query(`
+      SELECT * FROM cloudops_asset_page_rows 
+      WHERE page_id = $1 
+      ORDER BY row_order ASC, created_at ASC
+      LIMIT $2 OFFSET $3
+    `, [pageId, limit, offset]);
+
+    const countResult = await pool.query('SELECT COUNT(*)::int AS total FROM cloudops_asset_page_rows WHERE page_id = $1', [pageId]);
+
+    res.json({
+      rows: result.rows,
+      total: countResult.rows[0]?.total || 0,
+      limit,
+      offset
+    });
+  } catch (err) {
+    console.error('Failed to fetch rows:', err);
+    res.status(500).json({ message: 'Failed to fetch rows' });
+  }
+});
+
+// Create row
+app.post('/api/cloudops/assets/pages/:pageId/rows', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const pageCheck = await pool.query('SELECT id FROM cloudops_asset_pages WHERE id = $1', [pageId]);
+    if (pageCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Page not found' });
+    }
+
+    const { row_data, row_order } = req.body || {};
+    if (!row_data || typeof row_data !== 'object') {
+      return res.status(400).json({ message: 'Row data is required' });
+    }
+
+    // Get max row_order if not provided
+    let order = row_order;
+    if (order === undefined || order === null) {
+      const orderResult = await pool.query('SELECT COALESCE(MAX(row_order), 0) + 1 AS next_order FROM cloudops_asset_page_rows WHERE page_id = $1', [pageId]);
+      order = parseInt(orderResult.rows[0]?.next_order || '1', 10);
+    }
+
+    const result = await pool.query(
+      `INSERT INTO cloudops_asset_page_rows (page_id, row_data, row_order, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $4) RETURNING *`,
+      [pageId, JSON.stringify(row_data), order, (req.user?.email || '').toLowerCase()]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to create row:', err);
+    res.status(500).json({ message: 'Failed to create row' });
+  }
+});
+
+// Update row
+app.put('/api/cloudops/assets/pages/:pageId/rows/:rowId', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    const rowId = parseInt(req.params.rowId, 10);
+    if (!Number.isInteger(pageId) || !Number.isInteger(rowId)) {
+      return res.status(400).json({ message: 'Invalid page or row id' });
+    }
+
+    const { row_data, row_order } = req.body || {};
+    if (!row_data || typeof row_data !== 'object') {
+      return res.status(400).json({ message: 'Row data is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE cloudops_asset_page_rows SET
+         row_data = $1, row_order = $2,
+         updated_by = $3, updated_at = NOW()
+       WHERE id = $4 AND page_id = $5 RETURNING *`,
+      [JSON.stringify(row_data), row_order || 0, (req.user?.email || '').toLowerCase(), rowId, pageId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Row not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to update row:', err);
+    res.status(500).json({ message: 'Failed to update row' });
+  }
+});
+
+// Delete row
+app.delete('/api/cloudops/assets/pages/:pageId/rows/:rowId', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    const rowId = parseInt(req.params.rowId, 10);
+    if (!Number.isInteger(pageId) || !Number.isInteger(rowId)) {
+      return res.status(400).json({ message: 'Invalid page or row id' });
+    }
+
+    const result = await pool.query(
+      'DELETE FROM cloudops_asset_page_rows WHERE id = $1 AND page_id = $2 RETURNING id',
+      [rowId, pageId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Row not found' });
+    }
+    res.json({ message: 'Row deleted successfully' });
+  } catch (err) {
+    console.error('Failed to delete row:', err);
+    res.status(500).json({ message: 'Failed to delete row' });
+  }
+});
+
+// Bulk delete rows
+app.delete('/api/cloudops/assets/pages/:pageId/rows', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const { rowIds } = req.body || {};
+    if (!Array.isArray(rowIds) || rowIds.length === 0) {
+      return res.status(400).json({ message: 'rowIds array is required' });
+    }
+
+    const placeholders = rowIds.map((_, i) => `$${i + 2}`).join(',');
+    const result = await pool.query(
+      `DELETE FROM cloudops_asset_page_rows WHERE page_id = $1 AND id IN (${placeholders})`,
+      [pageId, ...rowIds]
+    );
+
+    res.json({ message: `${result.rowCount} rows deleted successfully` });
+  } catch (err) {
+    console.error('Failed to bulk delete rows:', err);
+    res.status(500).json({ message: 'Failed to bulk delete rows' });
+  }
+});
+
+// Reorder rows
+app.put('/api/cloudops/assets/pages/:pageId/rows/reorder', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const pageId = parseInt(req.params.pageId, 10);
+    if (!Number.isInteger(pageId)) {
+      return res.status(400).json({ message: 'Invalid page id' });
+    }
+
+    const { rowIds } = req.body || {};
+    if (!Array.isArray(rowIds)) {
+      return res.status(400).json({ message: 'rowIds array is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      for (let i = 0; i < rowIds.length; i++) {
+        await client.query(
+          'UPDATE cloudops_asset_page_rows SET row_order = $1, updated_at = NOW() WHERE id = $2 AND page_id = $3',
+          [i + 1, rowIds[i], pageId]
+        );
+      }
+      
+      await client.query('COMMIT');
+      res.json({ message: 'Rows reordered successfully' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Failed to reorder rows:', err);
+    res.status(500).json({ message: 'Failed to reorder rows' });
   }
 });
 

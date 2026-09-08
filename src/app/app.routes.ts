@@ -63,6 +63,11 @@ export const routes: Routes = [
           import('./cloudops/cloudops.component').then(m => m.CloudopsComponent)
       },
       {
+        path: 'cloudops/assets',
+        loadComponent: () =>
+          import('./cloudops/assets/assets.component').then(m => m.AssetsComponent)
+      },
+      {
         path: 'project-workspace',
         loadComponent: () =>
           import('./project-workspace/project-workspace.component').then(m => m.ProjectWorkspaceComponent)
