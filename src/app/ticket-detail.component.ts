@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy, ChangeDetectorRef, SecurityContext } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ActivatedRoute, Router, RouterModule } from '@angular/router';
 import { ReactiveFormsModule, FormsModule, FormBuilder, Validators } from '@angular/forms';
@@ -1460,7 +1460,7 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
   }
 
   sanitize(html: string): SafeHtml {
-    return this.sanitizer.bypassSecurityTrustHtml(html);
+    return this.sanitizer.bypassSecurityTrustHtml(this.sanitizer.sanitize(SecurityContext.HTML, html) ?? '');
   }
 
   renderContent(content: string): SafeHtml {
@@ -1468,7 +1468,11 @@ export class TicketDetailComponent implements OnInit, OnDestroy {
     // If content contains HTML tags, use as-is; otherwise convert newlines to <br>
     const isHtml = /<[a-z][\s\S]*>/i.test(content);
     const processed = isHtml ? content : content.replace(/\r\n/g, '<br>').replace(/\n/g, '<br>');
-    return this.sanitizer.bypassSecurityTrustHtml(processed);
+    // Ticket thread content originates from requesters/commenters (e.g. inbound email),
+    // so it must go through Angular's sanitizer to strip scripts/handlers before we
+    // mark it as trusted for [innerHTML] binding.
+    const safe = this.sanitizer.sanitize(SecurityContext.HTML, processed) ?? '';
+    return this.sanitizer.bypassSecurityTrustHtml(safe);
   }
 
   private resolveInlineImagesInThreads(): void {

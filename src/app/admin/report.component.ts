@@ -2,7 +2,7 @@ import { Component, OnInit, ViewChild, ElementRef, AfterViewInit, Input, Output,
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { firstValueFrom } from 'rxjs';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 
 import { AssignmentService, TicketAssignment, GroupMember } from '../services/assignment.service';
 import { MsalService } from '../services/msal.service';
@@ -1468,65 +1468,75 @@ export class ReportComponent implements OnInit, AfterViewInit {
     return Math.max(5, Math.round((count / max) * 100));
   }
 
-  downloadExcel(): void {
+  // Adds a worksheet whose columns are inferred from the first row's keys,
+  // matching the header-per-key behavior of the old XLSX.utils.json_to_sheet.
+  private addJsonSheet(workbook: ExcelJS.Workbook, data: Record<string, unknown>[], sheetName: string): void {
+    const sheet = workbook.addWorksheet(sheetName);
+    if (data.length === 0) return;
+    sheet.columns = Object.keys(data[0]).map(key => ({ header: key, key }));
+    sheet.addRows(data);
+  }
+
+  private triggerDownload(blob: Blob, filename: string): void {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async downloadExcel(): Promise<void> {
     if (this.summaryRows.length === 0) return;
 
-    const overviewSheet = XLSX.utils.json_to_sheet([{
+    const workbook = new ExcelJS.Workbook();
+
+    this.addJsonSheet(workbook, [{
       'Report Period': `${this.startDate} to ${this.endDate}`,
       'Total Tickets': this.detailRows.length,
       'Closed Tickets': this.closedCount,
       'Resolved %': this.resolvedPct + '%',
       'Critical Compliance (within 24h)': this.slaCompliance + '%',
       'Avg Resolution Time (h)': this.avgResolutionHours
-    }]);
+    }], 'Overview');
 
-    const summarySheet = XLSX.utils.json_to_sheet(
-      this.summaryRows.map(row => ({
-        Name: row.displayName,
-        Email: row.email,
-        Assigned: row.assignedCount,
-        Closed: row.closedCount,
-        Total: row.assignedCount + row.closedCount
-      }))
-    );
+    this.addJsonSheet(workbook, this.summaryRows.map(row => ({
+      Name: row.displayName,
+      Email: row.email,
+      Assigned: row.assignedCount,
+      Closed: row.closedCount,
+      Total: row.assignedCount + row.closedCount
+    })), 'Team Summary');
 
-    const detailSheet = XLSX.utils.json_to_sheet(
-      this.detailRows.map(row => ({
-        TicketNumber: row.ticketNumber,
-        TicketId: row.ticketId,
-        Category: row.category,
-        PrimaryAssignee: row.primaryAssignee,
-        AssignedUsers: row.assignedUsers,
-        AssignedAt: row.assignedAt,
-        Status: row.status,
-        ClosedBy: row.closedBy,
-        ClosedAt: row.closedAt
-      }))
-    );
+    this.addJsonSheet(workbook, this.detailRows.map(row => ({
+      TicketNumber: row.ticketNumber,
+      TicketId: row.ticketId,
+      Category: row.category,
+      PrimaryAssignee: row.primaryAssignee,
+      AssignedUsers: row.assignedUsers,
+      AssignedAt: row.assignedAt,
+      Status: row.status,
+      ClosedBy: row.closedBy,
+      ClosedAt: row.closedAt
+    })), 'Ticket Details');
 
-    const categorySheet = XLSX.utils.json_to_sheet(
-      this.categoryData.map(cat => ({
-        Category: cat.name,
-        Count: cat.count,
-        'Percentage': cat.percentage + '%'
-      }))
-    );
+    this.addJsonSheet(workbook, this.categoryData.map(cat => ({
+      Category: cat.name,
+      Count: cat.count,
+      'Percentage': cat.percentage + '%'
+    })), 'By Category');
 
-    const resolutionSheet = XLSX.utils.json_to_sheet(
-      this.resolutionByCategoryData.map(d => ({
-        Category: d.name,
-        'Avg Resolution Time (h)': d.avgHours
-      }))
-    );
+    this.addJsonSheet(workbook, this.resolutionByCategoryData.map(d => ({
+      Category: d.name,
+      'Avg Resolution Time (h)': d.avgHours
+    })), 'Resolution Time');
 
-    const monthlyTrendSheet = XLSX.utils.json_to_sheet(
-      this.monthlyTrendData.map(row => ({
-        Month: row.month,
-        Tickets: row.count
-      }))
-    );
+    this.addJsonSheet(workbook, this.monthlyTrendData.map(row => ({
+      Month: row.month,
+      Tickets: row.count
+    })), 'Monthly Trends');
 
-    const responseAnalysisSheet = XLSX.utils.json_to_sheet(
+    this.addJsonSheet(workbook,
       [...this.fastestResponders, ...this.needsImprovementResponders]
         .reduce<ResponseAnalystRow[]>((acc, row) => {
           if (!acc.some(existing => existing.email === row.email)) {
@@ -1539,55 +1549,39 @@ export class ReportComponent implements OnInit, AfterViewInit {
           Email: row.email,
           'Closed Tickets': row.ticketCount,
           'Avg Response/Resolution (h)': row.avgHours
-        }))
+        })),
+      'Response Analysis'
     );
 
-    const qualitySheet = XLSX.utils.json_to_sheet(
-      this.resolutionDistribution.map(row => ({
-        Bucket: row.label,
-        Tickets: row.count
-      }))
-    );
+    this.addJsonSheet(workbook, this.resolutionDistribution.map(row => ({
+      Bucket: row.label,
+      Tickets: row.count
+    })), 'Resolution Distribution');
 
-    const reopenedSheet = XLSX.utils.json_to_sheet(
-      this.reopenedByOwner.map(row => ({
-        Owner: row.name,
-        Reopened: row.count
-      }))
-    );
+    this.addJsonSheet(workbook, this.reopenedByOwner.map(row => ({
+      Owner: row.name,
+      Reopened: row.count
+    })), 'Reopened by Owner');
 
-    const topRequesterSheet = XLSX.utils.json_to_sheet(
-      this.topRequesters.map(row => ({
-        Requester: row.name,
-        Tickets: row.count
-      }))
-    );
+    this.addJsonSheet(workbook, this.topRequesters.map(row => ({
+      Requester: row.name,
+      Tickets: row.count
+    })), 'Top Requesters');
 
-    const slaByMemberSheet = XLSX.utils.json_to_sheet(
-      this.slaByMember.map(row => ({
-        Member: row.displayName || row.email,
-        Email: row.email,
-        'Closed Tickets': row.tickets,
-        'Within 24h': row.withinTarget,
-        'Critical %': row.sla
-      }))
-    );
+    this.addJsonSheet(workbook, this.slaByMember.map(row => ({
+      Member: row.displayName || row.email,
+      Email: row.email,
+      'Closed Tickets': row.tickets,
+      'Within 24h': row.withinTarget,
+      'Critical %': row.sla
+    })), 'Critical by Member');
 
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, overviewSheet, 'Overview');
-    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Team Summary');
-    XLSX.utils.book_append_sheet(workbook, detailSheet, 'Ticket Details');
-    XLSX.utils.book_append_sheet(workbook, categorySheet, 'By Category');
-    XLSX.utils.book_append_sheet(workbook, resolutionSheet, 'Resolution Time');
-    XLSX.utils.book_append_sheet(workbook, monthlyTrendSheet, 'Monthly Trends');
-    XLSX.utils.book_append_sheet(workbook, responseAnalysisSheet, 'Response Analysis');
-    XLSX.utils.book_append_sheet(workbook, qualitySheet, 'Resolution Distribution');
-    XLSX.utils.book_append_sheet(workbook, reopenedSheet, 'Reopened by Owner');
-    XLSX.utils.book_append_sheet(workbook, topRequesterSheet, 'Top Requesters');
-    XLSX.utils.book_append_sheet(workbook, slaByMemberSheet, 'Critical by Member');
-
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    });
     const filename = `cloudops-report-${this.startDate}-to-${this.endDate}.xlsx`;
-    XLSX.writeFile(workbook, filename);
+    this.triggerDownload(blob, filename);
   }
 
   private buildReport(assignments: TicketAssignment[]): void {

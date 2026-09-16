@@ -8,6 +8,7 @@ const path = require("path");
 const { execFile } = require('child_process');
 const bodyParser = require("body-parser");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const compression = require("compression");
 const fs = require("fs");
 const multer = require("multer");
@@ -18,16 +19,48 @@ const pool = require("./db");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024, files: 10 }
+});
 const NODE_ID = process.env.HOSTNAME || 'local-node';
 
 // ===============================
 // Middleware
 // ===============================
-app.use(cors());
+// Locked to known frontend origins. CORS_ALLOWED_ORIGINS (comma-separated) is
+// set per environment via Helm; falls back to local dev origins when unset.
+const CORS_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+const DEFAULT_DEV_ORIGINS = ['http://localhost:4200', 'http://localhost:3000'];
+const corsAllowlist = CORS_ALLOWED_ORIGINS.length > 0 ? CORS_ALLOWED_ORIGINS : DEFAULT_DEV_ORIGINS;
+app.use(cors({
+  origin: (origin, callback) => {
+    // No Origin header = same-origin/non-browser request (curl, server-to-server) — allow.
+    if (!origin || corsAllowlist.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  }
+}));
 app.use(compression()); // 🚀 Enable gzip compression for responses
 app.use(express.json());
 app.use(bodyParser.json());
+
+// Rate limit auth endpoints against credential stuffing / brute force.
+// Per-pod (in-memory store): with N replicas the effective ceiling is up to
+// N times this limit, since counters aren't shared across pods. Still closes
+// the "no limit at all" gap; move to a shared (e.g. Redis) store if a precise
+// cluster-wide limit is ever needed.
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many attempts, please try again later' }
+});
 
 // 🚀 Production: Smart caching headers
 app.use((req, res, next) => {
@@ -53,7 +86,7 @@ function isZohoProjectsConfigured() {
   return ENABLE_ZOHO_PROJECTS && !!ZOHO_PROJECTS_PORTAL_ID;
 }
 
-app.get('/api/project-workspace/projects', async (req, res) => {
+app.get('/api/project-workspace/projects', authenticateToken, async (req, res) => {
   try {
     if (isZohoProjectsConfigured()) {
       const zohoProjects = await fetchZohoProjectsItems();
@@ -70,7 +103,7 @@ app.get('/api/project-workspace/projects', async (req, res) => {
   }
 });
 
-app.post('/api/project-workspace/projects', async (req, res) => {
+app.post('/api/project-workspace/projects', authenticateToken, async (req, res) => {
   try {
     const { name, owner, status, progress, dueDate } = req.body;
     const result = await pool.query(
@@ -86,7 +119,7 @@ app.post('/api/project-workspace/projects', async (req, res) => {
   }
 });
 
-app.get('/api/project-workspace/tasks', async (req, res) => {
+app.get('/api/project-workspace/tasks', authenticateToken, async (req, res) => {
   try {
     if (isZohoProjectsConfigured()) {
       const zohoTasks = await fetchZohoTasksItems();
@@ -104,7 +137,7 @@ app.get('/api/project-workspace/tasks', async (req, res) => {
   }
 });
 
-app.post('/api/project-workspace/tasks', async (req, res) => {
+app.post('/api/project-workspace/tasks', authenticateToken, async (req, res) => {
   try {
     const { projectId, title, assignee, status, priority, dueDate } = req.body;
     const result = await pool.query(
@@ -120,7 +153,7 @@ app.post('/api/project-workspace/tasks', async (req, res) => {
   }
 });
 
-app.get('/api/project-workspace/time-logs', async (req, res) => {
+app.get('/api/project-workspace/time-logs', authenticateToken, async (req, res) => {
   try {
     if (isZohoProjectsConfigured() && ENABLE_ZOHO_PROJECTS_TIME_LOGS) {
       const zohoTimeLogs = await fetchZohoTimeLogsItems();
@@ -138,7 +171,7 @@ app.get('/api/project-workspace/time-logs', async (req, res) => {
   }
 });
 
-app.post('/api/project-workspace/time-logs', async (req, res) => {
+app.post('/api/project-workspace/time-logs', authenticateToken, async (req, res) => {
   try {
     const { taskId, projectId, user, hours, date, note } = req.body;
     const result = await pool.query(
@@ -154,7 +187,7 @@ app.post('/api/project-workspace/time-logs', async (req, res) => {
   }
 });
 
-app.patch('/api/project-workspace/tasks/:id/status', async (req, res) => {
+app.patch('/api/project-workspace/tasks/:id/status', authenticateToken, async (req, res) => {
   try {
     const taskId = Number(req.params.id);
     const { status } = req.body;
@@ -173,7 +206,7 @@ app.patch('/api/project-workspace/tasks/:id/status', async (req, res) => {
   }
 });
 
-app.get('/api/project-workspace/dashboard', async (req, res) => {
+app.get('/api/project-workspace/dashboard', authenticateToken, async (req, res) => {
   try {
     if (isZohoProjectsConfigured()) {
       const dashboard = await fetchZohoDashboardItems();
@@ -199,7 +232,7 @@ app.get('/api/project-workspace/dashboard', async (req, res) => {
   }
 });
 
-app.get('/api/project-workspace/config', (req, res) => {
+app.get('/api/project-workspace/config', authenticateToken, (req, res) => {
   res.json({
     zohoProjectsEnabled: isZohoProjectsConfigured(),
     zohoTimeLogsEnabled: isZohoProjectsConfigured() && ENABLE_ZOHO_PROJECTS_TIME_LOGS
@@ -771,6 +804,39 @@ async function runMigrations() {
       console.warn('⚠️ Role constraint drop warning:', e?.message);
     }
 
+    // Enable RLS + deny-all policy on every backend-only table (see 008/009/011/013).
+    // Supabase auto-exposes all public-schema tables via PostgREST to the anon/
+    // authenticated roles unless RLS is enabled; this app never uses PostgREST
+    // (it only talks to Postgres via the pool above), so PostgREST access to
+    // these tables must always be denied. Re-applied on every boot so newly
+    // added tables — or a table whose policy was manually dropped — can never
+    // silently regress to being world-readable again the way 011's did.
+    try {
+      const backendOnlyTables = [
+        'users', 'ticket_closure', 'ssl_alert_tickets', 'cloudops_members',
+        'recycled_tickets', 'ihub_assets', 'ihub_alert_tickets', 'ssl_assets',
+        'ssl_expiry_alert_tickets', 'ticket_assignments', 'recycle_bin',
+        'email_tickets', 'user_name_mapping', 'alertmanager_ssl_tickets',
+        'reply_authors', 'user_roles', 'ihub_certificate_assets',
+        'ihub_certificate_alert_tickets', 'cloudops_tasks',
+        'monitoring_azure_resources', 'cloudops_task_assignees',
+        'monitoring_devices', 'monitoring_telemetry', 'monitoring_presence_log',
+        'monitoring_intune_devices', 'user_role_bindings', 'group_role_bindings',
+        'cloudops_project_members', 'cloudops_projects',
+        'project_workspace_projects', 'project_workspace_tasks',
+        'project_workspace_time_logs', 'ticket_arrival_notifications',
+        'cloudops_asset_pages', 'cloudops_asset_page_columns',
+        'cloudops_asset_page_rows'
+      ];
+      for (const table of backendOnlyTables) {
+        await pool.query(`ALTER TABLE IF EXISTS public.${table} ENABLE ROW LEVEL SECURITY`);
+        await pool.query(`DROP POLICY IF EXISTS "backend_only" ON public.${table}`);
+        await pool.query(`CREATE POLICY "backend_only" ON public.${table} AS RESTRICTIVE FOR ALL TO public USING (false)`);
+      }
+    } catch (e) {
+      console.warn('⚠️ RLS enforcement warning:', e?.message);
+    }
+
     console.log("✅ Database migrations applied");
   } catch (err) {
     console.error("⚠️ Migration warning:", err.message);
@@ -949,6 +1015,46 @@ function authorizeElevated(req, res, next) {
     return res.status(403).json({ message: 'Elevated role required' });
   }
   next();
+}
+
+// Per-ticket access control, mirroring the frontend's canViewTicket(): these roles
+// may access any ticket; everyone else must be the requester, the Zoho assignee, or
+// in the ticket's Supabase multi-agent assignment (ticket_assignments.assigned_users).
+const TICKET_UNRESTRICTED_ROLES = new Set(['admin', 'cloudops', 'itsm']);
+function isUnrestrictedTicketRole(role) {
+  return TICKET_UNRESTRICTED_ROLES.has((role || '').toString().toLowerCase());
+}
+
+// Given an already-fetched raw Zoho ticket payload (include=contacts,assignee) and its
+// Supabase assigned_users array, return the lowercased set of emails allowed to access it.
+function ticketOwnerEmails(ticketData, assignedUsers) {
+  const requesterEmail = (
+    ticketData?.email || ticketData?.contact?.email ||
+    ticketData?.contact?.emailAddress || ticketData?.contact?.secondaryEmail || ''
+  ).toString().trim().toLowerCase();
+  const assigneeEmail = (
+    ticketData?.assignee?.email || ticketData?.assignee?.emailId || ''
+  ).toString().trim().toLowerCase();
+  const supabaseUsers = (assignedUsers || []).map(e => (e || '').toString().trim().toLowerCase());
+  return [requesterEmail, assigneeEmail, ...supabaseUsers].filter(Boolean);
+}
+
+// For routes that haven't already fetched the ticket/assignment themselves.
+async function userCanAccessTicket(user, ticketId) {
+  if (isUnrestrictedTicketRole(user?.role)) return true;
+
+  const requestingEmail = (user?.email || '').toString().trim().toLowerCase();
+  if (!requestingEmail) return false;
+
+  const [ticketRes, assignmentRes] = await Promise.allSettled([
+    zohoFetch(`/tickets/${ticketId}?include=contacts,assignee`).then(r => r.ok ? r.json() : {}),
+    pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [ticketId])
+  ]);
+
+  const ticketData = ticketRes.status === 'fulfilled' ? ticketRes.value : {};
+  const assignedUsers = assignmentRes.status === 'fulfilled' ? (assignmentRes.value?.rows?.[0]?.assigned_users || []) : [];
+
+  return ticketOwnerEmails(ticketData, assignedUsers).includes(requestingEmail);
 }
 
 function parseJsonArray(value) {
@@ -1656,7 +1762,7 @@ app.post("/api/users", authenticateToken, authorizeAdmin, async (req, res) => {
 
 
 // Login
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", authRateLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -1709,7 +1815,7 @@ app.post("/api/login", async (req, res) => {
   }
 });
 // 🔄 Refresh Token API
-app.post("/api/refresh", (req, res) => {
+app.post("/api/refresh", authRateLimiter, (req, res) => {
   const { refreshToken } = req.body;
 
   if (!refreshToken) return res.sendStatus(401);
@@ -2499,9 +2605,16 @@ function safeTokenEqual(a, b) {
   return crypto.timingSafeEqual(aa, bb);
 }
 
+// Fail closed like isZohoTicketWebhookAuthorized below: this endpoint creates real
+// Zoho tickets from "firing" alerts, so an unset secret must reject, not admit, all.
+//
+// Checks the standard `Authorization: Bearer <token>` header — this is what
+// Alertmanager's http_config.authorization sends via credentials_file, and works
+// across Alertmanager versions without depending on custom-header support.
 function isAlertmanagerAuthorized(req) {
-  if (!ALERTMANAGER_WEBHOOK_SECRET) return true;
-  const provided = (req.headers['x-alertmanager-secret'] || '').toString().trim();
+  if (!ALERTMANAGER_WEBHOOK_SECRET) return false;
+  const authHeader = (req.headers['authorization'] || '').toString().trim();
+  const provided = authHeader.replace(/^Bearer\s+/i, '');
   return safeTokenEqual(provided, ALERTMANAGER_WEBHOOK_SECRET);
 }
 
@@ -4433,7 +4546,23 @@ app.get('/api/tickets/:id',  authenticateToken,async (req, res) => {
   try {
     // Include assignee/contact fields so permission checks on the UI are accurate for assigned users.
     const response = await zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`);
-    res.json(await response.json());
+    const data = await response.json();
+
+    if (!isUnrestrictedTicketRole(req.user?.role)) {
+      const requestingEmail = (req.user?.email || '').toString().trim().toLowerCase();
+      let assignedUsers = [];
+      try {
+        const a = await pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [req.params.id]);
+        assignedUsers = a.rows?.[0]?.assigned_users || [];
+      } catch (e) {
+        console.warn('[Ticket access check] assignment lookup failed:', e?.message);
+      }
+      if (!ticketOwnerEmails(data, assignedUsers).includes(requestingEmail)) {
+        return res.status(403).json({ error: 'You do not have access to this ticket' });
+      }
+    }
+
+    res.json(data);
   } catch {
     res.status(500).json({ error: 'Failed to fetch ticket' });
   }
@@ -4441,6 +4570,10 @@ app.get('/api/tickets/:id',  authenticateToken,async (req, res) => {
 
 app.patch('/api/tickets/:id', authenticateToken, async (req, res) => {
   try {
+    if (!(await userCanAccessTicket(req.user, req.params.id))) {
+      return res.status(403).json({ error: 'You do not have access to this ticket' });
+    }
+
     const payload = req.body || {};
     if (!payload || Object.keys(payload).length === 0) {
       return res.status(400).json({ error: 'No update fields provided' });
@@ -4562,13 +4695,29 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
       return res.json(data);
     }
 
-    // ── Start private-note visibility check in parallel with enrichment ──
-    // so we don't add sequential latency.
+    // ── Ticket access check (also drives private-note visibility below) ──
+    // Resolved up front, before enrichment, so a caller with no relationship to this
+    // ticket at all is rejected immediately instead of seeing its public conversations.
     const requestingEmail = (req.user?.email || '').toLowerCase();
-    const privateNoteCheckPromise = Promise.allSettled([
-      zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`).then(r => r.ok ? r.json() : {}),
-      pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [req.params.id])
-    ]);
+    const isUnrestricted = isUnrestrictedTicketRole(req.user?.role);
+    let hasTicketRelationship = false;
+    if (!isUnrestricted) {
+      try {
+        const [ticketFetch, assignmentFetch] = await Promise.allSettled([
+          zohoFetch(`/tickets/${req.params.id}?include=contacts,assignee`).then(r => r.ok ? r.json() : {}),
+          pool.query('SELECT assigned_users FROM ticket_assignments WHERE zoho_ticket_id = $1', [req.params.id])
+        ]);
+        const ticketData = ticketFetch.status === 'fulfilled' ? ticketFetch.value : {};
+        const assignedUsers = assignmentFetch.status === 'fulfilled' ? (assignmentFetch.value?.rows?.[0]?.assigned_users || []) : [];
+        hasTicketRelationship = ticketOwnerEmails(ticketData, assignedUsers).includes(requestingEmail);
+      } catch (e) {
+        console.warn('[Ticket access check] conversations lookup failed:', e?.message);
+      }
+      if (!hasTicketRelationship) {
+        return res.status(403).json({ error: 'You do not have access to this ticket' });
+      }
+    }
+    const canSeePrivate = isUnrestricted || hasTicketRelationship;
 
     // Enrich every conversation entry with detailed comment/thread payload.
     // Some older email records only expose a truncated description on the list endpoint,
@@ -4653,21 +4802,6 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
         '';
     });
 
-    // ── Resolve private-note visibility (promise was started at top, alongside enrichment) ──
-    let canSeePrivate = false;
-    try {
-      const [ticketFetch, assignmentFetch] = await privateNoteCheckPromise;
-      const ticketData = ticketFetch.status === 'fulfilled' ? (ticketFetch.value || {}) : {};
-      const requesterEmail = (ticketData.email || ticketData.contact?.email || '').toLowerCase();
-      const zohoAssigneeEmail = (ticketData.assignee?.email || ticketData.assignee?.emailId || '').toLowerCase();
-      const supabaseUsers = assignmentFetch.status === 'fulfilled'
-        ? (assignmentFetch.value?.rows?.[0]?.assigned_users || []).map(e => e.toLowerCase())
-        : [];
-      const allowed = new Set([requesterEmail, zohoAssigneeEmail, ...supabaseUsers].filter(Boolean));
-      canSeePrivate = allowed.has(requestingEmail);
-    } catch {
-      canSeePrivate = false;
-    }
     const visibleData = canSeePrivate
       ? resultData
       : resultData.filter(conv => conv.isPublic !== false);
@@ -4680,6 +4814,9 @@ app.get('/api/tickets/:id/conversations', authenticateToken, async (req, res) =>
 
 app.get('/api/tickets/:id/attachments',  authenticateToken,async (req, res) => {
   try {
+    if (!(await userCanAccessTicket(req.user, req.params.id))) {
+      return res.status(403).json({ error: 'You do not have access to this ticket' });
+    }
     const response = await zohoFetch(`/tickets/${req.params.id}/attachments`);
     const data = await response.json();
     if (!response.ok) {
@@ -4694,6 +4831,9 @@ app.get('/api/tickets/:id/attachments',  authenticateToken,async (req, res) => {
 app.get('/api/tickets/:id/attachments/:attachmentId', authenticateToken, async (req, res) => {
   try {
     const { id, attachmentId } = req.params;
+    if (!(await userCanAccessTicket(req.user, id))) {
+      return res.status(403).json({ error: 'You do not have access to this ticket' });
+    }
     let response = await zohoFetch(`/tickets/${id}/attachments/${attachmentId}/content`);
 
     // Some Zoho attachment responses are available without the /content suffix.
@@ -4782,8 +4922,11 @@ app.get('/api/zoho-content', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/tickets/:id/attachments', upload.array('attachments'),  authenticateToken,async (req, res) => {
+app.post('/api/tickets/:id/attachments', authenticateToken, upload.array('attachments'), async (req, res) => {
   try {
+    if (!(await userCanAccessTicket(req.user, req.params.id))) {
+      return res.status(403).json({ error: 'You do not have access to this ticket' });
+    }
     const files = Array.isArray(req.files) ? req.files : [];
     if (files.length === 0) {
       return res.status(400).json({ error: 'No attachments provided' });
@@ -4808,7 +4951,7 @@ app.post('/api/tickets/:id/attachments', upload.array('attachments'),  authentic
   }
 });
 
-app.post("/api/msal-login", async (req, res) => {
+app.post("/api/msal-login", authRateLimiter, async (req, res) => {
   try {
     const { email, accessToken } = req.body;
 
@@ -4821,6 +4964,37 @@ app.post("/api/msal-login", async (req, res) => {
     const requestedRole = normalize(req.body?.selectedRole || '');
     const rolesSet = new Set();
     let roleSource = 'default';
+
+    // Verify accessToken is a real, currently-valid Microsoft token for this exact
+    // email before trusting anything else in this request (admin allowlist, roles,
+    // etc.). Without this, the group-membership lookup below fails silently on an
+    // invalid/garbage token (it just continues with zero groups), which previously
+    // let anyone claim an arbitrary `email` — including an allowlisted admin's —
+    // with no real Microsoft credentials at all.
+    try {
+      const meResponse = await fetch('https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      if (!meResponse.ok) {
+        console.warn(`[MSAL LOGIN] Access token verification failed for ${normalizedEmail}: ${meResponse.status}`);
+        return res.status(401).json({ message: "Invalid or expired access token" });
+      }
+      const me = await meResponse.json();
+      // The frontend sends MSAL's `account.username` (the preferred_username/UPN claim),
+      // which doesn't always equal Graph's `mail` attribute in every tenant, so accept
+      // either verified field rather than requiring a specific one to match.
+      const verifiedMail = normalize(me?.mail);
+      const verifiedUpn = normalize(me?.userPrincipalName);
+      const identityVerified = (!!verifiedMail && verifiedMail === normalizedEmail)
+        || (!!verifiedUpn && verifiedUpn === normalizedEmail);
+      if (!identityVerified) {
+        console.warn(`[MSAL LOGIN] Claimed email ${normalizedEmail} does not match token identity (mail=${verifiedMail || '(none)'}, upn=${verifiedUpn || '(none)'})`);
+        return res.status(401).json({ message: "Access token does not match the provided email" });
+      }
+    } catch (verifyErr) {
+      console.warn(`[MSAL LOGIN] Access token verification error for ${normalizedEmail}:`, verifyErr?.message || verifyErr);
+      return res.status(401).json({ message: "Invalid or expired access token" });
+    }
 
     if (isAllowlistedAdminEmail(normalizedEmail)) {
       rolesSet.add('admin');
@@ -4964,8 +5138,11 @@ app.post("/api/msal-login", async (req, res) => {
 });
 
 
-app.post('/api/tickets/:id/reply', upload.array('attachments'),  authenticateToken,async (req, res) => {
+app.post('/api/tickets/:id/reply', authenticateToken, upload.array('attachments'), async (req, res) => {
   try {
+    if (!(await userCanAccessTicket(req.user, req.params.id))) {
+      return res.status(403).json({ error: 'You do not have access to this ticket' });
+    }
     const files = Array.isArray(req.files) ? req.files : [];
     const content = req.body?.content || '';
     const senderName = req.body?.senderName || req.user?.email?.split('@')[0] || '';
@@ -5062,7 +5239,7 @@ app.post('/api/tickets/:id/reply', upload.array('attachments'),  authenticateTok
   }
 });
 
-app.post('/api/tickets', upload.array('attachments'), authenticateToken, async (req, res) => {
+app.post('/api/tickets', authenticateToken, upload.array('attachments'), async (req, res) => {
   try {
     const isMultipart = req.is('multipart/form-data');
     const body = isMultipart ? (req.body || {}) : (req.body || {});
@@ -6592,6 +6769,9 @@ app.get("/api/admin/group-members", authenticateToken, authorizeElevated, async 
     if (!groupEmail) {
       return res.status(400).json({ message: "Missing groupEmail" });
     }
+    // Escape single quotes per OData string-literal syntax so groupEmail can't break
+    // out of the $filter expression below.
+    const odataGroupEmail = groupEmail.replace(/'/g, "''");
 
     const token = getGraphToken(req);
     if (!token) {
@@ -6599,7 +6779,7 @@ app.get("/api/admin/group-members", authenticateToken, authorizeElevated, async 
     }
 
     const groupLookupUrl =
-      `https://graph.microsoft.com/v1.0/groups?$filter=mail eq '${groupEmail}'&$select=id,displayName,mail`;
+      `https://graph.microsoft.com/v1.0/groups?$filter=mail eq '${odataGroupEmail}'&$select=id,displayName,mail`;
 
     let groupResponse = await fetch(groupLookupUrl, {
       headers: { Authorization: `Bearer ${token}` }
@@ -6614,7 +6794,7 @@ app.get("/api/admin/group-members", authenticateToken, authorizeElevated, async 
 
     if (!group) {
       const fallbackUrl =
-        `https://graph.microsoft.com/v1.0/groups?$filter=displayName eq '${groupEmail}'&$select=id,displayName,mail`;
+        `https://graph.microsoft.com/v1.0/groups?$filter=displayName eq '${odataGroupEmail}'&$select=id,displayName,mail`;
       groupResponse = await fetch(fallbackUrl, {
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -7992,6 +8172,19 @@ async function runCloudOpsAssignmentPoll() {
     console.error('[CloudOps poll] Cycle failed:', err?.message || err);
   }
 }
+
+// ------------------------
+// Multer upload error handler (must be registered after all routes)
+// ------------------------
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? 'Attachment exceeds the maximum allowed size (25MB)'
+      : 'Attachment upload failed';
+    return res.status(413).json({ message });
+  }
+  next(err);
+});
 
 // ------------------------
 // Start server
