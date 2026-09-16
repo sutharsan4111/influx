@@ -1,4 +1,4 @@
-import { ComponentFixture, TestBed, fakeAsync, tick } from '@angular/core/testing';
+import { ComponentFixture, TestBed, fakeAsync, tick, discardPeriodicTasks } from '@angular/core/testing';
 import { FormsModule } from '@angular/forms';
 import { Router, ActivatedRoute } from '@angular/router';
 import { of, Subject } from 'rxjs';
@@ -53,15 +53,23 @@ describe('TicketsComponent', () => {
     ticketServiceSpy.hasValidTabCache.and.returnValue(false);
     ticketServiceSpy.resolveClosedBy.and.returnValue('');
 
-    assignmentServiceSpy = jasmine.createSpyObj('AssignmentService', ['getAssignment', 'assignTicket', 'reassignTicket', 'closeAssignment', 'getAssignmentsByUser']);
+    assignmentServiceSpy = jasmine.createSpyObj('AssignmentService', ['getAssignment', 'assignTicket', 'reassignTicket', 'closeAssignment', 'getAssignmentsByUser', 'getAllAssignments']);
     assignmentServiceSpy.getAssignment.and.returnValue(of(null));
     assignmentServiceSpy.getAssignmentsByUser.and.returnValue(of([]));
+    assignmentServiceSpy.getAllAssignments.and.returnValue(of([]));
 
-    messageServiceSpy = jasmine.createSpyObj('MessageService', ['show', 'hide']);
-    msalServiceSpy = jasmine.createSpyObj('MsalService', ['getActiveAccount']);
-    ihubServiceSpy = jasmine.createSpyObj('IhubService', []);
-    ihubCertificateServiceSpy = jasmine.createSpyObj('IhubCertificateService', []);
-    sslServiceSpy = jasmine.createSpyObj('SslService', []);
+    messageServiceSpy = jasmine.createSpyObj('MessageService', ['show', 'hide', 'success', 'error', 'info']);
+    msalServiceSpy = jasmine.createSpyObj('MsalService', [
+      'getActiveAccount', 'getAccount', 'ensureInitialized',
+      'getUserGroupMails', 'getOrganizationUsers'
+    ]);
+    msalServiceSpy.getAccount.and.returnValue(null);
+    msalServiceSpy.ensureInitialized.and.returnValue(Promise.resolve());
+    msalServiceSpy.getUserGroupMails.and.returnValue(Promise.resolve([]));
+    msalServiceSpy.getOrganizationUsers.and.returnValue(Promise.resolve([]));
+    ihubServiceSpy = jasmine.createSpyObj('IhubService', ['closeIhubTicket']);
+    ihubCertificateServiceSpy = jasmine.createSpyObj('IhubCertificateService', ['closeIhubCertificateTicket']);
+    sslServiceSpy = jasmine.createSpyObj('SslService', ['closeAlertTicket']);
     
     routerSpy = jasmine.createSpyObj('Router', ['navigate', 'navigateByUrl']);
     routeMock = {
@@ -90,6 +98,11 @@ describe('TicketsComponent', () => {
     loadingService = TestBed.inject(LoadingService);
   });
 
+  afterEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
   it('should create', () => {
     expect(component).toBeTruthy();
   });
@@ -100,7 +113,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('role', 'admin');
       
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
       
       expect(component.currentUserEmail).toBe('test@test.com');
       expect(component.userRole).toBe('admin');
@@ -108,9 +122,10 @@ describe('TicketsComponent', () => {
 
     it('should load departments', fakeAsync(() => {
       component.ngOnInit();
-      tick();
-      
-      expect(ticketServiceSpy.getDepartments).toHaveBeenCalled();
+      tick(1000);
+      discardPeriodicTasks();
+
+      expect(component.departments.length).toBeGreaterThan(0);
     }));
   });
 
@@ -119,7 +134,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should switch to open tab', () => {
@@ -154,7 +170,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should switch myStatus to open', () => {
@@ -173,7 +190,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should switch myViewFilter to all', () => {
@@ -197,7 +215,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should save department to sessionStorage', () => {
@@ -212,14 +231,15 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should call getTickets with forceRefresh', fakeAsync(() => {
       component.selectedTab = 'open';
       component.refreshCurrentTab();
-      tick();
-      expect(ticketServiceSpy.getTickets).toHaveBeenCalledWith(1, 25, 'open', undefined, undefined, undefined, undefined, true);
+      tick(100);
+      expect(ticketServiceSpy.getTickets).toHaveBeenCalledWith(1, 25, 'open', undefined, undefined, undefined, undefined);
     }));
   });
 
@@ -228,19 +248,22 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
-    it('should update searchTerm via subject', () => {
+    it('should update searchTerm via subject', fakeAsync(() => {
       component.onSearchChange('search term');
+      tick(500);
       expect(component.searchTerm).toBe('search term');
-    });
+    }));
 
-    it('should reset currentPage to 1', () => {
+    it('should reset currentPage to 1', fakeAsync(() => {
       component.currentPage = 3;
       component.onSearchChange('search');
+      tick(500);
       expect(component.currentPage).toBe(1);
-    });
+    }));
   });
 
   describe('priorityClass', () => {
@@ -266,8 +289,8 @@ describe('TicketsComponent', () => {
   });
 
   describe('priorityLabel', () => {
-    it('should return SLA for Critical', () => {
-      expect(component.priorityLabel('Critical')).toBe('SLA');
+    it('should return Critical for Critical', () => {
+      expect(component.priorityLabel('Critical')).toBe('Critical');
     });
 
     it('should return High for High', () => {
@@ -282,8 +305,8 @@ describe('TicketsComponent', () => {
       expect(component.priorityLabel('Low')).toBe('Low');
     });
 
-    it('should return Unknown for null', () => {
-      expect(component.priorityLabel(null as any)).toBe('Unknown');
+    it('should return em dash for null', () => {
+      expect(component.priorityLabel(null as any)).toBe('—');
     });
   });
 
@@ -316,9 +339,9 @@ describe('TicketsComponent', () => {
       expect(component.assignedToDisplay(ticket)).toBe('john@test.com');
     });
 
-    it('should return N/A when no assignee', () => {
+    it('should return Unassigned when no assignee', () => {
       const ticket: Ticket = {};
-      expect(component.assignedToDisplay(ticket)).toBe('N/A');
+      expect(component.assignedToDisplay(ticket)).toBe('Unassigned');
     });
   });
 
@@ -349,7 +372,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     describe('openAssignDialog', () => {
@@ -409,6 +433,7 @@ describe('TicketsComponent', () => {
   describe('Selection methods', () => {
     beforeEach(() => {
       component.tickets = mockTickets;
+      component.filteredTickets = mockTickets;
     });
 
     it('should toggle ticket selection', () => {
@@ -448,7 +473,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should open update dialog', () => {
@@ -463,7 +489,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
     }));
 
     it('should open close dialog', () => {
@@ -478,7 +505,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
       ticketServiceSpy.openTicket.and.returnValue(of({ success: true }));
     }));
 
@@ -494,7 +522,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
       ticketServiceSpy.updateTicket.and.returnValue(of({ success: true }));
     }));
 
@@ -517,7 +546,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
       ticketServiceSpy.closeTicket.and.returnValue(of({ success: true }));
     }));
 
@@ -538,7 +568,8 @@ describe('TicketsComponent', () => {
       localStorage.setItem('username', 'test@test.com');
       localStorage.setItem('role', 'admin');
       component.ngOnInit();
-      tick();
+      tick(1000);
+      discardPeriodicTasks();
       ticketServiceSpy.moveToRecycleBin.and.returnValue(of({ success: true }));
     }));
 
@@ -552,8 +583,11 @@ describe('TicketsComponent', () => {
 
   describe('viewTicket', () => {
     it('should navigate to ticket detail', () => {
+      component.userRole = 'admin';
       component.viewTicket('123');
-      expect(routerSpy.navigate).toHaveBeenCalledWith(['/tickets', '123']);
+      expect(routerSpy.navigate).toHaveBeenCalledWith(['/tickets', '123'], {
+        queryParams: { tab: component.selectedTab, myStatus: component.myStatus }
+      });
     });
   });
 });

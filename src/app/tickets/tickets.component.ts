@@ -3030,7 +3030,8 @@ async loadTickets(showLoadingIndicator = true): Promise<void> {
     if ((status.includes('closed') || status.includes('resolved')) && closedBy) {
       return closedBy;
     }
-    return ticket.assignedTo || ticket.assignee?.email || ticket.assignee?.firstName || 'Unassigned';
+    const assigneeName = [ticket.assignee?.firstName, ticket.assignee?.lastName].filter(Boolean).join(' ');
+    return ticket.assignedTo || ticket.assignee?.email || assigneeName || 'Unassigned';
   }
 
   // Synchronous on purpose: role/email come straight from sessionStorage/MSAL's

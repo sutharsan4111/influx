@@ -84,11 +84,12 @@ describe('MessageService', () => {
     let messageCount = 0;
     service.message$.subscribe(msg => {
       messageCount++;
-      if (messageCount === 2) {
+      // 1st emission: initial null. 2nd: the message itself. 3rd: auto-clear.
+      if (messageCount === 3) {
         expect(msg).toBeNull();
         done();
       }
     });
     service.show('Test message', 'success');
-  });
+  }, 6000);
 });

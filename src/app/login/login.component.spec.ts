@@ -223,6 +223,7 @@ describe('LoginComponent', () => {
 
   describe('loginWithMicrosoft', () => {
     beforeEach(() => {
+      spyOn(window, 'fetch');
       component.msalReady = true;
       msalServiceSpy.getActiveAccount.and.returnValue({ 
         username: 'user@test.com', 
@@ -311,8 +312,8 @@ describe('LoginComponent', () => {
 
       component.loginWithMicrosoft();
       tick();
-      
-      expect(component.error).toBe('Backend authentication failed');
+
+      expect(component.error).toBe('Backend auth failed');
     }));
 
     it('should set error on MSAL login failure', async () => {

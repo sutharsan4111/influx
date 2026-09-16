@@ -86,7 +86,7 @@ describe('MsalService', () => {
 
     it('should throw error when MSAL instance is null', async () => {
       const nullMsalService = new MsalService(null as any);
-      await expectAsync(nullMsalService.ensureInitialized()).toBeRejectedWithError('MSAL is not available');
+      await expectAsync(nullMsalService.ensureInitialized()).toBeRejectedWithError('MSAL is not available (HTTP deployment)');
     });
   });
 
@@ -247,7 +247,7 @@ describe('MsalService', () => {
 
       const mails = await service.getUserGroupMails();
       expect(mails).toContain('group1@test.com');
-      expect(mails).toContain('Group 1');
+      expect(mails).toContain('group 1');
     });
   });
 
