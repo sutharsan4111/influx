@@ -4170,55 +4170,38 @@ async function computeUserTickets(userEmail, status, allowedDeptIds = []) {
     console.error('[computeUserTickets] contact path error:', e?.message || e);
   }
 
-  // ── Path 2: Fallback scan for requester/assignee tickets in global list ──
-  {
-    const BATCH = 5;
-    const PAGE = 100;
-    const MAX_OFFSET = 3000;
-    let from = 0;
-    let keepScanning = true;
-    while (keepScanning) {
-      const batchPromises = [];
-      for (let i = 0; i < BATCH; i++) {
-        const offset = from + i * PAGE;
-        if (offset > MAX_OFFSET) break;
-        batchPromises.push(
-          zohoFetch(`/tickets?limit=${PAGE}&from=${offset}&include=${include}`)
-            .then(r => r.ok ? r.json() : { data: [] })
-            .then(d => ({ data: d.data || [], offset }))
-            .catch(() => ({ data: [], offset }))
-        );
+  // ── Path 2: Direct assignee lookup ──
+  // Previously this scanned the entire org ticket list (up to 3000 tickets,
+  // up to ~30 Zoho calls) client-side filtering for assignee matches, because
+  // there's no per-contact-style endpoint for "tickets assigned to agent X".
+  // But Zoho Desk's /tickets list endpoint does accept assigneeId as a
+  // server-side filter (same as the departmentId/status filters used in
+  // computeCounts above), so resolve the user's agent id and page only
+  // through *their* tickets instead of the whole org's. addTicket() still
+  // re-validates isRequester/isAssignee against the real ticket data, so if
+  // this filter were ever ignored by Zoho, results stay correct — just not
+  // as fast as intended (logged below so that's verifiable after deploy).
+  const beforeAssigneePath = allUserTickets.length;
+  try {
+    const agentId = await lookupAgentIdByEmail(userEmail);
+    if (agentId) {
+      let from = 0;
+      let more = true;
+      while (more) {
+        const res = await zohoFetch(
+          `/tickets?assigneeId=${agentId}&from=${from}&limit=100&include=${include}`
+        ).then(r => r.ok ? r.json() : null).catch(() => null);
+        const tickets = res?.data || [];
+        tickets.filter(isStatusMatch).forEach(addTicket);
+        more = tickets.length === 100;
+        from += 100;
+        if (from > 2000) more = false;
       }
-      if (!batchPromises.length) break;
-      const batchResults = await Promise.all(batchPromises);
-      batchResults.sort((a, b) => a.offset - b.offset);
-      let anyFull = false;
-      for (const r of batchResults) {
-        for (const t of r.data) {
-          const tid = (t.id || '').toString();
-          const requesterEmail = (
-            t.email ||
-            t.contact?.email ||
-            t.contact?.emailAddress ||
-            t.contact?.secondaryEmail ||
-            t.requester?.email ||
-            t.customer?.email
-          || '').toLowerCase();
-          const assigneeEmail = (t.assignee?.email || t.assignee?.emailId || '').toLowerCase();
-          const isRequester = requesterEmail === userEmail;
-          const isAssignee = assigneeEmail === userEmail || supabaseAssignedIds.has(tid);
-          if ((isRequester || isAssignee) && isStatusMatch(t)) {
-            addTicket(t);
-          }
-        }
-        if (r.data.length === PAGE) anyFull = true;
-      }
-      if (!anyFull) break;
-      from += BATCH * PAGE;
-      if (from > MAX_OFFSET) break;
-      keepScanning = true;
     }
+  } catch (e) {
+    console.error('[computeUserTickets] assignee path error:', e?.message || e);
   }
+  console.log(`[computeUserTickets] assignee path added ${allUserTickets.length - beforeAssigneePath} ticket(s) for ${userEmail}`);
 
   // ── Path 3: Fetch any Supabase-assigned tickets not yet seen ──
   const missingIds = [...supabaseAssignedIds].filter(id => !seenIds.has(id));
