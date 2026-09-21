@@ -1,4 +1,4 @@
--- 007_runtime_performance_indexes.sql
+-- 008_runtime_performance_indexes.sql
 -- Production performance: indexes covering hot lookups used by /api/tickets,
 -- /api/tickets/counts and /api/tickets/:id/conversations.
 -- All indexes are created IF NOT EXISTS so the migration is idempotent.

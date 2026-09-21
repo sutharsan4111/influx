@@ -862,7 +862,10 @@ export class SidebarComponent implements OnInit {
       return;
     }
 
-    this.http.post<any>('/api/auth/switch-role', { role: this.selectedRole }, {
+    this.http.post<any>('/api/auth/switch-role', {
+      role: this.selectedRole,
+      refreshToken: localStorage.getItem('refreshToken')
+    }, {
       headers: this.getAuthHeaders()
     }).subscribe({
       next: (data) => {

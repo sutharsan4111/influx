@@ -11,7 +11,7 @@ The app is a single Node/Express server (`server.js`) that serves a REST API und
 - **Ticketing** — creates, lists, assigns, and tracks tickets synced with Zoho Desk (`/api/tickets`, `/api/zoho`), including a recycle bin for soft-deleted tickets and a project workspace view.
 - **Dashboard** — at-a-glance ticket and operations metrics.
 - **CloudOps** — cloud project and asset tracking (`/api/cloudops`).
-- **Azure Backup monitoring** — collects and reports Azure Recovery Services backup status via a PowerShell-based collector (`azure-backup-collector.js`, requires PowerShell Core + Az modules).
+- **Azure Backup monitoring** — collects and reports Azure Recovery Services backup status via `azure-backup-collector.js`, using `@azure/identity` and the Azure REST API directly (no PowerShell dependency). Reports are persisted in Postgres (`azure_backup_reports`), not the container filesystem.
 - **Infrastructure / Certificates** — SSL certificate tracking and automation, plus iHub certificate management (`/api/ssl`, `/api/automation-ssl`, `/api/ihub`, `/api/ihub-certificate`).
 - **Admin** — user and role management, feature toggles (`/api/admin`, `/api/users`).
 - **Monitoring & Alerting** — Prometheus/Alertmanager webhook ingestion with Microsoft Teams notifications (`/api/monitoring`, `/api/webhook`).
@@ -44,17 +44,17 @@ src/app/
   services/, shared/     Shared services, guards, interceptors
 server.js              Express API + static server (all /api/* routes)
 db.js                  PostgreSQL connection pool
-azure-backup-collector.js  Azure backup data collection (PowerShell)
+azure-backup-collector.js  Azure backup data collection (Azure SDK / REST API)
 migrations/            SQL schema migrations
+runMigration.js        Applies migrations/*.sql in order, tracked in schema_migrations
 ```
 
 ## Getting Started
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 18.x (matches the production image — see `engines` in package.json and `Dockerfile`)
 - PostgreSQL database
-- (Optional, for Azure Backup collection) PowerShell Core with `Az.Accounts`, `Az.RecoveryServices`, `Az.Resources` modules
 
 ### Setup
 
@@ -64,7 +64,13 @@ npm install
 
 Create a `.env` file in the project root with the required variables (see [Environment Variables](#environment-variables) below).
 
-Run database migrations against your PostgreSQL instance using the SQL files in [migrations/](migrations/), in order.
+Apply the database schema:
+
+```bash
+npm run migrate
+```
+
+This runs every file in [migrations/](migrations/) in order and records what's applied in a `schema_migrations` table, so re-running only applies what's new.
 
 ### Development
 
@@ -89,10 +95,14 @@ npm start
 ### Docker
 
 ```bash
-docker compose up --build
+docker build -t itsm-influx .
+docker run --env-file .env -p 3000:3000 itsm-influx
 ```
 
-Serves the app on `http://localhost:3000`.
+The `Dockerfile` builds the Angular frontend and the Express server from this
+repo in one multi-stage build — no separate build step or staging folder
+needed. `docker compose up --build` also works for local development (bind-mounts
+the repo and rebuilds on start).
 
 ## Environment Variables
 
@@ -122,3 +132,4 @@ Configured via `.env` (not committed):
 | `npm run build:prod` | Angular production build |
 | `npm run watch` | Angular build in watch mode |
 | `npm test` | Run Angular unit tests |
+| `npm run migrate` | Apply pending database migrations (migrations/*.sql) |

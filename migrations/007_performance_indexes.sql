@@ -1,6 +1,6 @@
 -- ============= DATABASE PERFORMANCE INDEXES =============
 -- Run these commands on your PostgreSQL database to improve query performance
--- File: 006_performance_indexes.sql
+-- File: 007_performance_indexes.sql
 
 -- Index for ticket assignment lookups (frequently queried by primary_assignee)
 CREATE INDEX IF NOT EXISTS idx_ticket_assignments_primary_assignee 

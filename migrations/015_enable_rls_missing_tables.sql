@@ -1,17 +1,15 @@
 -- Enable RLS on public tables flagged (again) by the Supabase Security Advisor
--- (rls_disabled_in_public). These tables were added after the 008/009 baseline
+-- (rls_disabled_in_public). These tables were added after the 009/011 baseline
 -- and, in the case of the ihub_certificate_* tables, the RLS statements that
--- already existed in 011 were apparently never actually applied to this DB.
+-- already existed in 013 were apparently never actually applied to this DB.
 --
--- Same rationale as 008/009: these tables are accessed exclusively via the
+-- Same rationale as 009/011: these tables are accessed exclusively via the
 -- Node.js backend's direct Postgres connection (which bypasses RLS).
 -- PostgREST (anon/authenticated) must never access them directly.
 --
--- NOTE: This is also applied automatically on every server boot by
--- runMigrations() in server.js, so it cannot silently regress again the way
--- 011's policies did. This file remains for the historical record and so it
--- can be applied immediately (via runMigration.js) without waiting on a
--- server restart.
+-- NOTE: Schema no longer runs at server boot (see runMigration.js) — apply
+-- this, and every other file here, via `npm run migrate` so it can't
+-- silently regress again the way 013's policies did.
 
 ALTER TABLE IF EXISTS public.cloudops_tasks                    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE IF EXISTS public.monitoring_azure_resources        ENABLE ROW LEVEL SECURITY;

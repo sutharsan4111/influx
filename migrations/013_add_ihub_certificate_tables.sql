@@ -27,10 +27,15 @@ CREATE TABLE IF NOT EXISTS ihub_certificate_alert_tickets (
   UNIQUE (ihub_certificate_asset_id, milestone_days, license_expiry_on)
 );
 
--- Same security baseline as ihub_assets/ihub_alert_tickets (see 008/009):
+-- Same security baseline as ihub_assets/ihub_alert_tickets (see 009/011):
 -- backend-only tables, accessed exclusively via the Node.js service-role connection.
 ALTER TABLE IF EXISTS public.ihub_certificate_assets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE IF EXISTS public.ihub_certificate_alert_tickets ENABLE ROW LEVEL SECURITY;
+
+-- Postgres has no `CREATE POLICY IF NOT EXISTS` — DROP IF EXISTS first so this
+-- migration can be re-run.
+DROP POLICY IF EXISTS "backend_only" ON public.ihub_certificate_assets;
+DROP POLICY IF EXISTS "backend_only" ON public.ihub_certificate_alert_tickets;
 
 CREATE POLICY "backend_only" ON public.ihub_certificate_assets        AS RESTRICTIVE FOR ALL TO public USING (false);
 CREATE POLICY "backend_only" ON public.ihub_certificate_alert_tickets AS RESTRICTIVE FOR ALL TO public USING (false);

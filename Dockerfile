@@ -1,37 +1,35 @@
-# Base image with Node.js 20 + PowerShell Core for Azure backup collection
-FROM node:20
+# Builds straight from this repo — no external staging folder. Matches the
+# runtime that's actually deployed (node:18-alpine, no PowerShell: the Azure
+# Backup collector uses @azure/identity + the REST API, never pwsh).
 
+# ---- Stage 1: build the Angular frontend ----
+FROM node:20 AS build
 WORKDIR /app
+COPY package*.json ./
+RUN npm ci --legacy-peer-deps
+COPY tsconfig*.json angular.json ./
+COPY src ./src
+RUN npm run build:prod
 
+# ---- Stage 2: production runtime ----
+FROM node:18-alpine
+WORKDIR /app
 ENV NODE_ENV=production
-ENV NPM_CONFIG_LOGLEVEL=warn
 
-# Create azure-monitoring directory with proper permissions for Azure backup collection
+# Azure Backup collection writes here; persisted in Postgres, not this
+# filesystem (see azure_backup_reports migration) — this dir is scratch only.
 RUN mkdir -p /app/azure-monitoring && chown -R node:node /app/azure-monitoring
 
-# Install PowerShell Core (pwsh) for Azure backup collection
-RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates apt-transport-https && \
-    wget -q https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/powershell_7.4.6-1.deb_amd64.deb && \
-    dpkg -i powershell_7.4.6-1.deb_amd64.deb 2>/dev/null || apt-get install -f -y && \
-    rm -f powershell_7.4.6-1.deb_amd64.deb && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Install Azure PowerShell modules required by the backup collection script
-RUN pwsh -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted" && \
-    pwsh -Command "Install-Module -Name Az.Accounts, Az.RecoveryServices, Az.Resources -Scope AllUsers -Force -AllowClobber"
-
-# Copy package files and install dependencies
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --omit=dev --legacy-peer-deps
 
-# Copy application code
-COPY . .
+COPY server.js db.js azure-backup-collector.js runMigration.js ./
+COPY certs ./certs
+COPY migrations ./migrations
+COPY --from=build /app/dist/ticket-portal ./dist/ticket-portal
 
-# Ensure node user owns the app directory
 RUN chown -R node:node /app
-
-# Switch to non-root user
 USER node
 
 EXPOSE 3000
-
+CMD ["node", "server.js"]

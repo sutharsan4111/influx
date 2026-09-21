@@ -1,0 +1,22 @@
+# App build manifest — read by the cloudops-nexus app-pipeline (see
+# cloudops-nexus/docs/onboarding/repo-onboarding-guide.md).
+#
+# NOT yet live: this repo (sutharsan4111/influx) is under a personal GitHub
+# account, not the muraai org. The hub's dispatch GitHub App is installed on
+# the muraai org and can only be granted access to repos inside it — until
+# this repo is transferred into muraai (or the app maintainer grants access
+# another way), hub-dispatch.yml's dispatch step will no-op with
+# "hub dispatch app not installed/configured for this repo — skipping."
+# This file and hub-dispatch.yml are prepared so onboarding is a policy.yaml
+# entry + repo-access grant away, not a from-scratch CI setup.
+
+zoho-itsm:
+  paths:
+    - "**"
+  image:
+    repo: itsm/zoho-frontend
+    context: .
+    dockerfile: Dockerfile
+    port: 3000
+  sast:
+    path: .

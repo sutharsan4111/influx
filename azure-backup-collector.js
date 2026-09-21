@@ -1,12 +1,9 @@
 const { ClientSecretCredential } = require('@azure/identity');
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
 
 const TENANT_ID = process.env.AZURE_TENANT_ID;
 const CLIENT_ID = process.env.AZURE_CLIENT_ID;
 const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
-const AZURE_BACKUP_DIR = path.join(__dirname, 'azure-monitoring');
 
 let credential = null;
 
@@ -89,22 +86,15 @@ async function listAllSubscriptions(token) {
   return httpsGetAllPages(url, token);
 }
 
-function latestBackupDataFile() {
-  if (!fs.existsSync(AZURE_BACKUP_DIR)) return null;
-  return fs.readdirSync(AZURE_BACKUP_DIR)
-    .filter(name => name.startsWith('AzureBackupData_') && name.toLowerCase().endsWith('.json'))
-    .map(name => ({ name, path: path.join(AZURE_BACKUP_DIR, name), mtime: fs.statSync(path.join(AZURE_BACKUP_DIR, name)).mtime }))
-    .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())[0] || null;
-}
-
-function knownVaultsFromLatestReport(subscriptionName, subscriptionId) {
+// Falls back to vaults seen in the most recent successful report (passed in by the
+// caller, which reads it from Postgres) when the live vault-listing API call comes
+// back empty \u2014 e.g. a transient ARM permissions/throttling issue.
+function knownVaultsFromLatestReport(subscriptionName, subscriptionId, knownRecords) {
   try {
-    const latest = latestBackupDataFile();
-    if (!latest) return [];
-    const records = JSON.parse(fs.readFileSync(latest.path, 'utf8').replace(/^\uFEFF/, ''));
+    const records = Array.isArray(knownRecords) ? knownRecords : [];
     const byKey = new Map();
 
-    for (const record of Array.isArray(records) ? records : []) {
+    for (const record of records) {
       const matchesSubscription = [record.SubscriptionName, record.SubscriptionId, record.SubscriptionID]
         .filter(Boolean)
         .some(value => String(value).toLowerCase() === String(subscriptionName || subscriptionId).toLowerCase() || String(value).toLowerCase() === String(subscriptionId).toLowerCase());
@@ -122,7 +112,7 @@ function knownVaultsFromLatestReport(subscriptionName, subscriptionId) {
 
     const vaults = [...byKey.values()];
     if (vaults.length) {
-      console.log(`[AZ-SDK]   Using ${vaults.length} known vault(s) from ${latest.name}`);
+      console.log(`[AZ-SDK]   Using ${vaults.length} known vault(s) from the last report`);
     }
     return vaults;
   } catch (e) {
@@ -473,14 +463,14 @@ async function collectStorageAccountRecords(accessToken, subId, subName, sa) {
   return records.filter(Boolean);
 }
 
-async function collectSubscriptionRecords(accessToken, sub) {
+async function collectSubscriptionRecords(accessToken, sub, knownRecords) {
   const subId = sub.subscriptionId;
   const subName = sub.displayName || subId;
   console.log(`[AZ-SDK] Processing subscription: ${subName} (${subId})`);
 
   let vaults = await listVaultsForSubscription(accessToken, subId);
   if (!vaults.length) {
-    vaults = knownVaultsFromLatestReport(subName, subId);
+    vaults = knownVaultsFromLatestReport(subName, subId, knownRecords);
   }
   console.log(`[AZ-SDK]   Found ${vaults.length} Recovery Services vault(s)`);
 
@@ -499,7 +489,7 @@ async function collectSubscriptionRecords(accessToken, sub) {
   return [...vaultResults.flat(), ...saResults.flat()];
 }
 
-async function collectAzureBackupData(token) {
+async function collectAzureBackupData(token, knownRecords = []) {
   const accessToken = token || await getToken();
   console.log('[AZ-SDK] Starting Azure backup collection via REST API');
 
@@ -509,7 +499,7 @@ async function collectAzureBackupData(token) {
   // Subscriptions are independent — collect all of them concurrently. Rate-limit protection
   // now happens at the recovery-point/snapshot fetch level (mapWithConcurrency) instead of by
   // serializing whole subscriptions, which is what was making this take 20-25s.
-  const subResults = await Promise.all(subs.map(sub => collectSubscriptionRecords(accessToken, sub)));
+  const subResults = await Promise.all(subs.map(sub => collectSubscriptionRecords(accessToken, sub, knownRecords)));
   const allRecords = subResults.flat();
 
   console.log(`[AZ-SDK] Total records collected: ${allRecords.length}`);
@@ -579,509 +569,3 @@ function deduplicateFileShares(records) {
 }
 
 module.exports = { collectAzureBackupData, deduplicateFileShares };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// const { ClientSecretCredential } = require('@azure/identity');
-// const https = require('https');
-// const fs = require('fs');
-// const path = require('path');
-
-// const TENANT_ID = process.env.AZURE_TENANT_ID;
-// const CLIENT_ID = process.env.AZURE_CLIENT_ID;
-// const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
-// const AZURE_BACKUP_DIR = path.join(__dirname, 'azure-monitoring');
-
-// let credential = null;
-
-// function getCredential() {
-//   if (!credential) {
-//     if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET) {
-//       throw new Error('AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET must be set in environment');
-//     }
-//     credential = new ClientSecretCredential(TENANT_ID, CLIENT_ID, CLIENT_SECRET);
-//   }
-//   return credential;
-// }
-
-// async function getToken() {
-//   const cred = getCredential();
-//   const tokenResponse = await cred.getToken('https://management.azure.com/.default');
-//   return tokenResponse.token;
-// }
-
-// function httpsGet(url, token) {
-//   return new Promise((resolve, reject) => {
-//     const options = {
-//       headers: {
-//         Authorization: `Bearer ${token}`,
-//         'Content-Type': 'application/json'
-//       }
-//     };
-//     https.get(url, options, (res) => {
-//       let data = '';
-//       res.on('data', chunk => data += chunk);
-//       res.on('end', () => {
-//         if (res.statusCode >= 200 && res.statusCode < 300) {
-//           try { resolve(JSON.parse(data)); }
-//           catch (e) { reject(new Error(`Parse error: ${e.message}`)); }
-//         } else {
-//           reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
-//         }
-//       });
-//     }).on('error', reject);
-//   });
-// }
-
-// async function listAllSubscriptions(token) {
-//   const url = 'https://management.azure.com/subscriptions?api-version=2020-01-01';
-//   const response = await httpsGet(url, token);
-//   return response.value || [];
-// }
-
-// function latestBackupDataFile() {
-//   if (!fs.existsSync(AZURE_BACKUP_DIR)) return null;
-//   return fs.readdirSync(AZURE_BACKUP_DIR)
-//     .filter(name => name.startsWith('AzureBackupData_') && name.toLowerCase().endsWith('.json'))
-//     .map(name => ({ name, path: path.join(AZURE_BACKUP_DIR, name), mtime: fs.statSync(path.join(AZURE_BACKUP_DIR, name)).mtime }))
-//     .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())[0] || null;
-// }
-
-// function knownVaultsFromLatestReport(subscriptionName, subscriptionId) {
-//   try {
-//     const latest = latestBackupDataFile();
-//     if (!latest) return [];
-//     const records = JSON.parse(fs.readFileSync(latest.path, 'utf8').replace(/^\uFEFF/, ''));
-//     const byKey = new Map();
-
-//     for (const record of Array.isArray(records) ? records : []) {
-//       const matchesSubscription = [record.SubscriptionName, record.SubscriptionId, record.SubscriptionID]
-//         .filter(Boolean)
-//         .some(value => String(value).toLowerCase() === String(subscriptionName || subscriptionId).toLowerCase() || String(value).toLowerCase() === String(subscriptionId).toLowerCase());
-//       if (!matchesSubscription || !record.VaultName || !record.ResourceGroup || record.VaultName === 'N/A') continue;
-
-//       const key = `${record.ResourceGroup}/${record.VaultName}`.toLowerCase();
-//       if (!byKey.has(key)) {
-//         byKey.set(key, {
-//           id: `/subscriptions/${subscriptionId}/resourceGroups/${record.ResourceGroup}/providers/Microsoft.RecoveryServices/vaults/${record.VaultName}`,
-//           name: record.VaultName,
-//           resourceGroup: record.ResourceGroup
-//         });
-//       }
-//     }
-
-//     const vaults = [...byKey.values()];
-//     if (vaults.length) {
-//       console.log(`[AZ-SDK]   Using ${vaults.length} known vault(s) from ${latest.name}`);
-//     }
-//     return vaults;
-//   } catch (e) {
-//     console.warn(`[AZ-SDK] Cannot read known vault fallback: ${e.message}`);
-//     return [];
-//   }
-// }
-
-// function resourceGroupFromId(id) {
-//   const match = /\/resourceGroups\/([^/]+)/i.exec(id || '');
-//   return match ? decodeURIComponent(match[1]) : '';
-// }
-
-// async function listResourcesByType(token, subscriptionId, resourceType) {
-//   const filter = encodeURIComponent(`resourceType eq '${resourceType}'`);
-//   const url = `https://management.azure.com/subscriptions/${subscriptionId}/resources?$filter=${filter}&api-version=2021-04-01`;
-//   try {
-//     const response = await httpsGet(url, token);
-//     return (response.value || []).map(resource => ({
-//       ...resource,
-//       resourceGroup: resource.resourceGroup || resourceGroupFromId(resource.id)
-//     }));
-//   } catch (e) {
-//     console.warn(`[AZ-SDK] Cannot list ${resourceType} resources for sub ${subscriptionId}: ${e.message}`);
-//     return [];
-//   }
-// }
-
-// async function listVaultsForSubscription(token, subscriptionId) {
-//   try {
-//     const url = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.RecoveryServices/vaults?api-version=2023-04-01`;
-//     const response = await httpsGet(url, token);
-//     const vaults = response.value || [];
-//     if (vaults.length) return vaults.map(vault => ({ ...vault, resourceGroup: vault.resourceGroup || resourceGroupFromId(vault.id) }));
-//   } catch (e) {
-//     console.warn(`[AZ-SDK] Cannot list vaults for sub ${subscriptionId}: ${e.message}`);
-//   }
-//   return listResourcesByType(token, subscriptionId, 'Microsoft.RecoveryServices/vaults');
-// }
-
-// async function listBackupProtectedItems(token, subscriptionId, resourceGroup, vaultName) {
-//   const versions = ['2023-02-01', '2024-04-01', '2024-10-01'];
-//   for (const apiVersion of versions) {
-//     const url = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.RecoveryServices/vaults/${vaultName}/backupProtectedItems?api-version=${apiVersion}`;
-//     try {
-//       const response = await httpsGet(url, token);
-//       return response.value || [];
-//     } catch (e) {
-//       console.warn(`[AZ-SDK] Cannot list backup items for ${vaultName} with ${apiVersion}: ${e.message}`);
-//     }
-//   }
-//   return [];
-// }
-
-// async function listRecoveryPointsForBackupItem(token, item) {
-//   const itemId = item?.id || '';
-//   const itemName = item?.name || 'Unknown';
-//   if (!itemId) return [];
-
-//   const versions = ['2023-02-01', '2024-04-01', '2024-10-01'];
-//   for (const apiVersion of versions) {
-//     const url = `https://management.azure.com${itemId}/recoveryPoints?api-version=${apiVersion}`;
-//     try {
-//       const response = await httpsGet(url, token);
-//       return response.value || [];
-//     } catch (e) {
-//       console.warn(`[AZ-SDK] Cannot list recovery points for ${itemName} with ${apiVersion}: ${e.message}`);
-//     }
-//   }
-//   return [];
-// }
-
-// async function listStorageAccounts(token, subscriptionId) {
-//   try {
-//     const url = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01`;
-//     const response = await httpsGet(url, token);
-//     const accounts = response.value || [];
-//     if (accounts.length) return accounts.map(account => ({ ...account, resourceGroup: account.resourceGroup || resourceGroupFromId(account.id) }));
-//   } catch (e) {
-//     console.warn(`[AZ-SDK] Cannot list storage accounts for sub ${subscriptionId}: ${e.message}`);
-//   }
-//   return listResourcesByType(token, subscriptionId, 'Microsoft.Storage/storageAccounts');
-// }
-
-// async function listFileSharesInStorageAccount(token, subscriptionId, resourceGroup, storageAccountName) {
-//   const url = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Storage/storageAccounts/${storageAccountName}/fileServices/default/shares?api-version=2023-01-01`;
-//   try {
-//     const response = await httpsGet(url, token);
-//     return response.value || [];
-//   } catch (e) {
-//     console.warn(`[AZ-SDK] Cannot list file shares for ${storageAccountName}: ${e.message}`);
-//     return [];
-//   }
-// }
-
-// async function listFileShareSnapshots(token, subscriptionId, resourceGroup, storageAccountName, fileShareName) {
-//   const url = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Storage/storageAccounts/${storageAccountName}/fileServices/default/shares/${fileShareName}/snapshots?api-version=2023-01-01`;
-//   try {
-//     const response = await httpsGet(url, token);
-//     return response.value || [];
-//   } catch (e) {
-//     return [];
-//   }
-// }
-
-// function statusFromProtectionState(state) {
-//   const s = (state || '').toLowerCase();
-//   if (s === 'protected' || s === 'irpending' || s === 'backupupfront') return 'Healthy';
-//   if (s === 'unprotected' || s === 'protectionstopped') return 'Warning';
-//   if (s === 'protectionerror') return 'Failed';
-//   return 'Warning';
-// }
-
-// function consistencyFromHealth(health) {
-//   const h = (health || '').toLowerCase();
-//   if (h.includes('application')) return 'Application Consistent';
-//   if (h.includes('file')) return 'File-System Consistent';
-//   if (h.includes('crash') || h === 'invalid' || !h) return 'Crash Consistent';
-//   if (h === 'passed' || h === 'success' || h === 'succeeded' || h === 'healthy') return 'N/A';
-//   return health || 'N/A';
-// }
-
-// function consistencyFromRecoveryPoint(recoveryPoint) {
-//   const props = recoveryPoint?.properties || {};
-//   const text = [
-//     props.recoveryPointType,
-//     props.consistencyType,
-//     props.recoveryPointAdditionalInfo,
-//     props.recoveryPointProperties
-//   ].filter(Boolean).join(' ').toLowerCase();
-
-//   if (text.includes('appconsistent') || text.includes('application')) return 'Application Consistent';
-//   if (text.includes('crashconsistent') || text.includes('crash')) return 'Crash Consistent';
-//   if (text.includes('filesystemconsistent') || text.includes('file-system') || text.includes('file system')) return 'File-System Consistent';
-//   return '';
-// }
-
-// function recoveryTypeFromRecoveryPoint(recoveryPoint, fallback) {
-//   const props = recoveryPoint?.properties || {};
-//   const tierText = JSON.stringify(props.recoveryPointTierDetails || props.tierDetails || []);
-//   const combined = `${props.recoveryPointTierType || ''} ${props.recoveryPointType || ''} ${tierText} ${fallback || ''}`.toLowerCase();
-//   const hasSnapshot = combined.includes('snapshot') || combined.includes('instant');
-//   const hasVault = combined.includes('vault') || combined.includes('hardened') || combined.includes('standard');
-
-//   if (hasSnapshot && hasVault) return 'Snapshot and Vault-Standard';
-//   if (hasSnapshot) return 'Snapshot';
-//   if (hasVault) return 'Vault-Standard';
-//   return fallback || 'N/A';
-// }
-
-// function recoveryPointTime(recoveryPoint) {
-//   const props = recoveryPoint?.properties || {};
-//   return props.recoveryPointTime || props.recoveryPointTimeInUTC || props.recoveryPointTimeInUtc || props.creationTime || props.createdTime || '';
-// }
-
-// function latestRecoveryPoint(recoveryPoints) {
-//   return [...(recoveryPoints || [])]
-//     .filter(rp => recoveryPointTime(rp))
-//     .sort((a, b) => new Date(recoveryPointTime(b)) - new Date(recoveryPointTime(a)))[0] || null;
-// }
-
-// function getItemType(item) {
-//   const props = item.properties || {};
-//   const mgmtType = (props.backupManagementType || '').toLowerCase();
-//   const itemType = (item.type || '').toLowerCase();
-//   const itemName = (item.name || '').toLowerCase();
-  
-//   if (mgmtType === 'azurestorage' || itemType.includes('azurefileshare') || itemType.includes('fileshare') || itemName.startsWith('azurefileshare;')) {
-//     return 'File Share';
-//   }
-//   if (mgmtType === 'azureiaasvm' || mgmtType === 'iaasvm' || itemType.includes('virtualmachine') || itemName.startsWith('vm;')) {
-//     return 'Azure VM';
-//   }
-//   return 'Azure VM';
-// }
-
-// function getResourceName(item, itemType) {
-//   const props = item.properties || {};
-//   const rawName = item.name || item.id?.split('/').pop() || 'Unknown';
-//   const friendlyName = props.friendlyName || props.protectedItemDataSourceId?.split('/').pop();
-
-//   if (friendlyName && !String(friendlyName).includes(';')) return friendlyName;
-//   if (itemType === 'Azure VM' && rawName.toLowerCase().startsWith('vm;')) {
-//     return rawName.split(';').filter(Boolean).pop() || rawName;
-//   }
-//   return rawName;
-// }
-
-// function convertToBackupRecord(item, vault, subscriptionName, subscriptionId, latestRp = null, storageAccountName = null) {
-//   const props = item.properties || {};
-//   const rpTime = recoveryPointTime(latestRp);
-//   const lastBackup = rpTime ? new Date(rpTime) : props.lastBackupTime ? new Date(props.lastBackupTime) : null;
-//   const now = new Date();
-//   const ageHours = lastBackup ? Math.round((now - lastBackup) / 3600000) : -1;
-//   const protectionState = props.protectionState || 'N/A';
-//   const status = statusFromProtectionState(protectionState);
-//   const itemType = getItemType(item);
-//   const recoveryPointConsistency = consistencyFromRecoveryPoint(latestRp);
-//   const consistency = recoveryPointConsistency || consistencyFromHealth(props.healthStatus);
-//   const itemName = getResourceName(item, itemType);
-//   const rawItemName = item.name || item.id?.split('/').pop() || 'Unknown';
-//   const recoveryType = recoveryTypeFromRecoveryPoint(
-//     latestRp,
-//     itemType === 'File Share' ? 'Snapshot' : 'Snapshot and Vault-Standard'
-//   );
-
-//   const actualStorageAccount = storageAccountName || (itemType === 'File Share' ? vault.name : '');
-
-//   const baseRecord = {
-//     TenantId: TENANT_ID || '',
-//     TenantName: '',
-//     SubscriptionName: subscriptionName || subscriptionId,
-//     ResourceGroup: vault.resourceGroup || 'N/A',
-//     VaultName: vault.name || 'N/A',
-//     BackupType: itemType,
-//     ResourceName: itemName,
-//     RawResourceName: rawItemName,
-//     BackupStatus: status,
-//     LastBackupStatus: props.lastBackupStatus || 'N/A',
-//     PreBackupStatus: props.lastBackupStatus || 'N/A',
-//     ConsistencyType: consistency,
-//     RecoveryType: recoveryType,
-//     LatestRPTime: lastBackup ? lastBackup.toISOString() : 'N/A',
-//     LastBackupTime: lastBackup ? lastBackup.toISOString() : 'N/A',
-//     BackupAge: ageHours >= 0 ? `${ageHours}h ago` : 'N/A',
-//     BackupAgeHours: ageHours,
-//     PolicyName: props.policyName || 'N/A',
-//     ProtectionState: protectionState,
-//     StorageAccount: actualStorageAccount
-//   };
-
-//   if (itemType === 'File Share') {
-//     baseRecord.ConsistencyType = 'File-System Consistent';
-//     baseRecord.RecoveryType = 'Snapshot';
-//   }
-
-//   return baseRecord;
-// }
-
-// async function collectAzureBackupData(token) {
-//   const accessToken = token || await getToken();
-//   console.log('[AZ-SDK] Starting Azure backup collection via REST API');
-//   const allRecords = [];
-
-//   const subs = await listAllSubscriptions(accessToken);
-//   console.log(`[AZ-SDK] Found ${subs.length} subscription(s)`);
-
-//   // Process subscriptions sequentially (to avoid rate limits), but vaults/storage accounts in parallel within each subscription
-//   for (const sub of subs) {
-//     const subId = sub.subscriptionId;
-//     const subName = sub.displayName || subId;
-//     console.log(`[AZ-SDK] Processing subscription: ${subName} (${subId})`);
-
-//     let vaults = await listVaultsForSubscription(accessToken, subId);
-//     if (!vaults.length) {
-//       vaults = knownVaultsFromLatestReport(subName, subId);
-//     }
-//     console.log(`[AZ-SDK]   Found ${vaults.length} Recovery Services vault(s)`);
-
-//     // Process vaults in parallel (with concurrency limit to avoid rate limits)
-//     const vaultResults = await Promise.all(vaults.map(async (vault) => {
-//       const vaultName = vault.name;
-//       const rg = vault.resourceGroup || resourceGroupFromId(vault.id);
-//       console.log(`[AZ-SDK]   Vault: ${vaultName} (rg: ${rg})`);
-
-//       const items = await listBackupProtectedItems(accessToken, subId, rg, vaultName);
-//       console.log(`[AZ-SDK]     ${items.length} backup item(s)`);
-
-//       // Fetch recovery points in parallel (much faster)
-//       const itemsWithRp = await Promise.all(items.map(async (item) => {
-//         console.log(`[AZ-SDK]       Item: name=${item.name}, type=${item.type}, backupManagementType=${item.properties?.backupManagementType}`);
-//         const recoveryPoints = await listRecoveryPointsForBackupItem(accessToken, item);
-//         const latestRp = latestRecoveryPoint(recoveryPoints);
-//         const itemType = getItemType(item);
-//         const record = convertToBackupRecord(item, { name: vaultName, resourceGroup: rg }, subName, subId, latestRp, itemType === 'File Share' ? vaultName : null);
-//         if (latestRp) {
-//           console.log(`[AZ-SDK]       Latest RP: ${recoveryPointTime(latestRp)} | ${record.ConsistencyType} | ${record.RecoveryType}`);
-//         }
-//         return record;
-//       }));
-
-//       return itemsWithRp;
-//     }));
-
-//     // Flatten vault results
-//     for (const records of vaultResults) {
-//       allRecords.push(...records);
-//     }
-
-//     // Also check storage accounts for Azure File Shares backup (native snapshots)
-//     const storageAccounts = await listStorageAccounts(accessToken, subId);
-//     console.log(`[AZ-SDK]   Found ${storageAccounts.length} storage account(s)`);
-
-//     // Process storage accounts in parallel
-//     const saResults = await Promise.all(storageAccounts.map(async (sa) => {
-//       const saName = sa.name;
-//       const saRg = sa.resourceGroup || resourceGroupFromId(sa.id);
-//       console.log(`[AZ-SDK]   Storage Account: ${saName} (rg: ${saRg})`);
-
-//       const fileShares = await listFileSharesInStorageAccount(accessToken, subId, saRg, saName);
-//       console.log(`[AZ-SDK]     ${fileShares.length} file share(s)`);
-
-//       // Fetch snapshots in parallel
-//       const fsRecords = await Promise.all(fileShares.map(async (fs) => {
-//         const fsName = fs.name;
-//         const snapshots = await listFileShareSnapshots(accessToken, subId, saRg, saName, fsName);
-//         const latestSnapshot = snapshots.length > 0
-//           ? snapshots.sort((a, b) => new Date(b.properties.snapshotTime) - new Date(a.properties.snapshotTime))[0]
-//           : null;
-
-//         const lastBackupTime = latestSnapshot ? latestSnapshot.properties.snapshotTime : null;
-//         const now = new Date();
-//         const ageHours = lastBackupTime ? Math.round((now - new Date(lastBackupTime)) / 3600000) : -1;
-//         const status = lastBackupTime ? 'Healthy' : 'Warning';
-
-//         return {
-//           TenantId: TENANT_ID || '',
-//           TenantName: '',
-//           SubscriptionName: subName,
-//           ResourceGroup: saRg,
-//           VaultName: saName,
-//           BackupType: 'File Share',
-//           ResourceName: fsName,
-//           BackupStatus: status,
-//           LastBackupStatus: lastBackupTime ? 'Completed' : 'N/A',
-//           PreBackupStatus: lastBackupTime ? 'Succeeded' : 'N/A',
-//           ConsistencyType: 'File-System Consistent',
-//           RecoveryType: 'Snapshot',
-//           LatestRPTime: lastBackupTime || 'N/A',
-//           LastBackupTime: lastBackupTime || 'N/A',
-//           BackupAge: ageHours >= 0 ? `${ageHours}h ago` : 'N/A',
-//           BackupAgeHours: ageHours,
-//           PolicyName: 'Native Snapshot',
-//           ProtectionState: lastBackupTime ? 'Protected' : 'Unprotected',
-//           StorageAccount: saName
-//         };
-//       }));
-
-//       return fsRecords;
-//     }));
-
-//     for (const records of saResults) {
-//       allRecords.push(...records);
-//     }
-//   }
-
-//   console.log(`[AZ-SDK] Total records collected: ${allRecords.length}`);
-//   return allRecords;
-// }
-
-// // Deduplicate file shares that appear both in vault backup and storage account native snapshots
-// function deduplicateFileShares(records) {
-//   const seen = new Map();
-//   const deduped = [];
-
-//   for (const record of records) {
-//     const isFileShare = record.BackupType === 'File Share' || 
-//       (record.ResourceName && record.ResourceName.toLowerCase().startsWith('azurefileshare;')) ||
-//       (record.RawResourceName && record.RawResourceName.toLowerCase().startsWith('azurefileshare;'));
-
-//     if (isFileShare) {
-//       // Create unique key: subscription:resourceGroup:fileShareName (storage account not needed as file share name is unique within RG)
-//       const fileShareName = record.ResourceName || record.RawResourceName || '';
-//       const key = `${record.SubscriptionName}:${record.ResourceGroup}:${fileShareName}`.toLowerCase();
-
-//       if (!seen.has(key)) {
-//         seen.set(key, record);
-//         deduped.push(record);
-//       } else {
-//         // Keep the one with newer backup time (prefer vault backup over native)
-//         const existing = seen.get(key);
-//         const existingTime = new Date(existing.LatestRPTime || 0).getTime();
-//         const newTime = new Date(record.LatestRPTime || 0).getTime();
-//         if (newTime > existingTime) {
-//           seen.set(key, record);
-//           const idx = deduped.findIndex(r => r === existing);
-//           if (idx >= 0) deduped[idx] = record;
-//         }
-//       }
-//     } else {
-//       deduped.push(record);
-//     }
-//   }
-
-//   console.log(`[AZ-SDK] After deduplication: ${deduped.length} records (removed ${records.length - deduped.length} duplicate file shares)`);
-//   return deduped;
-// }
-
-// module.exports = { collectAzureBackupData, deduplicateFileShares };

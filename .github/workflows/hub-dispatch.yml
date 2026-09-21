@@ -1,0 +1,110 @@
+# Generic dispatcher: on push or PR, match changed files against ci/app.yaml
+# paths and ask the cloudops-nexus hub to build each affected app.
+# PR builds validate only — the hub builds and scans but never pushes an image.
+#
+# Copied verbatim from an onboarded repo per cloudops-nexus's onboarding guide
+# (docs/onboarding/repo-onboarding-guide.md) — nothing below is repo-specific
+# except the branch list. See ci/app.yaml for why dispatch currently no-ops.
+name: hub-dispatch
+
+on:
+  push:
+    branches: [main, Influx]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'app key from ci/app.yaml (forces a build)'
+        required: true
+        type: string
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # secrets context is not allowed in step-level if:, so surface it here
+      HAS_APP: ${{ secrets.CLOUDOPS_APP_ID != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # full history: the diff range below can span many commits
+          fetch-depth: 0
+
+      - name: Determine affected apps
+        id: affected
+        env:
+          FORCED: ${{ inputs.app }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          python3 - << 'EOF'
+          import fnmatch, os, subprocess, yaml
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True).stdout.splitlines()
+
+          cfg = yaml.safe_load(open("ci/app.yaml"))
+          forced = os.environ.get("FORCED", "")
+          base_ref = os.environ.get("BASE_REF", "")
+          before = os.environ.get("BEFORE", "")
+
+          if forced:
+              apps = [forced] if forced in cfg else []
+          else:
+              if base_ref:
+                  # PR: compare against the merge base with the target branch
+                  subprocess.run(["git", "fetch", "--no-tags", "origin", base_ref], check=False)
+                  diff = git("diff", "--name-only", f"origin/{base_ref}...HEAD")
+              elif before and set(before) != {"0"}:
+                  # push: the whole pushed range, not just the tip commit
+                  diff = git("diff", "--name-only", f"{before}..{os.environ['GITHUB_SHA']}")
+              else:
+                  # new branch (before is all zeros) — no usable range; build everything
+                  diff = None
+              if diff is None:
+                  apps = list(cfg)
+              else:
+                  apps = [a for a, c in cfg.items()
+                          if any(fnmatch.fnmatch(f, p) for p in c.get("paths", []) for f in diff)]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("apps=" + " ".join(apps) + "\n")
+          print("affected:", apps or "none")
+          EOF
+
+      - name: Generate hub dispatch token
+        id: app-token
+        if: steps.affected.outputs.apps != '' && env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.CLOUDOPS_APP_ID }}
+          private-key: ${{ secrets.CLOUDOPS_APP_PRIVATE_KEY }}
+          owner: muraai
+          repositories: cloudops-nexus
+
+      - name: Dispatch hub builds
+        if: steps.affected.outputs.apps != ''
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          # PR builds report against the PR head, not the merge commit
+          REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          PR: ${{ github.event.pull_request.number }}
+          # exact commit: the hub reports its status against this, and a ref
+          # name can move between dispatch and build
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::hub dispatch app not installed/configured for this repo — skipping."
+            exit 0
+          fi
+          for APP in ${{ steps.affected.outputs.apps }}; do
+            curl -sf -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/muraai/cloudops-nexus/dispatches \
+              -d "{\"event_type\":\"app-build\",\"client_payload\":{\"repo\":\"${GITHUB_REPOSITORY}\",\"ref\":\"${REF}\",\"app\":\"$APP\",\"pr\":\"${PR}\",\"sha\":\"${SHA}\"}}"
+            echo "dispatched $APP (ref $REF${PR:+, PR #$PR})" >> "$GITHUB_STEP_SUMMARY"
+          done
