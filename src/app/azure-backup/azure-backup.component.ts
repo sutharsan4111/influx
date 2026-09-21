@@ -92,7 +92,7 @@ import { AzureBackupService, BackupReport, BackupItem, SubscriptionGroup } from 
           <span class="filter-count">{{ filteredFileShares.length }} file shares, {{ filteredVMs.length }} VMs</span>
         </div>
 
-        <div class="vm-consistency-block" *ngIf="reportData?.consistencyDetails">
+        <div class="vm-consistency-block" *ngIf="reportData.consistencyDetails">
           <span class="block-label">VM Consistency</span>
           <div class="consistency-toggle-row">
             <div class="consistency-toggle application"
@@ -121,7 +121,7 @@ import { AzureBackupService, BackupReport, BackupItem, SubscriptionGroup } from 
           </div>
         </div>
 
-        <div class="subscription-health-block" *ngIf="reportData?.subscriptions?.length">
+        <div class="subscription-health-block" *ngIf="reportData.subscriptions.length">
           <span class="block-label">Subscription Health</span>
           <div class="subscription-health-row">
             <div class="subscription-card" *ngFor="let sub of reportData.subscriptions">

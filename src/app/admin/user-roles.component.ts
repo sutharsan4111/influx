@@ -124,7 +124,7 @@ interface GroupOption {
                 <div class="action-buttons">
                   <button class="btn-save" (click)="assignRoles(user.email)">Save</button>
                   <button 
-                    *ngIf="user.assignedBy || (user.roles?.length || 0) > 0"
+                    *ngIf="user.assignedBy || (user.roles.length || 0) > 0"
                     (click)="removeRole(user.email)" 
                     class="btn-remove"
                     title="Remove role assignment (revert to Graph)"
